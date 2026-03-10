@@ -43,6 +43,7 @@ forward-slash-delimited keys, which map directly to filesystem paths:
 ├── indexes/
 │   └── <index-version>/
 │       ├── manifest.json      # full manifest (see below)
+│       ├── ivfpq.bin          # IVF-PQ index (present when --pq-m > 0)
 │       └── shards/
 │           ├── shard-0000.sidx
 │           ├── shard-0001.sidx
@@ -101,7 +102,8 @@ and index version and describes every shard artifact.
     "builder_version": "0.1.0",
     "num_kmeans_iters": 20,
     "nprobe_default": 2
-  }
+  },
+  "pq_artifact_key": "indexes/idx-v1/ivfpq.bin"
 }
 ```
 
@@ -124,6 +126,7 @@ and index version and describes every shard artifact.
 | `build_metadata.builder_version` | string | Semver version of the `shardlake` binary that built this index. |
 | `build_metadata.num_kmeans_iters` | integer | K-means iterations used. |
 | `build_metadata.nprobe_default` | integer | Default nprobe recorded at build time. |
+| `pq_artifact_key` | string \| null | Storage key of the IVF-PQ binary artifact. Present only when the index was built with `--pq-m > 0`. Omitted from JSON when absent. |
 
 ### Shard definition fields
 
@@ -179,3 +182,50 @@ per vector:
 
 The magic bytes and format version allow the reader to detect corrupt or incompatible
 artifacts before parsing any vector data.
+
+---
+
+## IVF-PQ binary index (`indexes/<version>/ivfpq.bin`)
+
+Written by `shardlake build-index --pq-m > 0`. Stores the complete IVF-PQ index
+including the PQ codebook, coarse centroids, and per-cluster posting lists with both
+PQ byte codes and raw vectors (for exact reranking). Binary, little-endian throughout.
+
+### Top-level layout
+
+```
+Offset   Size    Field
+------   ----    -----
+0        8       Magic bytes: "SLKIVPQ\0" (0x534C4B49565051 + 0x00)
+8        4       Format version (u32) — currently 1
+12       4       Vector dimension `dims` (u32)
+16       4       Distance metric code (u32): 0=cosine, 1=euclidean, 2=inner_product
+20       8       Byte length of embedded PQ codebook blob `pq_len` (u64)
+28       pq_len  PQ codebook (see PQ codebook layout below)
+28+pq_len 4      Number of coarse centroids `K` (u32)
+...      K×dims×4  Centroid coordinates (f32 × dims per centroid)
+...      K posting lists (see posting list layout below)
+```
+
+### PQ codebook layout (embedded blob)
+
+```
+0        8       PQ magic bytes ("SLKPQ\0\0\0")
+8        4       PQ format version (u32) — currently 1
+12       4       Vector dimension `dims` (u32)
+16       4       Number of sub-spaces `M` (u32)
+20       4       Codewords per sub-space `K_sub` (u32)
+24       M × K_sub × (dims/M) × 4   Codebook entries (f32)
+```
+
+### Posting list layout (per centroid, K total)
+
+```
+0        8       Number of vectors in this cluster `N` (u64)
+--- N vector entries ---
+per vector:
+  8              Vector ID (u64)
+  M              PQ byte codes (u8 × M, one code per sub-space)
+  dims × 4       Raw vector data (f32 × dims, for exact reranking)
+```
+

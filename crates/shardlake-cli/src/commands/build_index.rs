@@ -8,13 +8,14 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
+use rand::SeedableRng;
 use tracing::info;
 
 use shardlake_core::{
     config::SystemConfig,
     types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
 };
-use shardlake_index::{BuildParams, IndexBuilder};
+use shardlake_index::{BuildParams, IndexBuilder, IvfPqIndex};
 use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
@@ -40,6 +41,13 @@ pub struct BuildIndexArgs {
     /// Number of shards to probe at query time.
     #[arg(long, default_value_t = 2)]
     pub nprobe: u32,
+    /// Number of PQ sub-spaces.  Set to 0 to skip PQ index building.
+    /// `dims` must be divisible by this value.
+    #[arg(long, default_value_t = 0)]
+    pub pq_m: usize,
+    /// Codewords per PQ sub-space (1–256, only relevant when --pq-m > 0).
+    #[arg(long, default_value_t = 256)]
+    pub pq_ksub: usize,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
@@ -94,23 +102,63 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
 
     info!(records = records.len(), dims, "Loaded vectors");
 
+    // Build the standard IVF shard index.
     let builder = IndexBuilder::new(&store, &config);
-    let manifest = builder.build(BuildParams {
-        records,
+    let mut manifest = builder.build(BuildParams {
+        records: records.clone(),
         dataset_version: dataset_ver,
         embedding_version: embedding_ver,
-        index_version: index_ver,
+        index_version: index_ver.clone(),
         metric: args.metric,
         dims,
         vectors_key,
         metadata_key,
     })?;
 
+    // Optionally build the IVF-PQ index alongside the shard index.
+    if args.pq_m > 0 {
+        info!(
+            pq_m = args.pq_m,
+            pq_ksub = args.pq_ksub,
+            "Building IVF-PQ index"
+        );
+        // Use the same fixed seed as the IVF shard builder for reproducible artifacts.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
+        let ivf_pq = IvfPqIndex::build(
+            &records,
+            args.num_shards as usize,
+            args.pq_m,
+            args.pq_ksub,
+            args.kmeans_iters,
+            args.metric,
+            &mut rng,
+        )?;
+
+        let ivfpq_key = format!("indexes/{}/ivfpq.bin", index_ver.0);
+        let ivfpq_bytes = ivf_pq.to_bytes()?;
+        store.put(&ivfpq_key, ivfpq_bytes)?;
+        info!(key = %ivfpq_key, "IVF-PQ artifact written");
+
+        // Update the manifest to record the PQ artifact key and re-save.
+        manifest.pq_artifact_key = Some(ivfpq_key);
+        manifest
+            .save(&store)
+            .map_err(|e| anyhow::anyhow!("failed to update manifest: {e}"))?;
+        info!("Manifest updated with pq_artifact_key");
+    }
+
+    let pq_note = if manifest.pq_artifact_key.is_some() {
+        format!(", PQ m={} ksub={}", args.pq_m, args.pq_ksub)
+    } else {
+        String::new()
+    };
+
     println!(
-        "Index built → index_version={} ({} shards, {} vectors)",
+        "Index built → index_version={} ({} shards, {} vectors{})",
         manifest.index_version,
         manifest.shards.len(),
         manifest.total_vector_count,
+        pq_note,
     );
     Ok(())
 }

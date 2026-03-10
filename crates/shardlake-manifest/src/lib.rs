@@ -61,6 +61,11 @@ pub struct Manifest {
     pub shards: Vec<ShardDef>,
     pub total_vector_count: u64,
     pub build_metadata: BuildMetadata,
+    /// Storage key of the IVF-PQ binary index artifact, if built.
+    ///
+    /// Present only when the index was built with `--pq-m > 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_artifact_key: Option<String>,
 }
 
 impl Manifest {

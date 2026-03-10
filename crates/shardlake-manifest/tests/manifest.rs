@@ -37,6 +37,7 @@ fn sample_manifest() -> Manifest {
             num_kmeans_iters: 20,
             nprobe_default: 2,
         },
+        pq_artifact_key: None,
     }
 }
 

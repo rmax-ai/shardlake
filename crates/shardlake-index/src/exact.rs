@@ -82,6 +82,20 @@ pub fn recall_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
     hits as f64 / k as f64
 }
 
+/// Precision@k: fraction of the retrieved results that are in `ground_truth`.
+///
+/// Returns `0.0` when `retrieved` is empty.
+pub fn precision_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
+    if retrieved.is_empty() {
+        return 0.0;
+    }
+    let hits = retrieved
+        .iter()
+        .filter(|id| ground_truth.contains(id))
+        .count();
+    hits as f64 / retrieved.len() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +136,20 @@ mod tests {
         let ret = vec![VectorId(1), VectorId(2), VectorId(5)];
         let r = recall_at_k(&gt, &ret);
         assert!((r - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_precision_at_k() {
+        let gt = vec![VectorId(1), VectorId(2), VectorId(3)];
+        let ret = vec![VectorId(1), VectorId(2), VectorId(5)];
+        let p = precision_at_k(&gt, &ret);
+        // 2 out of 3 retrieved are relevant
+        assert!((p - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_precision_at_k_empty_retrieved() {
+        let gt = vec![VectorId(1), VectorId(2)];
+        assert_eq!(precision_at_k(&gt, &[]), 0.0);
     }
 }

@@ -130,6 +130,7 @@ impl<'a> IndexBuilder<'a> {
                 num_kmeans_iters: iters,
                 nprobe_default: self.config.nprobe,
             },
+            pq_artifact_key: None,
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;

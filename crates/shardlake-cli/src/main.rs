@@ -31,6 +31,8 @@ enum Commands {
     Serve(commands::serve::ServeArgs),
     /// Run recall/latency benchmark.
     Benchmark(commands::benchmark::BenchmarkArgs),
+    /// Evaluate ANN quality: recall@k, precision@k, and latency.
+    EvalAnn(commands::eval_ann::EvalAnnArgs),
 }
 
 #[tokio::main]
@@ -47,5 +49,6 @@ async fn main() -> Result<()> {
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
+        Commands::EvalAnn(args) => commands::eval_ann::run(cli.storage, args).await,
     }
 }
