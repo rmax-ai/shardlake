@@ -1,42 +1,124 @@
-# shardlake
+# Shardlake
 
-A Rust project scaffolded for robust and modular development.
+Shardlake is a Rust prototype of a decoupled, billion-scale-inspired vector search system built for personal-scale experimentation.
 
-## Getting Started
+It demonstrates the architecture pattern of:
+- raw embeddings stored separately from serving
+- offline index build pipeline (K-means sharding + brute-force within shards)
+- immutable, versioned index artifacts
+- stateless HTTP query workers with lazy shard loading
+- manifest/version-driven artifact lifecycle
+- reproducible benchmarking
+
+## Architecture overview
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌───────────────────┐
+│  Ingest plane   │────▶│  Index build      │────▶│  Serving plane    │
+│  shardlake ingest│    │  shardlake build- │     │  shardlake serve  │
+│  raw vectors    │     │  index            │     │  axum HTTP API    │
+│  JSONL format   │     │  K-means + shard  │     │  lazy shard cache │
+└─────────────────┘     └──────────────────┘     └───────────────────┘
+                                │
+                         ┌──────▼──────┐
+                         │  Manifest   │
+                         │  shardlake  │
+                         │  publish    │
+                         └─────────────┘
+                                │
+                         ┌──────▼──────┐
+                         │  Benchmark  │
+                         │  shardlake  │
+                         │  benchmark  │
+                         └─────────────┘
+```
+
+## Quickstart
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
+- Rust stable (≥ 1.75)
 
 ### Build
 
 ```bash
-cargo build
+cargo build --release
 ```
 
-### Run
+### Generate sample data
 
 ```bash
-cargo run
+# Uses the included fixture
+cp fixtures/sample_10.jsonl /tmp/sample.jsonl
+
+# Or generate a larger dataset
+python3 tools/gen_sample.py --count 1000 --dims 64 > /tmp/vectors.jsonl
 ```
 
-### Test
+### Run end-to-end
 
 ```bash
-cargo test
+# 1. Ingest
+./target/release/shardlake ingest --input fixtures/sample_10.jsonl --dataset-version ds-v1
+
+# 2. Build index
+./target/release/shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1 \
+  --num-shards 2 \
+  --metric cosine
+
+# 3. Publish alias
+./target/release/shardlake publish --index-version idx-v1
+
+# 4. Serve
+./target/release/shardlake serve &
+
+# 5. Query
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"vector": [0.1, 0.2], "k": 3}'
+
+# 6. Benchmark
+./target/release/shardlake benchmark --k 5 --nprobe 2
 ```
 
-## Project Structure
+Or use the Makefile:
 
-```
-shardlake/
-├── src/
-│   └── main.rs   # Application entry point
-├── Cargo.toml    # Package manifest
-├── README.md     # This file
-└── AGENTS.md     # Best practices for contributing
+```bash
+make demo
 ```
 
-## License
+## Commands
 
-No license specified yet.
+| Command | Description |
+|---------|-------------|
+| `shardlake ingest` | Read JSONL vectors into versioned artifact storage |
+| `shardlake build-index` | Build K-means shard index from ingested dataset |
+| `shardlake publish` | Create/update alias pointer (e.g. `latest`) |
+| `shardlake serve` | Start HTTP query server |
+| `shardlake benchmark` | Measure recall@k and latency |
+
+## Workspace crates
+
+| Crate | Purpose |
+|-------|---------|
+| `shardlake-core` | Shared types, errors, config |
+| `shardlake-storage` | `ObjectStore` trait + local filesystem backend |
+| `shardlake-manifest` | Manifest schema and alias lifecycle |
+| `shardlake-index` | K-means builder, shard format, ANN searcher |
+| `shardlake-serve` | axum HTTP API |
+| `shardlake-bench` | Recall@k and latency benchmark harness |
+| `shardlake-cli` | CLI binary (`shardlake`) |
+
+## Limitations
+
+- Single-node only (no distributed execution)
+- Index is rebuilt offline; no online updates
+- K-means sharding is simple; not HNSW or DiskANN
+- No authentication or multitenancy
+- Vectors stored as JSONL for simplicity (not optimal for large scale)
+
+## Future evolution
+
+See [ROADMAP.md](ROADMAP.md).

@@ -1,0 +1,16 @@
+[package]
+name = "shardlake-serve"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shardlake-core = { workspace = true }
+shardlake-storage = { workspace = true }
+shardlake-manifest = { workspace = true }
+shardlake-index = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
