@@ -79,6 +79,9 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards |
 | `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
+| `--parallel` | bool | `false` | Build shards in parallel using a rayon thread-pool (see [9.1](#parallel-builds)) |
+| `--worker-id <N>` | u32 | *(none)* | Distributed mode: zero-based index of this worker (requires `--num-workers`) |
+| `--num-workers <N>` | u32 | *(none)* | Distributed mode: total number of workers (requires `--worker-id`) |
 
 ### Output
 
@@ -99,6 +102,78 @@ shardlake build-index \
   --kmeans-iters 30 \
   --metric cosine \
   --nprobe 3
+```
+
+#### Parallel build (single machine)
+
+```bash
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1 \
+  --num-shards 8 \
+  --parallel
+```
+
+#### Distributed build (two workers)
+
+Run each worker independently (e.g. on separate machines sharing the same
+storage path or object store):
+
+```bash
+# Worker 0
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1-w0 \
+  --num-shards 8 \
+  --worker-id 0 \
+  --num-workers 2
+
+# Worker 1
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1-w1 \
+  --num-shards 8 \
+  --worker-id 1 \
+  --num-workers 2
+```
+
+Then merge the partial manifests with [`merge-shards`](#shardlake-merge-shards).
+
+---
+
+## `shardlake merge-shards`
+
+Combines partial index manifests produced by distributed `build-index` workers
+into a single authoritative manifest.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] merge-shards --index-versions <V1,V2,...> --output-version <STRING>
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-versions <V1,V2,...>` | comma-separated strings | *(required)* | Partial index versions to merge (must cover disjoint shard IDs) |
+| `--output-version <STRING>` | string | *(required)* | Version tag for the merged output manifest |
+
+### Output
+
+Writes `<storage>/indexes/<output-version>/manifest.json` containing the
+combined shard list from all partial manifests.
+
+### Example
+
+```bash
+# Merge the two partial builds from the distributed example above
+shardlake merge-shards \
+  --index-versions idx-v1-w0,idx-v1-w1 \
+  --output-version idx-v1
+
+# Then publish
+shardlake publish --index-version idx-v1
 ```
 
 ---

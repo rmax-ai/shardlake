@@ -40,6 +40,15 @@ pub struct BuildIndexArgs {
     /// Number of shards to probe at query time.
     #[arg(long, default_value_t = 2)]
     pub nprobe: u32,
+    /// Build shards in parallel using a rayon thread-pool.
+    #[arg(long)]
+    pub parallel: bool,
+    /// Distributed mode: zero-based worker index (requires --num-workers).
+    #[arg(long)]
+    pub worker_id: Option<u32>,
+    /// Distributed mode: total number of workers (requires --worker-id).
+    #[arg(long)]
+    pub num_workers: Option<u32>,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
@@ -104,6 +113,9 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         dims,
         vectors_key,
         metadata_key,
+        parallel: args.parallel,
+        worker_id: args.worker_id,
+        num_workers: args.num_workers,
     })?;
 
     println!(

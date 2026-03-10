@@ -25,6 +25,8 @@ enum Commands {
     Ingest(commands::ingest::IngestArgs),
     /// Build shard-based ANN index from ingested vectors.
     BuildIndex(commands::build_index::BuildIndexArgs),
+    /// Merge partial distributed build manifests into a single index.
+    MergeShards(commands::merge_shards::MergeShardsArgs),
     /// Publish (or re-publish) a manifest alias.
     Publish(commands::publish::PublishArgs),
     /// Start the HTTP query server.
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Ingest(args) => commands::ingest::run(cli.storage, args).await,
         Commands::BuildIndex(args) => commands::build_index::run(cli.storage, args).await,
+        Commands::MergeShards(args) => commands::merge_shards::run(cli.storage, args).await,
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,

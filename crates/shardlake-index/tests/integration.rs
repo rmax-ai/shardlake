@@ -44,6 +44,9 @@ fn test_build_and_search() {
             dims: 4,
             vectors_key: "datasets/ds-test/vectors.jsonl".into(),
             metadata_key: "datasets/ds-test/metadata.json".into(),
+            parallel: false,
+            worker_id: None,
+            num_workers: None,
         })
         .unwrap();
 
