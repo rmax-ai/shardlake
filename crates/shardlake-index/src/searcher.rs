@@ -3,9 +3,10 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 use shardlake_core::types::{DistanceMetric, SearchResult, ShardId};
 use shardlake_manifest::Manifest;
@@ -14,6 +15,7 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    query_plan::QueryPlan,
     shard::ShardIndex,
     IndexError, Result,
 };
@@ -46,7 +48,33 @@ impl IndexSearcher {
     }
 
     /// Perform approximate top-k search using nprobe shard probing.
+    ///
+    /// Records the following metrics (via the globally-installed `metrics` recorder):
+    /// - `query_latency_seconds` histogram — wall-clock time for the full search.
+    #[instrument(skip(self, query), fields(k, nprobe))]
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+        let t0 = Instant::now();
+        let plan = self.build_query_plan(query, k, nprobe)?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        metrics::histogram!("query_latency_seconds").record(elapsed);
+        Ok(plan.results)
+    }
+
+    /// Perform approximate top-k search and return a full [`QueryPlan`] for debugging.
+    ///
+    /// The plan includes the selected centroids, searched shards, all candidate vectors
+    /// gathered before reranking, and the final top-k results.
+    #[instrument(skip(self, query), fields(k, nprobe))]
+    pub fn search_with_plan(&self, query: &[f32], k: usize, nprobe: usize) -> Result<QueryPlan> {
+        self.build_query_plan(query, k, nprobe)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Internal helpers
+    // ---------------------------------------------------------------------------
+
+    /// Core search logic shared by [`search`] and [`search_with_plan`].
+    fn build_query_plan(&self, query: &[f32], k: usize, nprobe: usize) -> Result<QueryPlan> {
         let metric: DistanceMetric = self.manifest.distance_metric;
 
         // Collect all centroids and map centroid index → shard id.
@@ -62,10 +90,21 @@ impl IndexSearcher {
         }
 
         if all_centroids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(QueryPlan {
+                selected_centroids: Vec::new(),
+                searched_shards: Vec::new(),
+                candidate_vectors: Vec::new(),
+                results: Vec::new(),
+            });
         }
 
         let probe_indices = top_n_centroids(query, &all_centroids, nprobe.min(all_centroids.len()));
+
+        let selected_centroids: Vec<Vec<f32>> = probe_indices
+            .iter()
+            .filter_map(|&i| all_centroids.get(i).cloned())
+            .collect();
+
         let mut probe_shards: Vec<ShardId> = probe_indices
             .into_iter()
             .filter_map(|i| centroid_to_shard.get(i).copied())
@@ -75,21 +114,42 @@ impl IndexSearcher {
 
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
-        let mut all_results = Vec::new();
+        let searched_shards: Vec<u32> = probe_shards.iter().map(|s| s.0).collect();
+
+        let mut candidate_vectors: Vec<SearchResult> = Vec::new();
         for shard_id in probe_shards {
             let shard = self.load_shard(shard_id)?;
             let results = exact_search(query, &shard.records, metric, k);
-            all_results.extend(results);
+            candidate_vectors.extend(results);
         }
 
-        Ok(merge_top_k(all_results, k))
+        // Rerank stage: merge all candidates to final top-k.
+        let n_candidates = candidate_vectors.len();
+        let results = {
+            let _rerank_span =
+                tracing::info_span!("rerank", candidates = n_candidates, k).entered();
+            merge_top_k(candidate_vectors.clone(), k)
+        };
+
+        Ok(QueryPlan {
+            selected_centroids,
+            searched_shards,
+            candidate_vectors,
+            results,
+        })
     }
 
     /// Load a shard from cache or store.
+    ///
+    /// Records the following metrics:
+    /// - `shard_cache_hits_total` counter — incremented on a cache hit.
+    /// - `shard_load_latency_seconds` histogram — observed only on a cache miss.
+    #[instrument(skip(self), fields(shard_id = shard_id.0))]
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(idx) = cache.get(&shard_id) {
+                metrics::counter!("shard_cache_hits_total").increment(1);
                 return Ok(Arc::clone(idx));
             }
         }
@@ -101,8 +161,11 @@ impl IndexSearcher {
             .find(|s| s.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
+        let t0 = Instant::now();
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
+        let elapsed = t0.elapsed().as_secs_f64();
+        metrics::histogram!("shard_load_latency_seconds").record(elapsed);
 
         let mut cache = self.cache.lock().unwrap();
         cache.insert(shard_id, Arc::clone(&idx));

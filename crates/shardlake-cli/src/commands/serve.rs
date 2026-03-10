@@ -25,6 +25,10 @@ pub struct ServeArgs {
 }
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("failed to install Prometheus recorder: {e}"))?;
+
     let store: std::sync::Arc<dyn ObjectStore> =
         std::sync::Arc::new(LocalObjectStore::new(&storage)?);
     let manifest = Manifest::load_alias(&*store, &args.alias)?;
@@ -37,6 +41,7 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     let state = AppState {
         searcher,
         nprobe: args.nprobe,
+        prometheus_handle,
     };
     let router = build_router(state);
 

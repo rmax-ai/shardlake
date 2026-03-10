@@ -86,6 +86,8 @@ pub fn run_benchmark(
         "Benchmark complete"
     );
 
+    metrics::gauge!("recall_at_k").set(report.recall_at_k);
+
     report
 }
 

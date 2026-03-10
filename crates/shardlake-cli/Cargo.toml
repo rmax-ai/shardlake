@@ -24,3 +24,4 @@ clap = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
