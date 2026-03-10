@@ -1,0 +1,1774 @@
+name: Create Epic Issues
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (echo issue bodies without creating)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  issues: write
+
+jobs:
+  create-epics:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Create labels
+        run: |
+          gh label create "epic" --color "8B5CF6" --description "Large feature epic" \
+            --repo "$REPO" 2>/dev/null || true
+          gh label create "roadmap" --color "0EA5E9" --description "Roadmap item" \
+            --repo "$REPO" 2>/dev/null || true
+
+      - name: Create parent umbrella issue
+        id: parent
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Shardlake v1.x Roadmap — 10 Engineering Epics
+
+          This umbrella issue tracks the full product roadmap for Shardlake v1.x.
+          Each child issue below is a self-contained engineering epic with detailed tasks.
+
+          ### Epics
+
+          | # | Epic | Theme |
+          |---|------|-------|
+          | 1 | Artifact and Dataset Lifecycle | Immutable, reproducible artifacts |
+          | 2 | Shard Routing and Partitioning | Reduce fan-out, improve latency |
+          | 3 | ANN Index Algorithms | IVF, PQ, candidate pipelines |
+          | 4 | Shard Cache and Storage Layer | Object storage + cache architecture |
+          | 5 | Query Engine Improvements | Production-like query pipeline |
+          | 6 | Benchmarking and Evaluation | Systematic measurement tools |
+          | 7 | Observability | Structured logs, metrics, traces |
+          | 8 | Hybrid Retrieval | Lexical + vector hybrid search |
+          | 9 | Distributed Index Build | Parallel index building |
+          | 10 | Future ANN Research Integration | Research testbed |
+
+          ### Architecture Evolution
+
+          ```
+          v0 (current)
+          ┌─────────────────────────────────────────────────────────┐
+          │  ingest → build-index → manifest → serve → benchmark   │
+          │  K-means sharding + brute-force ANN + local storage     │
+          └─────────────────────────────────────────────────────────┘
+
+          v1 (these epics)
+          ┌─────────────────────────────────────────────────────────┐
+          │  dataset manifest + index manifest + checksum integrity │
+          │  IVF + PQ compression + centroid routing                │
+          │  shard cache LRU + mmap + prefetch                      │
+          │  modular query pipeline + parallel shard search         │
+          │  observability (prometheus + tracing + debug endpoint)  │
+          │  hybrid lexical + vector retrieval (BM25)               │
+          │  parallel / distributed index builds                    │
+          └─────────────────────────────────────────────────────────┘
+          ```
+
+          ### Related files
+
+          - `crates/shardlake-manifest/` — manifest schema and validation
+          - `crates/shardlake-index/` — ANN index builder and searcher
+          - `crates/shardlake-storage/` — storage backend abstraction
+          - `crates/shardlake-serve/` — HTTP query server
+          - `crates/shardlake-bench/` — benchmarking harness
+          - `crates/shardlake-cli/` — command-line interface
+          - `docs/` — user-facing documentation
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — parent issue body:"
+            echo "$BODY"
+            echo "parent_number=0" >> "$GITHUB_OUTPUT"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Shardlake v1.x Roadmap — 10 Engineering Epics" \
+              --body "$BODY" \
+              --label "epic" \
+              --label "roadmap")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created parent issue: #$NUMBER ($URL)"
+            echo "parent_number=$NUMBER" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Epic 1 — Artifact and Dataset Lifecycle
+        id: epic1
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 1 — Artifact and Dataset Lifecycle
+
+          **Goal:** Make dataset, embeddings, and index artifacts first-class immutable objects
+          with deterministic reproducibility.
+
+          **Why this matters:** In large-scale vector systems the biggest operational failures
+          are artifact drift and incompatible index versions.
+
+          ---
+
+          ### Task 1.1 — Dataset manifest specification
+
+          Define a canonical schema for dataset manifests.
+
+          **Required fields:**
+          - `dataset_id` — unique identifier for the dataset
+          - `dataset_version` — semver/slug version string
+          - `vector_dimension` — dimensionality of embedding vectors
+          - `distance_metric` — `cosine | dot_product | euclidean`
+          - `embedding_model` — model name/URI used to generate embeddings
+          - `embedding_version` — version of the embedding model
+          - `shard_count` — number of shards
+          - `record_count` — total vector count
+          - `artifact_locations` — paths/keys to stored artifacts
+          - `checksum` — SHA-256 of the dataset artifact(s)
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-manifest/src/lib.rs
+          // Current Manifest struct needs extension:
+
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct DatasetManifest {
+              pub dataset_id: String,
+              pub dataset_version: DatasetVersion,
+              pub vector_dimension: usize,
+              pub distance_metric: DistanceMetric,
+              pub embedding_model: String,
+              pub embedding_version: String,
+              pub shard_count: usize,
+              pub record_count: usize,
+              pub artifact_locations: Vec<String>,
+              pub checksum: String,           // SHA-256 hex
+              pub created_at: DateTime<Utc>,
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `DatasetManifest` struct with all required fields
+          - [ ] JSON schema validation via `serde_json`
+          - [ ] Unit tests for serialisation/deserialisation roundtrip
+          - [ ] Integration with `shardlake ingest` command
+
+          ---
+
+          ### Task 1.2 — Index manifest specification
+
+          Define a schema for index artifacts.
+
+          **Required fields:**
+          - `index_version`
+          - `dataset_version`
+          - `build_timestamp`
+          - `algorithm` — `ivf | hnsw | exact | ivfpq`
+          - `shard_metadata` — per-shard details
+          - `compression_method`
+          - `quantization_parameters`
+          - `recall_estimates`
+          - `build_duration`
+
+          **Compatibility checks:**
+          - dimension match between dataset and index
+          - dataset version match
+          - algorithm compatibility with query config
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-manifest/src/lib.rs
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct IndexManifest {
+              pub index_version: IndexVersion,
+              pub dataset_version: DatasetVersion,
+              pub build_timestamp: DateTime<Utc>,
+              pub algorithm: IndexAlgorithm,
+              pub shard_metadata: Vec<ShardMeta>,
+              pub compression_method: CompressionMethod,
+              pub quantization_parameters: Option<QuantizationParams>,
+              pub recall_estimates: Option<RecallEstimates>,
+              pub build_duration_secs: f64,
+          }
+
+          impl IndexManifest {
+              pub fn check_compatibility(&self, dataset: &DatasetManifest) -> Result<(), ManifestError> {
+                  // dimension match, dataset_version match, algorithm compat
+              }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `IndexManifest` struct with all required fields
+          - [ ] `check_compatibility()` method
+          - [ ] Tests for compatibility validation (positive and negative cases)
+
+          ---
+
+          ### Task 1.3 — Manifest integrity validation
+
+          Add a CLI command: `shardlake validate-manifest`
+
+          **Checks to perform:**
+          - shard files exist in storage backend
+          - shard metadata consistent with manifest
+          - vector dimensions match across dataset and index manifests
+          - artifact checksums valid (recompute and compare)
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-cli/src/commands/validate.rs
+          pub async fn run(opts: ValidateOpts, store: Arc<dyn ObjectStore>) -> anyhow::Result<()> {
+              let manifest = Manifest::load(&store, &opts.index_version).await?;
+              manifest.validate(&store).await?;
+              tracing::info!("Manifest validation passed");
+              Ok(())
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `shardlake validate-manifest --index-version <v>` command
+          - [ ] Checksum recomputation and comparison
+          - [ ] Human-readable validation report output
+
+          ---
+
+          ### Task 1.4 — Deterministic artifact builds
+
+          **Requirements:**
+          - Pin RNG seeds for reproducible K-means initialisation
+          - Log all algorithm parameters at build time
+          - Write build metadata to manifest (seed, parameters, duration)
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/builder.rs
+          pub struct BuildParams {
+              pub num_shards: usize,
+              pub metric: DistanceMetric,
+              pub kmeans_iterations: usize,
+              pub seed: u64,             // NEW: pin for determinism
+              pub log_params: bool,      // NEW: emit structured log of all params
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `--seed` flag on `build-index` command
+          - [ ] Deterministic output: two builds with same seed produce identical artifacts
+          - [ ] Build metadata written to manifest
+
+          ---
+
+          ### Task 1.5 — Artifact registry abstraction
+
+          Implement a local artifact registry with a structured layout:
+
+          ```
+          artifacts/
+          ├── datasets/
+          │   └── <dataset_id>/<version>/
+          ├── indexes/
+          │   └── <index_version>/shards/
+          └── manifests/
+              ├── dataset/
+              └── index/
+          ```
+
+          **Trait abstraction:**
+          ```rust
+          // crates/shardlake-storage/src/registry.rs
+          #[async_trait]
+          pub trait ArtifactRegistry: Send + Sync {
+              async fn put_dataset(&self, id: &str, version: &str, data: Bytes) -> Result<()>;
+              async fn get_dataset(&self, id: &str, version: &str) -> Result<Bytes>;
+              async fn put_index_shard(&self, version: &str, shard_id: usize, data: Bytes) -> Result<()>;
+              async fn list_indexes(&self) -> Result<Vec<String>>;
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `LocalArtifactRegistry` implementing the trait
+          - [ ] Directory structure created automatically on first write
+          - [ ] Unit tests for all registry operations
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 1 issue body (truncated):"
+            echo "$BODY" | head -20
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 1 — Artifact and Dataset Lifecycle" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 1: #$NUMBER"
+            # Link as sub-issue of parent
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 2 — Shard Routing and Partitioning
+        id: epic2
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 2 — Shard Routing and Partitioning
+
+          **Goal:** Improve the vector partitioning strategy to reduce query fan-out and improve latency.
+
+          ---
+
+          ### Task 2.1 — Implement vector clustering
+
+          Use k-means clustering to partition vectors into shards with high intra-cluster similarity.
+
+          **Requirements:**
+          - Train centroids using a sample subset of the dataset (configurable fraction)
+          - Assign every vector to its nearest centroid at build time
+          - Store centroid metadata in the index manifest
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/kmeans.rs  (already exists)
+          // Extend KMeans with:
+          pub struct ClusteringResult {
+              pub centroids: Vec<Vec<f32>>,   // k × dim
+              pub assignments: Vec<usize>,    // vector → centroid id
+              pub inertia: f64,               // sum of squared distances
+          }
+
+          impl KMeans {
+              pub fn fit_sample(&self, vectors: &[Vec<f32>], sample_frac: f32) -> ClusteringResult { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `fit_sample()` method on `KMeans`
+          - [ ] Centroid vectors persisted to object store
+          - [ ] Unit tests: clustering produces expected number of centroids
+
+          ---
+
+          ### Task 2.2 — Centroid routing logic
+
+          At query time, compute the nearest centroids to the query vector and route only to those shards.
+
+          **Requirements:**
+          - Compute distance from query to all centroids
+          - Select top-N centroids (configurable `candidate_centroids`)
+          - Return the shard IDs associated with those centroids
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/searcher.rs
+          impl IndexSearcher {
+              pub fn route_to_shards(
+                  &self,
+                  query: &[f32],
+                  candidate_centroids: usize,
+              ) -> Vec<ShardId> {
+                  // compute nearest centroids → return shard ids
+              }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `route_to_shards()` method
+          - [ ] Unit test: routing returns correct shard set for a known query
+          - [ ] Integration: query fan-out reduced vs. searching all shards
+
+          ---
+
+          ### Task 2.3 — Shard metadata format
+
+          Each shard must include structured metadata:
+
+          ```rust
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct ShardMeta {
+              pub shard_id: ShardId,
+              pub centroid_id: usize,
+              pub vector_count: usize,
+              pub index_type: IndexAlgorithm,
+              pub file_location: String,   // object store key
+              pub size_bytes: u64,
+              pub checksum: String,        // SHA-256
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `ShardMeta` struct in manifest crate
+          - [ ] Written during `build-index` and loaded at serve time
+          - [ ] Validated during `validate-manifest`
+
+          ---
+
+          ### Task 2.4 — Query fan-out policy
+
+          Implement configurable fan-out parameters via `SystemConfig` or per-query override:
+
+          ```toml
+          [query]
+          candidate_centroids = 4
+          candidate_shards = 4
+          max_vectors_per_shard = 50_000
+          ```
+
+          **Acceptance criteria:**
+          - [ ] Config fields in `SystemConfig` or `QueryConfig`
+          - [ ] Per-query override via HTTP request body
+          - [ ] Documented in `docs/configuration.md`
+
+          ---
+
+          ### Task 2.5 — Partition evaluation harness
+
+          Add CLI command: `shardlake evaluate-partitioning`
+
+          **Metrics to compute:**
+          - Shard size distribution (min/max/mean/stddev vector counts)
+          - Routing accuracy (fraction of relevant vectors in top-N shards)
+          - Recall impact (recall@k with limited vs. full fan-out)
+          - Shard hotness (query frequency per shard)
+
+          **Acceptance criteria:**
+          - [ ] `shardlake evaluate-partitioning --dataset-version <v> --index-version <v>` command
+          - [ ] JSON or table output with all metrics
+          - [ ] Documented in `docs/cli-reference.md`
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 2 issue body (truncated):"
+            echo "$BODY" | head -10
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 2 — Shard Routing and Partitioning" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 2: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 3 — ANN Index Algorithms
+        id: epic3
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 3 — ANN Index Algorithms
+
+          **Goal:** Introduce real approximate nearest neighbor methods beyond brute-force shards.
+
+          ---
+
+          ### Task 3.1 — Implement IVF index
+
+          Inverted File Index (IVF) organises vectors into clusters; at query time only a subset
+          of clusters (posting lists) are scanned.
+
+          **Requirements:**
+          - Train a coarse quantizer (k-means centroids)
+          - Assign vectors to clusters, store posting lists
+          - At query time, probe `nprobe` nearest centroids
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/ivf.rs  (new file)
+          pub struct IvfIndex {
+              pub centroids: Vec<Vec<f32>>,   // k_coarse × dim
+              pub posting_lists: Vec<Vec<(VectorId, Vec<f32>)>>,
+              pub metric: DistanceMetric,
+          }
+
+          impl IvfIndex {
+              pub fn build(vectors: &[(VectorId, Vec<f32>)], k: usize, metric: DistanceMetric) -> Self { ... }
+              pub fn search(&self, query: &[f32], top_k: usize, nprobe: usize) -> Vec<SearchResult> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `IvfIndex::build()` and `IvfIndex::search()` methods
+          - [ ] Unit tests: recall@10 ≥ 0.8 on synthetic data with nprobe = k/2
+          - [ ] `build-index --algorithm ivf` flag
+
+          ---
+
+          ### Task 3.2 — Implement PQ compression
+
+          Product Quantization (PQ) compresses vectors by splitting them into sub-vectors
+          and encoding each sub-vector with a small codebook.
+
+          **Requirements:**
+          - Configurable number of sub-quantizers (`m`) and bits per code (`nbits`)
+          - Store PQ codes instead of raw f32 vectors
+          - Asymmetric distance computation (ADC) at search time
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/pq.rs  (new file)
+          pub struct ProductQuantizer {
+              pub m: usize,          // number of sub-quantizers
+              pub nbits: usize,      // bits per code (typically 8)
+              pub codebooks: Vec<Vec<Vec<f32>>>,   // m × k_sub × (dim/m)
+          }
+
+          impl ProductQuantizer {
+              pub fn train(vectors: &[Vec<f32>], m: usize, nbits: usize) -> Self { ... }
+              pub fn encode(&self, vector: &[f32]) -> Vec<u8> { ... }
+              pub fn decode(&self, code: &[u8]) -> Vec<f32> { ... }
+              pub fn asymmetric_distance(&self, query: &[f32], code: &[u8]) -> f32 { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `ProductQuantizer` with train/encode/decode/asymmetric_distance
+          - [ ] Compression ratio ≥ 8× vs raw f32 for default params
+          - [ ] Unit tests for encode/decode roundtrip error bounds
+
+          ---
+
+          ### Task 3.3 — Candidate retrieval pipeline
+
+          Build a modular, composable query pipeline:
+
+          ```
+          query vector
+            → centroid routing (IVF coarse quantizer)
+            → IVF candidate selection (probe nprobe lists)
+            → PQ approximate distance computation
+            → top-K heap selection
+            → optional exact rerank
+          ```
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/pipeline.rs  (new file)
+          pub struct QueryPipeline {
+              ivf: IvfIndex,
+              pq: Option<ProductQuantizer>,
+              reranker: Option<ExactReranker>,
+          }
+
+          impl QueryPipeline {
+              pub fn search(&self, query: &[f32], params: &QueryParams) -> Vec<SearchResult> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `QueryPipeline` struct implementing the full candidate pipeline
+          - [ ] Each stage individually testable
+          - [ ] Pipeline stages configurable at runtime
+
+          ---
+
+          ### Task 3.4 — Exact reranking
+
+          After approximate candidate selection, fetch raw vectors and compute exact distances
+          for the top-M candidates, then re-sort.
+
+          **Requirements:**
+          - Configurable `rerank_limit` parameter
+          - Fetch raw vectors from shard storage
+          - Compute exact distance (same metric as index)
+
+          **Acceptance criteria:**
+          - [ ] `ExactReranker` struct
+          - [ ] Improves recall@k when enabled (measurable in benchmarks)
+          - [ ] `--rerank-limit` flag on `serve` command
+
+          ---
+
+          ### Task 3.5 — Recall evaluation command
+
+          Add CLI command: `shardlake eval-ann`
+
+          **Metrics:**
+          - recall@k (fraction of true top-k returned)
+          - precision@k
+          - mean query latency
+          - P50/P95/P99 latency
+
+          **Acceptance criteria:**
+          - [ ] `shardlake eval-ann --k 10 --nprobe 8 --queries <file>` command
+          - [ ] Compares approximate results against exact ground truth
+          - [ ] JSON report output
+          - [ ] Documented in `docs/cli-reference.md`
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 3 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 3 — ANN Index Algorithms" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 3: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 4 — Shard Cache and Storage Layer
+        id: epic4
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 4 — Shard Cache and Storage Layer
+
+          **Goal:** Simulate the object storage + cache architecture found in production vector systems.
+
+          ---
+
+          ### Task 4.1 — Storage abstraction
+
+          Extend the existing `ObjectStore` trait with a named `StorageBackend` and add
+          an S3-compatible stub.
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-storage/src/lib.rs  (extend existing trait)
+          #[async_trait]
+          pub trait StorageBackend: Send + Sync {
+              async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError>;
+              async fn get(&self, key: &str) -> Result<Bytes, StorageError>;
+              async fn exists(&self, key: &str) -> Result<bool, StorageError>;
+              async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
+              async fn delete(&self, key: &str) -> Result<(), StorageError>;
+              async fn size(&self, key: &str) -> Result<u64, StorageError>;
+          }
+
+          // LocalFilesystemBackend — already exists as LocalObjectStore
+          // S3CompatibleBackend — stub with unimplemented!() or returning Err
+          pub struct S3CompatibleBackend {
+              pub bucket: String,
+              pub endpoint: String,
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] Rename `LocalObjectStore` to `LocalFilesystemBackend` (or alias)
+          - [ ] `S3CompatibleBackend` stub with documented TODO
+          - [ ] Backend selection via config: `storage.backend = "local" | "s3"`
+
+          ---
+
+          ### Task 4.2 — Shard cache system
+
+          Implement an LRU shard cache so hot shards stay in memory across queries.
+
+          ```rust
+          // crates/shardlake-storage/src/cache.rs  (new file)
+          pub struct ShardCache {
+              capacity: usize,                          // max shards in memory
+              inner: Mutex<LruCache<ShardId, Arc<ShardIndex>>>,
+              metrics: CacheMetrics,
+          }
+
+          impl ShardCache {
+              pub fn new(capacity: usize) -> Self { ... }
+              pub async fn get_or_load(
+                  &self,
+                  shard_id: ShardId,
+                  backend: &dyn StorageBackend,
+              ) -> Result<Arc<ShardIndex>, StorageError> { ... }
+              pub fn evict(&self, shard_id: ShardId) { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `ShardCache` with LRU eviction (use `lru` crate)
+          - [ ] Thread-safe: multiple concurrent readers
+          - [ ] Unit tests for cache hit, miss, and eviction behaviour
+
+          ---
+
+          ### Task 4.3 — Cache metrics
+
+          Expose cache statistics for observability:
+
+          ```rust
+          pub struct CacheMetrics {
+              pub hits: AtomicU64,
+              pub misses: AtomicU64,
+              pub evictions: AtomicU64,
+              pub load_latency_ms: Histogram,  // use hdrhistogram or similar
+          }
+          ```
+
+          Expose via:
+          - `GET /metrics` endpoint (Prometheus text format) — see Epic 7
+          - Structured log lines on each cache operation
+
+          **Acceptance criteria:**
+          - [ ] Atomic counters for hits/misses/evictions
+          - [ ] Load latency histogram
+          - [ ] Metrics accessible via HTTP endpoint
+
+          ---
+
+          ### Task 4.4 — Prefetch policy
+
+          Optionally warm the cache before queries arrive.
+
+          **Requirements:**
+          - On startup, prefetch top-N most-frequently-queried shards
+          - Track per-shard query frequency with an `AtomicU64` counter
+          - Background task performs prefetch asynchronously
+
+          **Acceptance criteria:**
+          - [ ] `--prefetch-shards N` flag on `serve` command
+          - [ ] Frequency tracking per shard
+          - [ ] Background prefetch task using `tokio::spawn`
+
+          ---
+
+          ### Task 4.5 — Memory-mapped shard loading
+
+          Use `mmap` for large shard files to avoid copying data into the heap.
+
+          **Requirements:**
+          - Use `memmap2` crate for cross-platform mmap
+          - `ShardIndex` can be backed by either `Vec<u8>` (small) or `Mmap` (large)
+          - Configurable threshold: files above N MB use mmap
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/shard.rs
+          pub enum ShardData {
+              Heap(Vec<u8>),
+              Mapped(Mmap),
+          }
+
+          impl ShardIndex {
+              pub fn from_file_mmap(path: &Path) -> Result<Self, IndexError> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `ShardIndex::from_file_mmap()` implementation
+          - [ ] Configurable mmap threshold in `SystemConfig`
+          - [ ] Unit test: mmap-loaded shard produces same search results as heap-loaded
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 4 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 4 — Shard Cache and Storage Layer" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 4: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 5 — Query Engine Improvements
+        id: epic5
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 5 — Query Engine Improvements
+
+          **Goal:** Turn the basic search service into a production-like query pipeline.
+
+          ---
+
+          ### Task 5.1 — Query pipeline abstraction
+
+          Implement a modular, composable pipeline for query execution:
+
+          ```
+          query embedding
+            → centroid routing
+            → shard loading (via ShardCache)
+            → ANN candidate search
+            → result merge (global top-k heap)
+            → optional rerank
+          ```
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/pipeline.rs  (new file)
+          #[async_trait]
+          pub trait PipelineStage: Send + Sync {
+              type Input;
+              type Output;
+              async fn execute(&self, input: Self::Input) -> Result<Self::Output, IndexError>;
+          }
+
+          pub struct QueryPipeline {
+              stages: Vec<Box<dyn ErasedStage>>,
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `PipelineStage` trait with typed input/output
+          - [ ] `QueryPipeline` composing stages
+          - [ ] Each stage independently unit-testable
+          - [ ] Pipeline assembled and used in `shardlake-serve`
+
+          ---
+
+          ### Task 5.2 — Parallel shard search
+
+          Execute per-shard searches concurrently using Tokio tasks.
+
+          **Requirements:**
+          - Each shard search runs in its own `tokio::spawn` task
+          - Results collected via `JoinSet` or `FuturesUnordered`
+          - Configurable parallelism limit (`max_parallel_shards`)
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/searcher.rs
+          impl IndexSearcher {
+              pub async fn search_parallel(
+                  &self,
+                  query: &[f32],
+                  params: &QueryParams,
+              ) -> Result<Vec<SearchResult>, IndexError> {
+                  let mut set = JoinSet::new();
+                  for shard_id in self.route_to_shards(query, params.candidate_shards) {
+                      let shard = self.cache.get_or_load(shard_id, &self.store).await?;
+                      set.spawn(async move { shard.search(query, params.top_k) });
+                  }
+                  // collect and merge ...
+              }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] Concurrent shard searches with `JoinSet`
+          - [ ] Configurable `max_parallel_shards`
+          - [ ] Latency improvement measurable in benchmarks vs. sequential
+
+          ---
+
+          ### Task 5.3 — Result merge logic
+
+          Merge results from multiple shards into a single globally-sorted top-k list.
+
+          **Requirements:**
+          - Min-heap of size `k` for efficient merge
+          - Ties broken deterministically by vector ID
+          - Merge is O(n log k) where n = total candidates
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/merge.rs  (new file)
+          pub fn merge_results(
+              shard_results: Vec<Vec<SearchResult>>,
+              top_k: usize,
+          ) -> Vec<SearchResult> {
+              // BinaryHeap-based merge
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `merge_results()` function
+          - [ ] Property-based test: merged output is always sorted, length ≤ k
+          - [ ] No duplicate IDs in merged output
+
+          ---
+
+          ### Task 5.4 — Distance metrics
+
+          Support all three standard metrics:
+
+          | Metric | Formula |
+          |--------|---------|
+          | Cosine | 1 − (a·b) / (‖a‖ · ‖b‖) |
+          | Dot product | −(a·b) |
+          | Euclidean | ‖a − b‖² |
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-core/src/types.rs  (extend DistanceMetric)
+          impl DistanceMetric {
+              pub fn compute(&self, a: &[f32], b: &[f32]) -> f32 {
+                  match self {
+                      Self::Cosine => cosine_distance(a, b),
+                      Self::DotProduct => dot_product_distance(a, b),
+                      Self::Euclidean => euclidean_distance(a, b),
+                  }
+              }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] All three metrics implemented and unit-tested
+          - [ ] Metric selected from `DatasetManifest` at serve time
+          - [ ] Documented in `docs/data-formats.md`
+
+          ---
+
+          ### Task 5.5 — Query configuration
+
+          Allow per-query parameter overrides in the HTTP request body:
+
+          ```json
+          {
+            "vector": [0.1, 0.2, ...],
+            "k": 10,
+            "candidate_shards": 4,
+            "rerank_limit": 50,
+            "distance_metric": "cosine"
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `QueryRequest` struct extended with optional override fields
+          - [ ] Server applies overrides over system defaults
+          - [ ] Updated `docs/api-reference.md` with new fields
+          - [ ] Validation: `k ≥ 1`, `candidate_shards ≥ 1`, metric is valid
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 5 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 5 — Query Engine Improvements" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 5: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 6 — Benchmarking and Evaluation
+        id: epic6
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 6 — Benchmarking and Evaluation
+
+          **Goal:** Build systematic measurement tools to track performance regressions and
+          evaluate retrieval quality.
+
+          ---
+
+          ### Task 6.1 — Benchmark dataset generator
+
+          Extend `tools/gen_sample.py` and add a Rust-native generator:
+
+          **Python extension:**
+          ```bash
+          # Generate clustered synthetic data
+          python tools/gen_sample.py \
+            --count 100000 \
+            --dims 128 \
+            --clusters 20 \
+            --cluster-std 0.1 \
+            --seed 42 \
+            --output fixtures/bench_100k_128d.jsonl
+          ```
+
+          **Rust CLI flag:**
+          ```bash
+          shardlake generate-dataset \
+            --count 100000 --dims 128 --clusters 20 --seed 42
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `--clusters` and `--cluster-std` flags on `gen_sample.py`
+          - [ ] `shardlake generate-dataset` CLI command
+          - [ ] Output is valid JSONL accepted by `shardlake ingest`
+
+          ---
+
+          ### Task 6.2 — Benchmark harness
+
+          Extend `shardlake benchmark` with richer metrics:
+
+          ```bash
+          shardlake benchmark \
+            --dataset-version ds-v1 \
+            --index-version idx-v1 \
+            --k 10 \
+            --nprobe 4 \
+            --queries 1000 \
+            --output benchmark-report.json
+          ```
+
+          **Report fields:**
+          ```json
+          {
+            "recall_at_k": 0.923,
+            "precision_at_k": 0.891,
+            "mean_latency_ms": 3.2,
+            "p50_latency_ms": 2.8,
+            "p95_latency_ms": 6.1,
+            "p99_latency_ms": 11.4,
+            "throughput_qps": 312.5,
+            "index_size_bytes": 4194304,
+            "compression_ratio": 8.2
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] P50/P95/P99 latency using `hdrhistogram` or `histogram` crate
+          - [ ] Throughput (QPS) computed
+          - [ ] JSON report written to file with `--output` flag
+          - [ ] Updated `docs/cli-reference.md`
+
+          ---
+
+          ### Task 6.3 — Workload simulation
+
+          Simulate realistic query workloads with varying cache conditions:
+
+          | Mode | Description |
+          |------|-------------|
+          | `cold` | Each query starts with empty cache |
+          | `warm` | Cache pre-warmed with all shards |
+          | `mixed` | 80% warm / 20% cold |
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-bench/src/lib.rs
+          pub enum WorkloadMode {
+              Cold,
+              Warm,
+              Mixed { warm_fraction: f32 },
+          }
+
+          pub struct BenchmarkConfig {
+              pub workload: WorkloadMode,
+              pub query_count: usize,
+              pub seed: u64,
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `--workload cold|warm|mixed` flag
+          - [ ] Cache cleared between queries in cold mode
+          - [ ] Benchmark report includes workload mode
+
+          ---
+
+          ### Task 6.4 — Cost estimation
+
+          Add a sub-command or flag to estimate resource usage:
+
+          ```bash
+          shardlake estimate-cost \
+            --dataset-version ds-v1 \
+            --index-version idx-v1
+          ```
+
+          **Output:**
+          ```
+          Dataset size:        1.2 GB
+          Index size:          150 MB  (compression ratio: 8.0×)
+          Shard memory (all):  150 MB
+          Shard memory (hot):   38 MB  (top 4 shards at nprobe=4)
+          Disk footprint:      1.35 GB
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `shardlake estimate-cost` command
+          - [ ] Reads manifest to compute sizes without loading shards
+          - [ ] Human-readable and JSON output modes
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 6 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 6 — Benchmarking and Evaluation" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 6: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 7 — Observability
+        id: epic7
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 7 — Observability
+
+          **Goal:** Expose internal system behavior through structured logs, metrics, and
+          query traces so operators can understand and debug production behavior.
+
+          ---
+
+          ### Task 7.1 — Structured logging
+
+          Add `tracing` spans for all major operations:
+
+          | Operation | Span fields |
+          |-----------|-------------|
+          | `shard.load` | shard_id, size_bytes, latency_ms |
+          | `ann.search` | shard_id, query_k, candidates_found |
+          | `rerank` | candidates_in, candidates_out, latency_ms |
+          | `query.total` | index_version, top_k, nprobe, latency_ms |
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/searcher.rs
+          #[tracing::instrument(skip(self, query), fields(top_k = params.top_k))]
+          pub async fn search(&self, query: &[f32], params: &QueryParams)
+              -> Result<Vec<SearchResult>, IndexError>
+          {
+              let shard_ids = tracing::trace_span!("centroid_routing").in_scope(|| {
+                  self.route_to_shards(query, params.candidate_shards)
+              });
+              // ...
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `#[tracing::instrument]` on all public async functions in `shardlake-index`
+          - [ ] Span fields include relevant context (IDs, sizes, latencies)
+          - [ ] `RUST_LOG=shardlake=trace` produces detailed per-query traces
+
+          ---
+
+          ### Task 7.2 — Metrics endpoint
+
+          Expose Prometheus-compatible metrics at `GET /metrics`.
+
+          **Metrics to expose:**
+
+          | Metric name | Type | Description |
+          |-------------|------|-------------|
+          | `shardlake_query_duration_seconds` | Histogram | End-to-end query latency |
+          | `shardlake_shard_cache_hits_total` | Counter | Shard cache hits |
+          | `shardlake_shard_cache_misses_total` | Counter | Shard cache misses |
+          | `shardlake_shard_load_duration_seconds` | Histogram | Shard load latency |
+          | `shardlake_recall_at_k` | Gauge | Last measured recall@k (from benchmarks) |
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-serve/src/metrics.rs  (new file)
+          use prometheus::{Counter, Histogram, Registry};
+
+          pub struct AppMetrics {
+              pub query_duration: Histogram,
+              pub cache_hits: Counter,
+              pub cache_misses: Counter,
+              pub shard_load_duration: Histogram,
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `GET /metrics` returns valid Prometheus text format
+          - [ ] All five metrics implemented
+          - [ ] Documented in `docs/api-reference.md`
+          - [ ] Use `prometheus` crate (already widely used)
+
+          ---
+
+          ### Task 7.3 — Query tracing debug endpoint
+
+          Add a debug endpoint: `POST /debug/query-plan`
+
+          **Request:** same as `/query`
+
+          **Response:**
+          ```json
+          {
+            "centroids_selected": [2, 7, 14],
+            "shards_searched": ["shard-002", "shard-007", "shard-014"],
+            "candidates_per_shard": {"shard-002": 48, "shard-007": 52, "shard-014": 31},
+            "total_candidates": 131,
+            "top_k_returned": 10,
+            "reranked": false,
+            "latency_ms": 4.2
+          }
+          ```
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-serve/src/routes.rs
+          pub async fn debug_query_plan(
+              State(state): State<AppState>,
+              Json(req): Json<QueryRequest>,
+          ) -> Result<Json<QueryPlan>, AppError> { ... }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `POST /debug/query-plan` endpoint
+          - [ ] Returns the plan without actually returning vectors
+          - [ ] Disabled in production via config flag (`debug.enable_query_plan = false`)
+          - [ ] Documented in `docs/api-reference.md`
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 7 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 7 — Observability" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 7: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 8 — Hybrid Retrieval
+        id: epic8
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 8 — Hybrid Retrieval
+
+          **Goal:** Add lexical + vector hybrid search to improve retrieval for queries where
+          keyword matching complements semantic similarity.
+
+          ---
+
+          ### Task 8.1 — BM25 inverted index
+
+          Implement a basic in-memory BM25 inverted index over vector metadata.
+
+          **BM25 score formula:**
+          ```
+          score(q, d) = Σ IDF(t) · TF(t,d) · (k1+1) / (TF(t,d) + k1·(1−b+b·|d|/avgdl))
+          ```
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/bm25.rs  (new file)
+          pub struct Bm25Index {
+              pub k1: f32,    // default 1.2
+              pub b: f32,     // default 0.75
+              inverted_index: HashMap<String, PostingList>,
+              doc_lengths: HashMap<VectorId, usize>,
+              avg_doc_len: f32,
+              num_docs: usize,
+          }
+
+          pub struct PostingList {
+              pub idf: f32,
+              pub postings: Vec<(VectorId, u32)>,   // (doc_id, term_freq)
+          }
+
+          impl Bm25Index {
+              pub fn build(records: &[(VectorId, HashMap<String, String>)]) -> Self { ... }
+              pub fn search(&self, query_terms: &[&str], top_k: usize) -> Vec<(VectorId, f32)> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `Bm25Index::build()` from metadata fields
+          - [ ] `Bm25Index::search()` returning scored results
+          - [ ] Unit tests: known queries return expected ranking
+
+          ---
+
+          ### Task 8.2 — Hybrid ranking
+
+          Combine vector score and BM25 score with a configurable weighted sum:
+
+          ```
+          hybrid_score = α · vector_score + (1 − α) · bm25_score
+          ```
+
+          **Requirements:**
+          - Both scores normalised to [0, 1] before combining
+          - Configurable `alpha` (default 0.5)
+          - Fall back to vector-only if no text fields in metadata
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/hybrid.rs  (new file)
+          pub struct HybridRanker {
+              pub alpha: f32,
+          }
+
+          impl HybridRanker {
+              pub fn rank(
+                  &self,
+                  vector_results: &[(VectorId, f32)],
+                  bm25_results: &[(VectorId, f32)],
+                  top_k: usize,
+              ) -> Vec<SearchResult> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `HybridRanker::rank()` method
+          - [ ] Score normalisation (min-max per result set)
+          - [ ] Configurable `alpha` in `QueryRequest`
+
+          ---
+
+          ### Task 8.3 — Query mode selection
+
+          Add a `mode` field to the query API:
+
+          ```json
+          {
+            "vector": [...],
+            "query_text": "fast GPU training",
+            "k": 10,
+            "mode": "hybrid",
+            "alpha": 0.6
+          }
+          ```
+
+          | Mode | Behaviour |
+          |------|-----------|
+          | `vector` | ANN search only (current default) |
+          | `lexical` | BM25 search only |
+          | `hybrid` | Weighted combination |
+
+          **Acceptance criteria:**
+          - [ ] `mode` field in `QueryRequest`
+          - [ ] `lexical` mode works without a vector field
+          - [ ] `hybrid` mode requires both `vector` and `query_text`
+          - [ ] Error returned if required fields missing for selected mode
+          - [ ] Updated `docs/api-reference.md`
+
+          ---
+
+          ### Task 8.4 — Hybrid recall evaluation
+
+          Measure the recall improvement from hybrid retrieval vs. vector-only.
+
+          **Command:**
+          ```bash
+          shardlake eval-hybrid \
+            --k 10 \
+            --alpha 0.5 \
+            --queries fixtures/eval_queries.jsonl
+          ```
+
+          **Output:**
+          ```
+          Mode        Recall@10   Precision@10   MeanLatency
+          vector      0.823       0.791          3.2ms
+          lexical     0.612       0.588          1.1ms
+          hybrid      0.891       0.864          4.8ms
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `shardlake eval-hybrid` command
+          - [ ] Compares all three modes on the same query set
+          - [ ] Table and JSON output
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 8 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 8 — Hybrid Retrieval" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 8: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 9 — Distributed Index Build
+        id: epic9
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 9 — Distributed Index Build
+
+          **Goal:** Allow parallel index building to scale to larger datasets without
+          unbounded memory usage.
+
+          ---
+
+          ### Task 9.1 — Parallel shard building
+
+          Build shards concurrently using `rayon` (CPU-bound) or `tokio` tasks (I/O-bound).
+
+          **Requirements:**
+          - Each shard builds independently in its own thread/task
+          - Progress reported via tracing spans
+          - Deterministic output when same seed used (per shard)
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/builder.rs
+          use rayon::prelude::*;
+
+          impl IndexBuilder {
+              pub fn build_parallel(
+                  &self,
+                  shards: Vec<ShardData>,
+                  params: &BuildParams,
+              ) -> Result<Vec<ShardIndex>, IndexError> {
+                  shards
+                      .into_par_iter()
+                      .enumerate()
+                      .map(|(i, data)| self.build_shard(i, data, params))
+                      .collect()
+              }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `build_parallel()` using `rayon::par_iter()`
+          - [ ] `--parallel` flag on `build-index` command (default: true)
+          - [ ] Benchmark: parallel build ≥ 2× faster than sequential on 4+ cores
+          - [ ] Deterministic output with fixed seed
+
+          ---
+
+          ### Task 9.2 — Distributed build mode
+
+          Support splitting a dataset across multiple worker processes.
+
+          **Design:**
+          - Worker receives: dataset slice key range, shard assignment, build params
+          - Worker writes its shard artifact to shared storage
+          - Coordinator polls until all workers complete
+
+          **CLI:**
+          ```bash
+          # Coordinator
+          shardlake build-index --parallel --workers 4 --dataset-version ds-v1
+
+          # Worker (invoked by coordinator via subprocess or job queue)
+          shardlake build-shard \
+            --shard-id 2 \
+            --dataset-version ds-v1 \
+            --build-params build-params.json
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `build-shard` sub-command for single-shard builds
+          - [ ] Coordinator logic that spawns N worker processes
+          - [ ] All shards written to storage; coordinator assembles final manifest
+          - [ ] Documented in `docs/cli-reference.md`
+
+          ---
+
+          ### Task 9.3 — Merge index shards
+
+          After distributed builds, merge partial outputs into a single manifest.
+
+          **Requirements:**
+          - Validate all expected shards are present and checksums valid
+          - Assemble index manifest from per-shard metadata
+          - Publish merged manifest atomically
+
+          **CLI:**
+          ```bash
+          shardlake merge-shards \
+            --dataset-version ds-v1 \
+            --index-version idx-v1 \
+            --shard-dir ./partial-shards/
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `merge-shards` command
+          - [ ] Validates completeness (no missing shards)
+          - [ ] Writes final index manifest
+          - [ ] Idempotent: re-running with same inputs produces same manifest
+
+          ---
+
+          ### Task 9.4 — Build scheduler CLI
+
+          Unified scheduler command that orchestrates the full parallel build:
+
+          ```bash
+          shardlake build-index \
+            --dataset-version ds-v1 \
+            --index-version idx-v1 \
+            --parallel \
+            --num-workers 4 \
+            --algorithm ivfpq
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `--parallel` flag triggers distributed build flow
+          - [ ] Progress bar or structured log for each shard's build status
+          - [ ] Build duration written to index manifest
+          - [ ] `--dry-run` flag prints build plan without executing
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 9 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 9 — Distributed Index Build" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 9: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Create Epic 10 — Future ANN Research Integration
+        id: epic10
+        run: |
+          BODY=$(cat <<'ISSUE_BODY'
+          ## Epic 10 — Future ANN Research Integration
+
+          **Goal:** Make Shardlake a research testbed for evaluating and comparing
+          approximate nearest neighbor algorithms.
+
+          ---
+
+          ### Task 10.1 — DiskANN experiment
+
+          Integrate a disk-based ANN algorithm inspired by the DiskANN paper
+          (Subramanya et al., NeurIPS 2019).
+
+          **Key ideas:**
+          - Graph-based index stored on disk; only a small working set in memory
+          - Greedy beam search traversal with disk I/O for out-of-memory nodes
+          - Useful for datasets larger than available RAM
+
+          **Relevant code:**
+          ```rust
+          // crates/shardlake-index/src/diskann.rs  (new file)
+          pub struct DiskAnnIndex {
+              graph: MmapGraph,         // adjacency list on disk via mmap
+              entry_point: VectorId,
+              beam_width: usize,
+          }
+
+          impl DiskAnnIndex {
+              pub fn build(
+                  vectors: &[(VectorId, Vec<f32>)],
+                  max_degree: usize,
+                  alpha: f32,
+              ) -> Result<Self, IndexError> { ... }
+
+              pub fn search(
+                  &self,
+                  query: &[f32],
+                  top_k: usize,
+                  beam_width: usize,
+              ) -> Vec<SearchResult> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `DiskAnnIndex::build()` producing a valid graph on disk
+          - [ ] `DiskAnnIndex::search()` with beam search traversal
+          - [ ] Recall@10 ≥ 0.9 at 1ms latency on 1M 128-dim vectors (aspirational)
+          - [ ] Memory usage bounded by `beam_width × vector_size`
+
+          ---
+
+          ### Task 10.2 — HNSW integration
+
+          Implement a Hierarchical Navigable Small World graph index.
+
+          **Key ideas:**
+          - Hierarchical graph with long-range links at upper layers
+          - Greedy search descends from top layer to bottom
+          - Build time O(n log n), query time O(log n)
+
+          **Design:**
+          ```rust
+          // crates/shardlake-index/src/hnsw.rs  (new file)
+          pub struct HnswIndex {
+              layers: Vec<Layer>,
+              entry_point: VectorId,
+              ef_construction: usize,   // build-time beam width
+              m: usize,                 // max connections per node
+          }
+
+          pub struct Layer {
+              graph: HashMap<VectorId, Vec<VectorId>>,
+              vectors: HashMap<VectorId, Vec<f32>>,
+          }
+
+          impl HnswIndex {
+              pub fn build(vectors: &[(VectorId, Vec<f32>)], m: usize, ef: usize) -> Self { ... }
+              pub fn search(&self, query: &[f32], top_k: usize, ef: usize) -> Vec<SearchResult> { ... }
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `HnswIndex::build()` and `HnswIndex::search()` implemented
+          - [ ] Recall@10 ≥ 0.95 at ef=50 on synthetic clustered data
+          - [ ] Index serialisable to/from disk via serde + bincode
+
+          ---
+
+          ### Task 10.3 — ANN plugin interface
+
+          Define a trait that any ANN algorithm must implement, allowing runtime
+          selection and easy addition of new algorithms.
+
+          ```rust
+          // crates/shardlake-index/src/ann.rs  (new file)
+          #[async_trait]
+          pub trait AnnIndex: Send + Sync {
+              fn algorithm(&self) -> IndexAlgorithm;
+              fn dimension(&self) -> usize;
+
+              fn search(
+                  &self,
+                  query: &[f32],
+                  top_k: usize,
+                  params: &SearchParams,
+              ) -> Result<Vec<SearchResult>, IndexError>;
+
+              fn save(&self, store: &dyn StorageBackend, key: &str) -> Result<(), IndexError>;
+
+              fn load(store: &dyn StorageBackend, key: &str) -> Result<Box<dyn AnnIndex>, IndexError>
+              where
+                  Self: Sized;
+
+              fn stats(&self) -> IndexStats;
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `AnnIndex` trait with build/search/save/load/stats
+          - [ ] Existing `ShardIndex` (brute-force) implements `AnnIndex`
+          - [ ] `IvfIndex`, `HnswIndex`, `DiskAnnIndex` implement `AnnIndex`
+          - [ ] Factory function: `AnnIndex::from_algorithm(algo, store, key)`
+
+          ---
+
+          ### Task 10.4 — ANN benchmark comparison
+
+          Add a head-to-head benchmark comparing all implemented algorithms.
+
+          **Command:**
+          ```bash
+          shardlake benchmark-ann \
+            --dataset-version ds-v1 \
+            --algorithms ivfpq,hnsw,diskann,exact \
+            --k 10 \
+            --queries 1000 \
+            --output ann-comparison.json
+          ```
+
+          **Report format:**
+          ```json
+          {
+            "dataset": "ds-v1",
+            "query_count": 1000,
+            "results": [
+              {
+                "algorithm": "hnsw",
+                "recall_at_10": 0.951,
+                "mean_latency_ms": 0.8,
+                "p99_latency_ms": 2.1,
+                "index_size_mb": 42.3,
+                "build_time_secs": 38.2
+              },
+              {
+                "algorithm": "ivfpq",
+                "recall_at_10": 0.923,
+                "mean_latency_ms": 1.2,
+                "p99_latency_ms": 3.4,
+                "index_size_mb": 12.1,
+                "build_time_secs": 12.7
+              }
+            ]
+          }
+          ```
+
+          **Acceptance criteria:**
+          - [ ] `shardlake benchmark-ann` command
+          - [ ] Comparable conditions (same dataset, same queries, same k)
+          - [ ] Side-by-side table output in terminal
+          - [ ] JSON report with full metrics
+          - [ ] Documented in `docs/cli-reference.md`
+          ISSUE_BODY
+          )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — Epic 10 (skipped)"
+          else
+            URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Epic 10 — Future ANN Research Integration" \
+              --body "$BODY" \
+              --label "epic")
+            NUMBER=$(echo "$URL" | grep -oE '[0-9]+$')
+            echo "Created Epic 10: #$NUMBER"
+            PARENT=${{ steps.parent.outputs.parent_number }}
+            if [ "$PARENT" != "0" ] && [ -n "$PARENT" ]; then
+              CHILD_NUM="$NUMBER"
+              gh api --method POST \
+                "/repos/$REPO/issues/$PARENT/sub-issues" \
+                -f sub_issue_id="$CHILD_NUM" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Epic Issue Creation Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "**DRY RUN** — no issues were created." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Issues created successfully. Check the Issues tab for:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Parent umbrella issue: Shardlake v1.x Roadmap — 10 Engineering Epics" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 1: Artifact and Dataset Lifecycle" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 2: Shard Routing and Partitioning" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 3: ANN Index Algorithms" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 4: Shard Cache and Storage Layer" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 5: Query Engine Improvements" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 6: Benchmarking and Evaluation" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 7: Observability" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 8: Hybrid Retrieval" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 9: Distributed Index Build" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Epic 10: Future ANN Research Integration" >> "$GITHUB_STEP_SUMMARY"
+          fi
