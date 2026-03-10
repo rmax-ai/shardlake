@@ -1,48 +1,62 @@
-//! Query-time shard searcher with lazy loading and in-memory cache.
+//! Query-time shard searcher backed by an LRU [`ShardCache`].
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 use tracing::{debug, info};
 
 use shardlake_core::types::{DistanceMetric, SearchResult, ShardId};
 use shardlake_manifest::Manifest;
-use shardlake_storage::ObjectStore;
+use shardlake_storage::StorageBackend;
 
 use crate::{
+    cache::{CacheConfig, CacheMetrics, ShardCache},
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
     shard::ShardIndex,
     IndexError, Result,
 };
 
-/// Searcher that loads shard indexes lazily from `store`, caching them in RAM.
+/// Searcher that loads shard indexes lazily from a storage backend, caching
+/// them in an LRU [`ShardCache`].
 pub struct IndexSearcher {
-    store: Arc<dyn ObjectStore>,
+    store: Arc<dyn StorageBackend>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    cache: ShardCache,
 }
 
 impl IndexSearcher {
-    /// Create a new searcher from a loaded manifest.
-    pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+    /// Create a new searcher from a loaded manifest using default cache settings.
+    pub fn new(store: Arc<dyn StorageBackend>, manifest: Manifest) -> Self {
+        Self::with_cache_config(store, manifest, CacheConfig::default())
+    }
+
+    /// Create a new searcher with explicit cache configuration.
+    pub fn with_cache_config(
+        store: Arc<dyn StorageBackend>,
+        manifest: Manifest,
+        cache_config: CacheConfig,
+    ) -> Self {
         info!(
             index_version = %manifest.index_version,
             shards = manifest.shards.len(),
+            cache_capacity = cache_config.capacity,
             "IndexSearcher created"
         );
         Self {
             store,
             manifest,
-            cache: Mutex::new(HashMap::new()),
+            cache: ShardCache::new(cache_config),
         }
     }
 
     /// Return the underlying manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Return a snapshot of the shard cache metrics.
+    pub fn cache_metrics(&self) -> CacheMetrics {
+        self.cache.metrics()
     }
 
     /// Perform approximate top-k search using nprobe shard probing.
@@ -75,6 +89,20 @@ impl IndexSearcher {
 
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
+        // Record the query for the prefetch policy (threshold 0 = disabled).
+        let shard_defs: Vec<(ShardId, &str)> = self
+            .manifest
+            .shards
+            .iter()
+            .map(|s| (s.shard_id, s.artifact_key.as_str()))
+            .collect();
+        self.cache.record_query_and_prefetch(
+            &probe_shards,
+            &shard_defs,
+            self.store.as_ref(),
+            u64::MAX, // disabled by default; callers may set their own policy
+        );
+
         let mut all_results = Vec::new();
         for shard_id in probe_shards {
             let shard = self.load_shard(shard_id)?;
@@ -85,15 +113,8 @@ impl IndexSearcher {
         Ok(merge_top_k(all_results, k))
     }
 
-    /// Load a shard from cache or store.
+    /// Load a shard from the cache, falling back to the store on a miss.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some(idx) = cache.get(&shard_id) {
-                return Ok(Arc::clone(idx));
-            }
-        }
-
         let shard_def = self
             .manifest
             .shards
@@ -101,11 +122,7 @@ impl IndexSearcher {
             .find(|s| s.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert(shard_id, Arc::clone(&idx));
-        Ok(idx)
+        self.cache
+            .get_or_load(shard_id, &shard_def.artifact_key, self.store.as_ref())
     }
 }

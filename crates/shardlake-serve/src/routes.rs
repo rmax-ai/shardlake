@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use shardlake_core::types::SearchResult;
+use shardlake_index::CacheMetrics;
 
 use crate::AppState;
 
@@ -33,11 +34,36 @@ pub struct HealthResponse {
     pub index_version: String,
 }
 
+/// Cache statistics response.
+#[derive(Debug, Serialize)]
+pub struct CacheStatsResponse {
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f64,
+    pub avg_load_latency_ms: f64,
+    pub memory_bytes: usize,
+    pub cached_shards: usize,
+}
+
+impl From<CacheMetrics> for CacheStatsResponse {
+    fn from(m: CacheMetrics) -> Self {
+        Self {
+            hits: m.hits,
+            misses: m.misses,
+            hit_rate: m.hit_rate,
+            avg_load_latency_ms: m.avg_load_latency_ms,
+            memory_bytes: m.memory_bytes,
+            cached_shards: m.cached_shards,
+        }
+    }
+}
+
 /// Build the axum router with all routes attached to `state`.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/query", post(query_handler))
+        .route("/cache-stats", get(cache_stats_handler))
         .with_state(state)
 }
 
@@ -76,4 +102,8 @@ async fn query_handler(
         )
             .into_response(),
     }
+}
+
+async fn cache_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(CacheStatsResponse::from(state.cache_metrics()))
 }

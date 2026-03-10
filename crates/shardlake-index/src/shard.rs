@@ -33,6 +33,17 @@ pub struct ShardIndex {
 }
 
 impl ShardIndex {
+    /// Estimated heap memory occupied by this shard index, in bytes.
+    ///
+    /// Accounts for centroid and vector data arrays but not metadata payloads
+    /// (which are not serialised in the `.sidx` binary format).
+    pub fn memory_bytes(&self) -> usize {
+        let centroid_bytes = self.centroids.len() * self.dims * std::mem::size_of::<f32>();
+        let record_bytes = self.records.len()
+            * (std::mem::size_of::<u64>() + self.dims * std::mem::size_of::<f32>());
+        centroid_bytes + record_bytes
+    }
+
     /// Serialise to bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();

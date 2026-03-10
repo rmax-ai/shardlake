@@ -53,7 +53,7 @@ fn test_build_and_search() {
     assert_eq!(shard_sum, manifest.total_vector_count);
 
     let searcher = IndexSearcher::new(
-        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
+        Arc::clone(&store) as Arc<dyn shardlake_storage::StorageBackend>,
         manifest,
     );
     let query = records[0].data.clone();

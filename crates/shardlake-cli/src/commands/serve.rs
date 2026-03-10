@@ -6,10 +6,10 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use shardlake_index::IndexSearcher;
+use shardlake_index::{CacheConfig, IndexSearcher};
 use shardlake_manifest::Manifest;
 use shardlake_serve::{build_router, AppState};
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_storage::{LocalObjectStore, StorageBackend};
 
 #[derive(Parser, Debug)]
 pub struct ServeArgs {
@@ -25,15 +25,18 @@ pub struct ServeArgs {
 }
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
-    let store: std::sync::Arc<dyn ObjectStore> =
-        std::sync::Arc::new(LocalObjectStore::new(&storage)?);
-    let manifest = Manifest::load_alias(&*store, &args.alias)?;
+    let store = std::sync::Arc::new(LocalObjectStore::new(&storage)?);
+    let manifest = Manifest::load_alias(store.as_ref(), &args.alias)?;
     info!(
         alias = %args.alias,
         index_version = %manifest.index_version,
         "Serving manifest"
     );
-    let searcher = std::sync::Arc::new(IndexSearcher::new(std::sync::Arc::clone(&store), manifest));
+    let searcher = std::sync::Arc::new(IndexSearcher::with_cache_config(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn StorageBackend>,
+        manifest,
+        CacheConfig::default(),
+    ));
     let state = AppState {
         searcher,
         nprobe: args.nprobe,

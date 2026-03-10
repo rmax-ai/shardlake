@@ -51,6 +51,36 @@ trade-off:
 A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 `shardlake benchmark` and increase `nprobe` until the recall target is met.
 
+## Shard cache (`CacheConfig`)
+
+The shard cache is configured programmatically via `CacheConfig` (used by
+`IndexSearcher::with_cache_config`). The defaults are suitable for most workloads.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `capacity` | usize | `64` | Maximum number of shard indexes kept in RAM simultaneously. When the cache is full the least recently used shard is evicted. |
+| `mmap_threshold_bytes` | usize | `67_108_864` (64 MiB) | File-size threshold above which shard files are loaded via `mmap(2)` instead of `read(2)`. Memory-mapped loading avoids copying shard data into a heap buffer and is only available for `LocalFilesystemBackend`; it is ignored for `S3CompatibleBackend`. Set to `usize::MAX` to disable mmap entirely. |
+
+### Tuning guidance
+
+- **`capacity`**: Set to at least `num_shards` to allow the full index to fit in RAM. A
+  larger value (e.g. `num_shards * 2`) is useful when multiple index versions are served
+  concurrently.
+- **`mmap_threshold_bytes`**: Lower this value to use mmap for smaller shards. Set to `0`
+  to always use mmap when a local path is available. The default of 64 MiB is a
+  conservative starting point; production workloads with large shard files (> 256 MiB)
+  should lower this threshold to reduce heap pressure.
+
+## Storage backends
+
+Shardlake's storage layer is abstracted behind the `StorageBackend` trait (which extends
+`ObjectStore` with optional filesystem-path access for mmap support).
+
+| Backend | Type | Description |
+|---------|------|-------------|
+| `LocalFilesystemBackend` | `LocalObjectStore` alias | Stores artifacts as files under `--storage` root. Supports mmap via `path_for_key`. |
+| `S3CompatibleBackend` | stub | Placeholder for AWS S3 / MinIO. All operations return an error. `path_for_key` returns `None`. |
+
 ## Logging
 
 Shardlake uses the [`tracing`](https://docs.rs/tracing) crate. Log verbosity is

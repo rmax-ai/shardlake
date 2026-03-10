@@ -5,7 +5,7 @@ use std::{
 
 use tracing::{debug, trace};
 
-use crate::{ObjectStore, Result, StorageError};
+use crate::{ObjectStore, Result, StorageBackend, StorageError};
 
 /// Local filesystem-backed object store.
 ///
@@ -28,7 +28,7 @@ impl LocalObjectStore {
         Ok(Self { root })
     }
 
-    fn full_path(&self, key: &str) -> PathBuf {
+    pub(crate) fn full_path(&self, key: &str) -> PathBuf {
         self.root
             .join(key.replace('/', std::path::MAIN_SEPARATOR_STR))
     }
@@ -86,6 +86,14 @@ impl ObjectStore for LocalObjectStore {
             path: path.display().to_string(),
             source: e,
         })
+    }
+}
+
+/// [`StorageBackend`] implementation: exposes the absolute filesystem path so
+/// that callers can memory-map large shard files without reading them into RAM.
+impl StorageBackend for LocalObjectStore {
+    fn path_for_key(&self, key: &str) -> Option<PathBuf> {
+        Some(self.full_path(key))
     }
 }
 

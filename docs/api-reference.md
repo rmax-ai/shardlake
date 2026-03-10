@@ -110,3 +110,39 @@ curl -s -X POST http://localhost:8080/query \
 - **Inner product**: `score = -dot(a, b)`. Negated so that lower is always better; the most similar vector has the most negative raw dot product but the smallest (most negative → closest to zero) reported score.
 
 In all cases, results are sorted ascending by score (best match first).
+
+---
+
+## `GET /cache-stats`
+
+Returns a snapshot of the shard-cache statistics for the running server instance.
+These metrics are useful for diagnosing cache utilisation, tuning `--nprobe`, and
+estimating memory overhead.
+
+### Response
+
+```json
+{
+  "hits": 1024,
+  "misses": 3,
+  "hit_rate": 0.9971,
+  "avg_load_latency_ms": 12.4,
+  "memory_bytes": 8388608,
+  "cached_shards": 4
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hits` | integer | Total cache lookups that found a resident shard (no I/O). |
+| `misses` | integer | Total cache lookups that required loading from storage. |
+| `hit_rate` | float | `hits / (hits + misses)`. Returns `0.0` when no lookups have been made. |
+| `avg_load_latency_ms` | float | Average time to load one shard from storage (milliseconds). Returns `0.0` when no shards have been loaded. |
+| `memory_bytes` | integer | Estimated heap memory occupied by all currently cached shard indexes (bytes). |
+| `cached_shards` | integer | Number of shard indexes currently resident in the cache. |
+
+### Example
+
+```bash
+curl -s http://localhost:8080/cache-stats | python3 -m json.tool
+```

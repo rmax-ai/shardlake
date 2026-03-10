@@ -13,7 +13,7 @@ use tracing::info;
 use shardlake_core::types::VectorRecord;
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_storage::{LocalObjectStore, ObjectStore, StorageBackend};
 
 #[derive(Parser, Debug)]
 pub struct BenchmarkArgs {
@@ -33,7 +33,7 @@ pub struct BenchmarkArgs {
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
     let store = Arc::new(LocalObjectStore::new(&storage)?);
-    let manifest = Manifest::load_alias(&*store, &args.alias)?;
+    let manifest = Manifest::load_alias(store.as_ref(), &args.alias)?;
     let metric = manifest.distance_metric;
     info!(index_version = %manifest.index_version, "Loaded manifest for benchmark");
 
@@ -61,11 +61,8 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         "Running benchmark"
     );
 
-    let searcher = IndexSearcher::new(
-        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
-        manifest,
-    );
-    let store_arc: Arc<dyn shardlake_storage::ObjectStore> = store;
+    let searcher = IndexSearcher::new(Arc::clone(&store) as Arc<dyn StorageBackend>, manifest);
+    let store_arc: Arc<dyn ObjectStore> = store;
     let report = shardlake_bench::run_benchmark(
         &searcher,
         &store_arc,

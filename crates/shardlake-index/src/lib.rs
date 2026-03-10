@@ -1,12 +1,14 @@
 //! Index building and approximate nearest-neighbour search.
 
 pub mod builder;
+pub mod cache;
 pub mod exact;
 pub mod kmeans;
 pub mod searcher;
 pub mod shard;
 
 pub use builder::{BuildParams, IndexBuilder};
+pub use cache::{CacheConfig, CacheMetrics, ShardCache};
 pub use exact::ExactSearcher;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
