@@ -1,4 +1,4 @@
-//! `shardlake benchmark` – recall@k and latency report.
+//! `shardlake benchmark` – recall@k, latency, throughput, and cost report.
 
 use std::{
     io::{BufRead, BufReader},
@@ -10,6 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
+use shardlake_bench::WorkloadKind;
 use shardlake_core::types::VectorRecord;
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
@@ -29,6 +30,9 @@ pub struct BenchmarkArgs {
     /// Maximum number of query vectors to use (0 = up to 100).
     #[arg(long, default_value_t = 0)]
     pub max_queries: usize,
+    /// Query workload: cold (no cache), warm (pre-warmed cache), or mixed (alternating).
+    #[arg(long, default_value = "warm")]
+    pub workload: WorkloadKind,
 }
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
@@ -58,6 +62,7 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         n_queries = queries.len(),
         k = args.k,
         nprobe = args.nprobe,
+        workload = %args.workload,
         "Running benchmark"
     );
 
@@ -74,9 +79,11 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         args.k,
         args.nprobe,
         metric,
+        args.workload,
     );
 
     println!("=== Benchmark Report ===");
+    println!("  Workload:          {}", report.workload);
     println!("  Queries:           {}", report.num_queries);
     println!("  k:                 {}", report.k);
     println!("  nprobe:            {}", report.nprobe);
@@ -87,7 +94,16 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
     );
     println!("  Mean latency:      {:.1} µs", report.mean_latency_us);
     println!("  P99  latency:      {:.1} µs", report.p99_latency_us);
-    println!("  Artifact size:     {} bytes", report.artifact_size_bytes);
+    println!("  Throughput:        {:.1} QPS", report.throughput_qps);
+    println!();
+    println!("=== Cost Estimates ===");
+    println!("  Index size:        {} bytes", report.artifact_size_bytes);
+    println!(
+        "  Raw vectors size:  {} bytes",
+        report.raw_vector_size_bytes
+    );
+    println!("  Memory (est.):     {} bytes", report.memory_bytes);
+    println!("  Compression ratio: {:.3}x", report.compression_ratio);
 
     Ok(())
 }

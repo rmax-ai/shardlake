@@ -45,6 +45,14 @@ impl IndexSearcher {
         &self.manifest
     }
 
+    /// Clear the shard cache.
+    ///
+    /// All subsequent queries will reload shard data from the object store.
+    /// This is useful for simulating cold-start query workloads in benchmarks.
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+
     /// Perform approximate top-k search using nprobe shard probing.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
         let metric: DistanceMetric = self.manifest.distance_metric;

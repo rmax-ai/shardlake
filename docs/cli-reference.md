@@ -169,8 +169,8 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k) and latency by comparing the index output
-against an exact brute-force baseline over a sample of the corpus.
+Measures approximate-search quality (Recall@k), latency, throughput, and cost by comparing
+the index output against an exact brute-force baseline over a sample of the corpus.
 
 ### Usage
 
@@ -186,6 +186,15 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve |
 | `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
+| `--workload <KIND>` | enum | `warm` | Query workload: `cold`, `warm`, or `mixed` |
+
+#### Workload kinds
+
+| Kind | Behaviour |
+|------|-----------|
+| `warm` | Shard cache is pre-warmed; all measurements are cache hits |
+| `cold` | Shard cache is cleared before every query (simulates cold start) |
+| `mixed` | Even-indexed queries are cold, odd-indexed are warm (50/50 split) |
 
 ### Output
 
@@ -193,18 +202,84 @@ Printed to stdout:
 
 ```
 === Benchmark Report ===
+  Workload:          warm
   Queries:           100
   k:                 10
   nprobe:            2
   Recall@10:         0.9400
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
-  Artifact size:     184320 bytes
+  Throughput:        23616.1 QPS
+
+=== Cost Estimates ===
+  Index size:        184320 bytes
+  Raw vectors size:  512000 bytes
+  Memory (est.):     184320 bytes
+  Compression ratio: 2.778x
 ```
 
 ### Example
 
 ```bash
-# Full precision benchmark with a larger query sample
+# Full precision warm benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Measure cold-start latency
+shardlake benchmark --k 10 --nprobe 4 --workload cold
+
+# Simulate a realistic mixed workload
+shardlake benchmark --k 10 --nprobe 4 --workload mixed --max-queries 200
+```
+
+---
+
+## `shardlake generate-dataset`
+
+Generates a synthetic JSONL vector dataset suitable for use with `shardlake ingest`.
+
+Vectors are drawn from Gaussian distributions centred on randomly placed cluster
+centroids. All parameters influence the random generator; results are reproducible
+given the same `--seed`.
+
+### Usage
+
+```
+shardlake generate-dataset [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dims <N>` | usize | `128` | Number of dimensions per vector |
+| `--num-vectors <N>` | usize | `10000` | Total number of vectors to generate |
+| `--num-clusters <N>` | usize | `10` | Number of clusters (controls cluster structure) |
+| `--cluster-spread <F>` | f32 | `0.1` | Standard deviation of each component around its centroid |
+| `--seed <N>` | u64 | `42` | Random seed for reproducible generation |
+| `--output <FILE>` | path | `generated.jsonl` | Output JSONL file path |
+
+### Output
+
+Writes a JSONL file where each line is:
+
+```json
+{"id": 1, "vector": [0.12, -0.45, ...], "metadata": {"cluster": 0}}
+```
+
+The `metadata.cluster` field records which cluster centroid each vector was drawn
+from, useful for ground-truth recall analysis.
+
+### Example
+
+```bash
+# Generate 50 000 vectors in 64 dims with 20 clusters, reproducible from seed 99
+shardlake generate-dataset \
+  --dims 64 \
+  --num-vectors 50000 \
+  --num-clusters 20 \
+  --seed 99 \
+  --output /tmp/bench_vectors.jsonl
+
+# Immediately ingest the result
+shardlake ingest --input /tmp/bench_vectors.jsonl --dataset-version synth-v1
 ```

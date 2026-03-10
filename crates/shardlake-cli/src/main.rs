@@ -29,8 +29,10 @@ enum Commands {
     Publish(commands::publish::PublishArgs),
     /// Start the HTTP query server.
     Serve(commands::serve::ServeArgs),
-    /// Run recall/latency benchmark.
+    /// Run recall/latency/throughput benchmark.
     Benchmark(commands::benchmark::BenchmarkArgs),
+    /// Generate a synthetic JSONL vector dataset for benchmarking.
+    GenerateDataset(commands::generate::GenerateArgs),
 }
 
 #[tokio::main]
@@ -47,5 +49,6 @@ async fn main() -> Result<()> {
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
+        Commands::GenerateDataset(args) => commands::generate::run(cli.storage, args).await,
     }
 }
