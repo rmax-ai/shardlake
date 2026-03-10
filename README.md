@@ -99,6 +99,21 @@ make demo
 | `shardlake serve` | Start HTTP query server |
 | `shardlake benchmark` | Measure recall@k and latency |
 
+Full command reference: [docs/cli-reference.md](docs/cli-reference.md)
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/getting-started.md](docs/getting-started.md) | Step-by-step installation and first-run walkthrough |
+| [docs/cli-reference.md](docs/cli-reference.md) | All CLI commands, flags, and defaults |
+| [docs/api-reference.md](docs/api-reference.md) | HTTP endpoints, request/response schemas |
+| [docs/data-formats.md](docs/data-formats.md) | Input JSONL, manifest schema, `.sidx` binary format |
+| [docs/configuration.md](docs/configuration.md) | Config fields, tuning guidance, logging |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Component diagram, data flow, trade-offs |
+| [DECISIONS.md](DECISIONS.md) | Design decisions and rationale |
+| [ROADMAP.md](ROADMAP.md) | Planned improvements |
+
 ## Workspace crates
 
 | Crate | Purpose |
