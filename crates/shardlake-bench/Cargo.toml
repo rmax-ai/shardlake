@@ -1,0 +1,15 @@
+[package]
+name = "shardlake-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shardlake-core = { workspace = true }
+shardlake-index = { workspace = true }
+shardlake-manifest = { workspace = true }
+shardlake-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
