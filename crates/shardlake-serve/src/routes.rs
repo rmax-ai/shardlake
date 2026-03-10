@@ -7,16 +7,26 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use shardlake_core::types::SearchResult;
+use shardlake_core::types::{QueryMode, SearchResult};
 
 use crate::AppState;
 
 /// Query request payload.
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
-    pub vector: Vec<f32>,
+    /// Query vector. Required for `vector` (default) and `hybrid` modes.
+    pub vector: Option<Vec<f32>>,
+    /// Number of results to return. Must be ≥ 1.
     pub k: usize,
+    /// Number of shards to probe (vector/hybrid only). Defaults to server `--nprobe`.
     pub nprobe: Option<usize>,
+    /// Retrieval mode: `"vector"` (default), `"lexical"`, or `"hybrid"`.
+    pub mode: Option<QueryMode>,
+    /// Query text for lexical and hybrid modes.
+    pub text: Option<String>,
+    /// Hybrid blending weight `[0.0, 1.0]`. `1.0` = pure vector, `0.0` = pure
+    /// lexical. Default `0.5`. Ignored for non-hybrid modes.
+    pub alpha: Option<f32>,
 }
 
 /// Query response envelope.
@@ -60,8 +70,54 @@ async fn query_handler(
         )
             .into_response();
     }
+
+    let mode = req.mode.unwrap_or(QueryMode::Vector);
     let nprobe = req.nprobe.unwrap_or(state.nprobe);
-    match state.searcher.search(&req.vector, req.k, nprobe) {
+    let alpha = req.alpha.unwrap_or(0.5).clamp(0.0, 1.0);
+
+    let result = match mode {
+        QueryMode::Vector => {
+            let Some(ref vector) = req.vector else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "\"vector\" field is required for mode \"vector\"" })),
+                )
+                    .into_response();
+            };
+            state.searcher.search(vector, req.k, nprobe)
+        }
+        QueryMode::Lexical => {
+            let Some(ref text) = req.text else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "\"text\" field is required for mode \"lexical\"" })),
+                )
+                    .into_response();
+            };
+            state.searcher.search_lexical(text, req.k)
+        }
+        QueryMode::Hybrid => {
+            let Some(ref vector) = req.vector else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "\"vector\" field is required for mode \"hybrid\"" })),
+                )
+                    .into_response();
+            };
+            let Some(ref text) = req.text else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "\"text\" field is required for mode \"hybrid\"" })),
+                )
+                    .into_response();
+            };
+            state
+                .searcher
+                .search_hybrid(vector, text, req.k, nprobe, alpha)
+        }
+    };
+
+    match result {
         Ok(results) => {
             let version = state.searcher.manifest().index_version.0.clone();
             Json(QueryResponse {

@@ -1,13 +1,17 @@
 //! Index building and approximate nearest-neighbour search.
 
+pub mod bm25;
 pub mod builder;
 pub mod exact;
+pub mod hybrid;
 pub mod kmeans;
 pub mod searcher;
 pub mod shard;
 
+pub use bm25::BM25Index;
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
+pub use hybrid::hybrid_rank;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
 

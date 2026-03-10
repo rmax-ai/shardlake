@@ -5,6 +5,6 @@ pub mod types;
 pub use config::SystemConfig;
 pub use error::{CoreError, Result};
 pub use types::{
-    DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult, ShardId,
-    VectorId, VectorRecord,
+    DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, QueryMode, SearchResult,
+    ShardId, VectorId, VectorRecord,
 };

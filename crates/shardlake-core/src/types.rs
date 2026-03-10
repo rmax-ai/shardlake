@@ -50,6 +50,29 @@ impl std::fmt::Display for IndexVersion {
     }
 }
 
+/// Query execution mode controlling which retrieval signal(s) are used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMode {
+    /// Pure vector (ANN) search (default).
+    #[default]
+    Vector,
+    /// Pure lexical (BM25) search.
+    Lexical,
+    /// Hybrid: blended vector and lexical scores.
+    Hybrid,
+}
+
+impl std::fmt::Display for QueryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryMode::Vector => write!(f, "vector"),
+            QueryMode::Lexical => write!(f, "lexical"),
+            QueryMode::Hybrid => write!(f, "hybrid"),
+        }
+    }
+}
+
 /// Supported distance metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]

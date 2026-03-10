@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use shardlake_core::types::VectorRecord;
+use shardlake_core::types::{QueryMode, VectorRecord};
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -29,6 +29,15 @@ pub struct BenchmarkArgs {
     /// Maximum number of query vectors to use (0 = up to 100).
     #[arg(long, default_value_t = 0)]
     pub max_queries: usize,
+    /// Query mode to benchmark: `vector`, `lexical`, or `hybrid`.
+    /// When `hybrid` or `lexical`, the server must have been started
+    /// with `--enable-bm25` (or the benchmark corpus must have text metadata).
+    #[arg(long, default_value = "vector")]
+    pub mode: QueryMode,
+    /// Hybrid blending weight (0.0–1.0). 1.0 = pure vector, 0.0 = pure
+    /// lexical. Only used when `--mode hybrid`.
+    #[arg(long, default_value_t = 0.5)]
+    pub alpha: f32,
 }
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
@@ -58,28 +67,41 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         n_queries = queries.len(),
         k = args.k,
         nprobe = args.nprobe,
+        mode = %args.mode,
         "Running benchmark"
     );
 
-    let searcher = IndexSearcher::new(
-        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
-        manifest,
-    );
+    // Build searcher with BM25 when needed for lexical/hybrid modes.
     let store_arc: Arc<dyn shardlake_storage::ObjectStore> = store;
-    let report = shardlake_bench::run_benchmark(
+    let searcher = match args.mode {
+        QueryMode::Vector => IndexSearcher::new(Arc::clone(&store_arc), manifest),
+        QueryMode::Lexical | QueryMode::Hybrid => {
+            IndexSearcher::with_corpus(Arc::clone(&store_arc), manifest, &corpus)
+        }
+    };
+
+    let report = shardlake_bench::run_benchmark_mode(
         &searcher,
         &store_arc,
         &queries,
         &corpus,
-        args.k,
-        args.nprobe,
-        metric,
+        &shardlake_bench::BenchmarkConfig {
+            k: args.k,
+            nprobe: args.nprobe,
+            metric,
+            mode: args.mode,
+            alpha: args.alpha,
+        },
     );
 
     println!("=== Benchmark Report ===");
     println!("  Queries:           {}", report.num_queries);
     println!("  k:                 {}", report.k);
     println!("  nprobe:            {}", report.nprobe);
+    println!("  Mode:              {}", report.mode);
+    if matches!(args.mode, QueryMode::Hybrid) {
+        println!("  Alpha:             {:.2}", args.alpha);
+    }
     println!(
         "  Recall@{k}:         {:.4}",
         report.recall_at_k,

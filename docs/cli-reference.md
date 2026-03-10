@@ -142,6 +142,9 @@ shardlake publish --index-version idx-v1 --alias stable
 Starts the HTTP query server. Loads the manifest identified by `--alias` at startup;
 individual shard artifacts are loaded lazily on first use and cached in RAM.
 
+When `--enable-bm25` is passed the server also loads the full corpus at startup to
+build a BM25 inverted index, enabling `lexical` and `hybrid` query modes.
+
 ### Usage
 
 ```
@@ -155,12 +158,16 @@ shardlake [--storage <PATH>] serve [OPTIONS]
 | `--alias <STRING>` | string | `latest` | Alias name to resolve at startup |
 | `--bind <ADDR:PORT>` | string | `0.0.0.0:8080` | TCP address to listen on |
 | `--nprobe <N>` | usize | `2` | Default shard probe count for queries that omit `nprobe` |
+| `--enable-bm25` | flag | `false` | Load corpus at startup and build a BM25 index for lexical/hybrid queries |
 
 ### Example
 
 ```bash
 # Serve the "stable" alias on a non-default port
 shardlake serve --alias stable --bind 127.0.0.1:9090 --nprobe 4
+
+# Enable hybrid retrieval (loads BM25 index at startup)
+shardlake serve --alias latest --enable-bm25
 ```
 
 See [API Reference](api-reference.md) for the HTTP endpoints.
@@ -169,8 +176,9 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k) and latency by comparing the index output
-against an exact brute-force baseline over a sample of the corpus.
+Measures retrieval quality (Recall@k) and latency by comparing the index output
+against an exact brute-force baseline over a sample of the corpus.  Supports
+`vector`, `lexical`, and `hybrid` query modes for side-by-side recall comparison.
 
 ### Usage
 
@@ -186,6 +194,8 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve |
 | `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
+| `--mode <MODE>` | enum | `vector` | Query mode: `vector`, `lexical`, or `hybrid` |
+| `--alpha <F>` | float | `0.5` | Hybrid blending weight `[0.0, 1.0]`; `1.0` = pure vector, `0.0` = pure lexical. Only used when `--mode hybrid`. |
 
 ### Output
 
@@ -196,15 +206,29 @@ Printed to stdout:
   Queries:           100
   k:                 10
   nprobe:            2
+  Mode:              vector
   Recall@10:         0.9400
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
   Artifact size:     184320 bytes
 ```
 
+When `--mode hybrid`, an additional `Alpha` line is printed:
+
+```
+  Mode:              hybrid
+  Alpha:             0.50
+```
+
 ### Example
 
 ```bash
-# Full precision benchmark with a larger query sample
+# Vector-only benchmark
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Hybrid benchmark (alpha=0.6 means 60% vector, 40% lexical)
+shardlake benchmark --mode hybrid --alpha 0.6 --k 10
+
+# Pure lexical benchmark
+shardlake benchmark --mode lexical --k 10
 ```
