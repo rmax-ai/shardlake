@@ -79,6 +79,10 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards |
 | `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
+| `--candidate-centroids <N>` | u32 | `0` | Number of top centroids evaluated per query during routing. `0` = same as `--nprobe` |
+| `--candidate-shards <N>` | u32 | `0` | Maximum unique shards to probe after centroid routing. `0` = same as `--nprobe` |
+| `--max-vectors-per-shard <N>` | u32 | `0` | Cap on vectors per shard; overflow is re-assigned to the next-nearest centroid. `0` = unlimited |
+| `--kmeans-sample-size <N>` | u32 | `0` | Train K-means on a random sample of this many vectors. `0` = use all vectors |
 
 ### Output
 
@@ -98,7 +102,10 @@ shardlake build-index \
   --num-shards 8 \
   --kmeans-iters 30 \
   --metric cosine \
-  --nprobe 3
+  --nprobe 3 \
+  --candidate-centroids 6 \
+  --candidate-shards 3 \
+  --kmeans-sample-size 5000
 ```
 
 ---
@@ -207,4 +214,76 @@ Printed to stdout:
 ```bash
 # Full precision benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+```
+
+---
+
+## `shardlake evaluate-partitioning`
+
+Evaluates the quality of an existing index partition. Loads the index identified
+by `--alias` and reports:
+
+- **Shard size distribution** – min, max, mean, and standard deviation of
+  per-shard vector counts.
+- **Routing accuracy** – the fraction of corpus vectors whose nearest centroid
+  (nprobe = 1) matches the shard they were actually assigned to.
+- **Recall impact** – Recall\@k swept from `nprobe = 1` to `nprobe = num_shards`,
+  showing how probe depth trades off against search quality.
+- **Shard hotness** – per-shard hit counts when routing query vectors with the
+  configured `nprobe`.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] evaluate-partitioning [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--alias <STRING>` | string | `latest` | Alias to evaluate |
+| `--k <N>` | usize | `10` | Number of nearest neighbours for recall-impact sweep |
+| `--nprobe <N>` | usize | `2` | Shard probe count for hotness analysis |
+| `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
+
+### Output
+
+Printed to stdout:
+
+```
+=== Partition Evaluation Report ===
+  Index version:     idx-v1
+  Shards:            4
+  Total vectors:     10000
+
+── Shard Size Distribution ──────────────────────────
+  Min vectors/shard: 2300
+  Max vectors/shard: 2800
+  Mean:              2500.0
+  Std dev:           182.6
+
+── Routing Accuracy (nprobe=1) ──────────────────────
+  Correctly routed:  9850 / 10000 (98.50%)
+
+── Recall Impact (k=10) ─────────────────────────────
+  nprobe   Recall@k
+  1        0.7200
+  2        0.8900
+  3        0.9500
+  4        1.0000
+
+── Shard Hotness (nprobe=2) ────────────────────────
+  shard_id     hits
+  0            48
+  1            52
+  2            50
+  3            50
+```
+
+### Example
+
+```bash
+# Evaluate partitioning quality with k=10 and nprobe=3
+shardlake evaluate-partitioning --alias latest --k 10 --nprobe 3 --max-queries 500
 ```

@@ -31,6 +31,9 @@ enum Commands {
     Serve(commands::serve::ServeArgs),
     /// Run recall/latency benchmark.
     Benchmark(commands::benchmark::BenchmarkArgs),
+    /// Evaluate partition quality: size distribution, routing accuracy,
+    /// recall impact, and shard hotness.
+    EvaluatePartitioning(commands::evaluate_partitioning::EvaluatePartitioningArgs),
 }
 
 #[tokio::main]
@@ -47,5 +50,8 @@ async fn main() -> Result<()> {
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
+        Commands::EvaluatePartitioning(args) => {
+            commands::evaluate_partitioning::run(cli.storage, args).await
+        }
     }
 }

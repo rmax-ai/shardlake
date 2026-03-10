@@ -21,12 +21,34 @@ pub enum ManifestError {
 
 pub type Result<T> = std::result::Result<T, ManifestError>;
 
+/// The index strategy used within a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexType {
+    /// Brute-force flat (exact) search within the shard.
+    ///
+    /// This is the only type currently supported; future variants such as
+    /// `Hnsw` or `Ivf` can be added without breaking existing manifests.
+    #[default]
+    Flat,
+}
+
 /// Describes one shard artifact inside the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardDef {
     pub shard_id: ShardId,
-    /// Storage key for the shard index file.
-    pub artifact_key: String,
+    /// Zero-based index of the K-means centroid this shard was assigned to.
+    #[serde(default)]
+    pub centroid_id: u32,
+    /// Index strategy used within this shard.
+    #[serde(default)]
+    pub index_type: IndexType,
+    /// Storage key / file location for the `.sidx` artifact.
+    ///
+    /// Accepts the legacy field name `artifact_key` when deserialising older
+    /// manifests.
+    #[serde(alias = "artifact_key")]
+    pub file_location: String,
     /// Number of vectors in this shard.
     pub vector_count: u64,
     /// Fingerprint hex digest of the artifact bytes (filled after build).
@@ -40,6 +62,18 @@ pub struct BuildMetadata {
     pub builder_version: String,
     pub num_kmeans_iters: u32,
     pub nprobe_default: u32,
+    /// Number of candidate centroids evaluated per query during routing.
+    ///
+    /// Equals `nprobe_default` when `candidate_centroids` was not explicitly
+    /// configured.
+    #[serde(default)]
+    pub candidate_centroids: u32,
+    /// Maximum number of unique shards searched per query.
+    ///
+    /// Equals `nprobe_default` when `candidate_shards` was not explicitly
+    /// configured.
+    #[serde(default)]
+    pub candidate_shards: u32,
 }
 
 /// Full manifest tying dataset, embeddings, and index together.

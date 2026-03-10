@@ -91,7 +91,9 @@ and index version and describes every shard artifact.
   "shards": [
     {
       "shard_id": 0,
-      "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+      "centroid_id": 0,
+      "index_type": "flat",
+      "file_location": "indexes/idx-v1/shards/shard-0000.sidx",
       "vector_count": 2504,
       "sha256": "a1b2c3d4e5f60708"
     }
@@ -100,7 +102,9 @@ and index version and describes every shard artifact.
     "built_at": "2026-03-10T17:44:00Z",
     "builder_version": "0.1.0",
     "num_kmeans_iters": 20,
-    "nprobe_default": 2
+    "nprobe_default": 2,
+    "candidate_centroids": 2,
+    "candidate_shards": 2
   }
 }
 ```
@@ -124,13 +128,17 @@ and index version and describes every shard artifact.
 | `build_metadata.builder_version` | string | Semver version of the `shardlake` binary that built this index. |
 | `build_metadata.num_kmeans_iters` | integer | K-means iterations used. |
 | `build_metadata.nprobe_default` | integer | Default nprobe recorded at build time. |
+| `build_metadata.candidate_centroids` | integer | Candidate centroids evaluated per query during routing. Equals `nprobe_default` when not explicitly configured. |
+| `build_metadata.candidate_shards` | integer | Maximum unique shards searched per query. Equals `nprobe_default` when not explicitly configured. |
 
 ### Shard definition fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `shard_id` | integer | Zero-based shard index. |
-| `artifact_key` | string | Storage key of the `.sidx` file for this shard. |
+| `centroid_id` | integer | Zero-based index of the K-means centroid this shard was assigned to. |
+| `index_type` | string | Index strategy used within this shard. Currently always `"flat"`. |
+| `file_location` | string | Storage key of the `.sidx` file for this shard. The legacy field name `artifact_key` is also accepted when reading older manifests. |
 | `vector_count` | integer | Number of vectors stored in this shard. |
 | `sha256` | string | FNV-1a fingerprint of the raw shard bytes (prototype; not cryptographic SHA-256). |
 

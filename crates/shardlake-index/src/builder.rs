@@ -1,7 +1,7 @@
 //! Offline index builder: partitions vectors into shards using K-means.
 
 use chrono::Utc;
-use rand::SeedableRng;
+use rand::{seq::SliceRandom, SeedableRng};
 use tracing::{info, warn};
 
 use shardlake_core::{
@@ -10,11 +10,11 @@ use shardlake_core::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
     },
 };
-use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
+use shardlake_manifest::{BuildMetadata, IndexType, Manifest, ShardDef};
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    kmeans::{kmeans, nearest_centroid},
+    kmeans::{kmeans, nearest_centroid, sq_l2, top_n_centroids},
     shard::ShardIndex,
     IndexError, Result,
 };
@@ -64,11 +64,39 @@ impl<'a> IndexBuilder<'a> {
         let k = self.config.num_shards as usize;
         let iters = self.config.kmeans_iters;
 
-        info!(n, k, iters, "Running K-means to compute shard centroids");
-
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
-        let centroids = kmeans(&vecs, k, iters, &mut rng);
+
+        // Optionally subsample the corpus for centroid training (2.1).
+        let sample_size = if self.config.kmeans_sample_size > 0 {
+            (self.config.kmeans_sample_size as usize).min(n)
+        } else {
+            n
+        };
+
+        let training_vecs: Vec<Vec<f32>> = if sample_size < n {
+            info!(
+                n,
+                sample_size, "Subsampling vectors for K-means centroid training"
+            );
+            let mut indices: Vec<usize> = (0..n).collect();
+            indices.shuffle(&mut rng);
+            indices[..sample_size]
+                .iter()
+                .map(|&i| vecs[i].clone())
+                .collect()
+        } else {
+            vecs.clone()
+        };
+
+        info!(
+            n,
+            k,
+            iters,
+            training_n = training_vecs.len(),
+            "Running K-means to compute shard centroids"
+        );
+        let centroids = kmeans(&training_vecs, k, iters, &mut rng);
 
         info!("Assigning vectors to shards");
         let mut shard_records: Vec<Vec<VectorRecord>> = vec![Vec::new(); k];
@@ -82,6 +110,16 @@ impl<'a> IndexBuilder<'a> {
                 warn!(shard = i, "shard is empty after assignment");
             }
         }
+
+        // Enforce max_vectors_per_shard (2.4): redistribute overflow to the
+        // next-nearest centroid that still has capacity.
+        let max_per_shard = self.config.max_vectors_per_shard as usize;
+        if max_per_shard > 0 {
+            redistribute_overflow(&mut shard_records, &centroids, max_per_shard);
+        }
+
+        let candidate_centroids = self.config.effective_candidate_centroids();
+        let candidate_shards = self.config.effective_candidate_shards();
 
         let mut shard_defs = Vec::new();
         let mut actual_total: u64 = 0;
@@ -106,7 +144,9 @@ impl<'a> IndexBuilder<'a> {
             actual_total += count;
             shard_defs.push(ShardDef {
                 shard_id,
-                artifact_key: shard_artifact_key,
+                centroid_id: i as u32,
+                index_type: IndexType::Flat,
+                file_location: shard_artifact_key,
                 vector_count: count,
                 sha256: sha,
             });
@@ -129,12 +169,68 @@ impl<'a> IndexBuilder<'a> {
                 builder_version: env!("CARGO_PKG_VERSION").into(),
                 num_kmeans_iters: iters,
                 nprobe_default: self.config.nprobe,
+                candidate_centroids,
+                candidate_shards,
             },
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;
         info!(index_version = %manifest.index_version, "Manifest written");
         Ok(manifest)
+    }
+}
+
+/// Redistribute vectors that exceed `max_per_shard` to their next-nearest
+/// centroid that still has capacity.
+///
+/// One redistribution pass is performed: overflow vectors (those furthest from
+/// the overloaded centroid) are re-assigned greedily to the nearest centroid
+/// with remaining capacity.  If no centroid has capacity, the vector is placed
+/// in the nearest non-full centroid as a best-effort fallback.
+fn redistribute_overflow(
+    shard_records: &mut [Vec<VectorRecord>],
+    centroids: &[Vec<f32>],
+    max_per_shard: usize,
+) {
+    let k = centroids.len();
+    let mut overflow: Vec<VectorRecord> = Vec::new();
+
+    for i in 0..k {
+        if shard_records[i].len() > max_per_shard {
+            warn!(
+                shard = i,
+                current = shard_records[i].len(),
+                max = max_per_shard,
+                "Shard exceeds max_vectors_per_shard; redistributing overflow"
+            );
+            // Pre-compute distances once (sort_by_cached_key evaluates the
+            // key exactly once per element, avoiding redundant sq_l2 calls).
+            shard_records[i].sort_by_cached_key(|r| {
+                // sq_l2 returns non-negative f32; bit-ordering matches numeric
+                // ordering for non-negative IEEE 754 values.
+                sq_l2(&r.data, &centroids[i]).to_bits()
+            });
+            let drained: Vec<VectorRecord> = shard_records[i].drain(max_per_shard..).collect();
+            overflow.extend(drained);
+        }
+    }
+
+    if overflow.is_empty() {
+        return;
+    }
+
+    info!(overflow = overflow.len(), "Re-assigning overflow vectors");
+    for rec in overflow {
+        // Find the nearest centroid that still has room (or the second-nearest
+        // if the nearest is the full original shard).
+        let ranked = top_n_centroids(&rec.data, centroids, k);
+        let target = ranked
+            .iter()
+            .find(|&&ci| max_per_shard == 0 || shard_records[ci].len() < max_per_shard)
+            .or_else(|| ranked.get(1)) // fallback: second-nearest
+            .copied()
+            .unwrap_or(ranked[0]);
+        shard_records[target].push(rec);
     }
 }
 

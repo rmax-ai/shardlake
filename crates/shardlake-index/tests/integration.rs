@@ -30,6 +30,10 @@ fn test_build_and_search() {
         num_shards: 2,
         kmeans_iters: 10,
         nprobe: 2,
+        candidate_centroids: 0,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+        kmeans_sample_size: 0,
     };
 
     let records = make_records(20, 4);

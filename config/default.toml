@@ -2,3 +2,7 @@ storage_root = "./data"
 num_shards = 4
 kmeans_iters = 20
 nprobe = 2
+candidate_centroids = 0
+candidate_shards = 0
+max_vectors_per_shard = 0
+kmeans_sample_size = 0

@@ -16,6 +16,10 @@ individual command flags.
 | `num_shards` | u32 | `4` | Number of K-means clusters (shards) to create at index build time. Equivalent to `--num-shards`. |
 | `kmeans_iters` | u32 | `20` | Maximum number of K-means iterations. Equivalent to `--kmeans-iters`. |
 | `nprobe` | u32 | `2` | Number of shard centroids to probe during a query. Equivalent to `--nprobe` on both `build-index` (recorded in the manifest) and `serve` (runtime default). |
+| `candidate_centroids` | u32 | `0` | Number of top centroids to evaluate per query during routing. `0` = same as `nprobe`. Equivalent to `--candidate-centroids`. |
+| `candidate_shards` | u32 | `0` | Maximum unique shards to search after centroid routing. `0` = same as `nprobe`. Equivalent to `--candidate-shards`. |
+| `max_vectors_per_shard` | u32 | `0` | Cap on vectors per shard at build time. Overflow vectors are re-assigned to the next-nearest centroid. `0` = unlimited. Equivalent to `--max-vectors-per-shard`. |
+| `kmeans_sample_size` | u32 | `0` | If non-zero, K-means centroids are trained on a random sample of this many vectors instead of the full corpus. `0` = use all vectors. Equivalent to `--kmeans-sample-size`. |
 
 ### `config/default.toml` (reference)
 
@@ -24,6 +28,10 @@ storage_root = "./data"
 num_shards = 4
 kmeans_iters = 20
 nprobe = 2
+candidate_centroids = 0
+candidate_shards = 0
+max_vectors_per_shard = 0
+kmeans_sample_size = 0
 ```
 
 ## Choosing `num_shards`
@@ -50,6 +58,43 @@ trade-off:
 
 A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 `shardlake benchmark` and increase `nprobe` until the recall target is met.
+
+## Choosing `candidate_centroids` and `candidate_shards`
+
+These parameters refine the query fan-out policy (Epic 2):
+
+- **`candidate_centroids`** controls how many centroid distances are evaluated
+  before selecting shards.  Setting it higher than `nprobe` can improve routing
+  quality without necessarily searching more shards (because multiple centroids
+  may map to the same shard).
+- **`candidate_shards`** caps the number of unique shards actually searched
+  after centroid deduplication.
+
+When both are `0` (the default), the effective value for both is `nprobe`,
+preserving backward-compatible behaviour.  A typical tuning flow:
+
+1. Set `candidate_centroids = 2 * nprobe` to cast a wider centroid net.
+2. Keep `candidate_shards = nprobe` to control actual search fan-out.
+3. Verify recall improvement with `shardlake evaluate-partitioning`.
+
+## Choosing `kmeans_sample_size`
+
+For large corpora (> 100 000 vectors), running K-means on the full set can be
+expensive.  Setting `kmeans_sample_size` to a few thousand vectors speeds up
+centroid training with negligible recall impact, because K-means converges on a
+representative sample.
+
+A good heuristic: `kmeans_sample_size ≈ max(10 000, num_shards * 100)`.
+
+## Choosing `max_vectors_per_shard`
+
+`max_vectors_per_shard` prevents extremely imbalanced shards.  When a shard
+would exceed this limit, overflow vectors (those furthest from the centroid) are
+re-assigned to their next-nearest centroid.
+
+Set to `0` (unlimited) unless you observe severe imbalance in the shard size
+distribution reported by `shardlake evaluate-partitioning`.  A reasonable cap
+is `2 × (total_vectors / num_shards)` (twice the average shard size).
 
 ## Logging
 

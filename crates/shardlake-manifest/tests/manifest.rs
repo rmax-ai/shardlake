@@ -2,7 +2,7 @@ use chrono::Utc;
 use shardlake_core::types::{
     DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
 };
-use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
+use shardlake_manifest::{BuildMetadata, IndexType, Manifest, ShardDef};
 use shardlake_storage::LocalObjectStore;
 
 fn sample_manifest() -> Manifest {
@@ -20,13 +20,17 @@ fn sample_manifest() -> Manifest {
         shards: vec![
             ShardDef {
                 shard_id: ShardId(0),
-                artifact_key: "indexes/idx-v1/shards/shard-0000.sidx".into(),
+                centroid_id: 0,
+                index_type: IndexType::Flat,
+                file_location: "indexes/idx-v1/shards/shard-0000.sidx".into(),
                 vector_count: 5,
                 sha256: "abc".into(),
             },
             ShardDef {
                 shard_id: ShardId(1),
-                artifact_key: "indexes/idx-v1/shards/shard-0001.sidx".into(),
+                centroid_id: 1,
+                index_type: IndexType::Flat,
+                file_location: "indexes/idx-v1/shards/shard-0001.sidx".into(),
                 vector_count: 5,
                 sha256: "def".into(),
             },
@@ -36,6 +40,8 @@ fn sample_manifest() -> Manifest {
             builder_version: "0.1.0".into(),
             num_kmeans_iters: 20,
             nprobe_default: 2,
+            candidate_centroids: 2,
+            candidate_shards: 2,
         },
     }
 }

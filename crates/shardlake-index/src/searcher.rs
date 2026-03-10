@@ -86,7 +86,7 @@ impl IndexSearcher {
     }
 
     /// Load a shard from cache or store.
-    fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+    pub fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(idx) = cache.get(&shard_id) {
@@ -101,7 +101,7 @@ impl IndexSearcher {
             .find(|s| s.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-        let bytes = self.store.get(&shard_def.artifact_key)?;
+        let bytes = self.store.get(&shard_def.file_location)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
         let mut cache = self.cache.lock().unwrap();

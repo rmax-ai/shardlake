@@ -40,6 +40,22 @@ pub struct BuildIndexArgs {
     /// Number of shards to probe at query time.
     #[arg(long, default_value_t = 2)]
     pub nprobe: u32,
+    /// Number of candidate centroids evaluated per query during routing.
+    /// 0 = same as --nprobe.
+    #[arg(long, default_value_t = 0)]
+    pub candidate_centroids: u32,
+    /// Maximum unique shards to probe per query after centroid routing.
+    /// 0 = same as --nprobe.
+    #[arg(long, default_value_t = 0)]
+    pub candidate_shards: u32,
+    /// Maximum vectors per shard; overflow is re-assigned to the next-nearest
+    /// centroid. 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_vectors_per_shard: u32,
+    /// If non-zero, train K-means centroids on a random sample of this many
+    /// vectors instead of the full corpus.
+    #[arg(long, default_value_t = 0)]
+    pub kmeans_sample_size: u32,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
@@ -59,6 +75,10 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         num_shards: args.num_shards,
         kmeans_iters: args.kmeans_iters,
         nprobe: args.nprobe,
+        candidate_centroids: args.candidate_centroids,
+        candidate_shards: args.candidate_shards,
+        max_vectors_per_shard: args.max_vectors_per_shard,
+        kmeans_sample_size: args.kmeans_sample_size,
     };
 
     let info_key = format!("datasets/{}/info.json", dataset_ver.0);
