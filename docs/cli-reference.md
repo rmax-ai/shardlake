@@ -73,6 +73,8 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dataset-version <STRING>` | string | *(required)* | Dataset version to index (must match a prior `ingest` run) |
+| `--dataset-id <STRING>` | string | same as `--dataset-version` | Human-readable dataset identifier (slug or UUID) |
+| `--embedding-model <STRING>` | string | `unknown` | Name of the model that produced the embeddings (e.g. `text-embedding-ada-002`) |
 | `--embedding-version <STRING>` | string | same as `--dataset-version` | Embedding version to record in the manifest |
 | `--index-version <STRING>` | string | `idx-<timestamp>` | Version tag for the index artifact |
 | `--metric <METRIC>` | enum | `cosine` | Distance metric: `cosine`, `euclidean`, or `inner-product` |
@@ -99,6 +101,69 @@ shardlake build-index \
   --kmeans-iters 30 \
   --metric cosine \
   --nprobe 3
+```
+
+---
+
+## `shardlake validate-manifest`
+
+Validates a manifest and all of its referenced shard artifacts.
+
+Checks performed:
+1. Internal consistency (`manifest_version`, `dims`, shard counts, vector count totals).
+2. Every shard artifact key exists in storage.
+3. Shard artifact checksums match the recorded fingerprints.
+4. Vector dimension consistency is confirmed.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] validate-manifest [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(optional)* | Validate a specific index version directly |
+| `--alias <STRING>` | string | `latest` | Resolve this alias and validate the pointed-to manifest |
+
+`--index-version` and `--alias` are mutually exclusive. If neither is supplied the
+`latest` alias is used.
+
+### Output
+
+Printed to stdout:
+
+```
+=== Manifest Validation Report ===
+  Index version:   idx-v1
+  Dataset version: ds-v1
+  Dataset ID:      my-dataset
+  Embedding model: text-embedding-ada-002
+  Algorithm:       kmeans
+  Dims:            128
+  Shards:          4
+  Total vectors:   10000
+
+  ✓ dimension check passed: all shards expected to use dims=128
+
+Result: OK
+```
+
+Exit code is **0** on success and **non-zero** if any check fails.
+
+### Example
+
+```bash
+# Validate the "latest" alias (default)
+shardlake validate-manifest
+
+# Validate a specific index version
+shardlake validate-manifest --index-version idx-v1
+
+# Validate a named alias
+shardlake validate-manifest --alias stable
 ```
 
 ---

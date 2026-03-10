@@ -47,6 +47,8 @@ forward-slash-delimited keys, which map directly to filesystem paths:
 │           ├── shard-0000.sidx
 │           ├── shard-0001.sidx
 │           └── ...
+├── manifests/
+│   └── <index-version>.json   # mirror copy of manifest for fast lookup
 └── aliases/
     └── <alias-name>.json      # alias pointer (see below)
 ```
@@ -79,7 +81,9 @@ and index version and describes every shard artifact.
 ```json
 {
   "manifest_version": 1,
+  "dataset_id": "my-dataset",
   "dataset_version": "ds-v1",
+  "embedding_model": "text-embedding-ada-002",
   "embedding_version": "emb-v1",
   "index_version": "idx-v1",
   "alias": "latest",
@@ -87,7 +91,9 @@ and index version and describes every shard artifact.
   "distance_metric": "cosine",
   "vectors_key": "datasets/ds-v1/vectors.jsonl",
   "metadata_key": "datasets/ds-v1/metadata.json",
+  "shard_count": 4,
   "total_vector_count": 10000,
+  "checksum": "a1b2c3d4e5f60708",
   "shards": [
     {
       "shard_id": 0,
@@ -100,7 +106,12 @@ and index version and describes every shard artifact.
     "built_at": "2026-03-10T17:44:00Z",
     "builder_version": "0.1.0",
     "num_kmeans_iters": 20,
-    "nprobe_default": 2
+    "nprobe_default": 2,
+    "algorithm": "kmeans",
+    "compression_method": "none",
+    "quantization_parameters": null,
+    "recall_estimates": null,
+    "build_duration_ms": 1234
   }
 }
 ```
@@ -110,7 +121,9 @@ and index version and describes every shard artifact.
 | Field | Type | Description |
 |-------|------|-------------|
 | `manifest_version` | integer | Schema version. Currently always `1`. |
+| `dataset_id` | string | Human-readable identifier for the dataset (slug or UUID). |
 | `dataset_version` | string | Version tag of the source dataset. |
+| `embedding_model` | string | Name of the model that produced the embeddings. |
 | `embedding_version` | string | Version tag of the embedding generation run. |
 | `index_version` | string | Version tag of this index build. |
 | `alias` | string | Alias name this manifest was last published under. |
@@ -118,12 +131,19 @@ and index version and describes every shard artifact.
 | `distance_metric` | string | `"cosine"`, `"euclidean"`, or `"inner_product"`. |
 | `vectors_key` | string | Storage key of the raw vectors JSONL file. |
 | `metadata_key` | string | Storage key of the metadata JSON file. |
+| `shard_count` | integer | Number of non-empty shards in this index. Equals `shards` array length. |
 | `total_vector_count` | integer | Total number of vectors indexed. Must equal the sum of `shards[*].vector_count`. |
+| `checksum` | string | FNV-1a fingerprint of the manifest's own content (computed at save time). **Non-cryptographic** — detects accidental corruption only, not intentional tampering. Use SHA-256 for production systems. |
 | `shards` | array | One entry per non-empty shard (see below). |
 | `build_metadata.built_at` | ISO 8601 datetime | When the index was built (UTC). |
 | `build_metadata.builder_version` | string | Semver version of the `shardlake` binary that built this index. |
 | `build_metadata.num_kmeans_iters` | integer | K-means iterations used. |
 | `build_metadata.nprobe_default` | integer | Default nprobe recorded at build time. |
+| `build_metadata.algorithm` | string | Indexing algorithm (e.g. `"kmeans"`). |
+| `build_metadata.compression_method` | string | Compression applied to shard artifacts (e.g. `"none"`). |
+| `build_metadata.quantization_parameters` | object or null | Optional quantization config (`method`, `bits`). |
+| `build_metadata.recall_estimates` | object or null | Optional recall estimates (`recall_at_1`, `recall_at_10`). |
+| `build_metadata.build_duration_ms` | integer | Wall-clock build duration in milliseconds. |
 
 ### Shard definition fields
 

@@ -37,7 +37,9 @@ fn test_build_and_search() {
     let manifest = builder
         .build(BuildParams {
             records: records.clone(),
+            dataset_id: "ds-test".into(),
             dataset_version: DatasetVersion("ds-test".into()),
+            embedding_model: "test-model".into(),
             embedding_version: EmbeddingVersion("emb-test".into()),
             index_version: IndexVersion("idx-test".into()),
             metric: DistanceMetric::Euclidean,

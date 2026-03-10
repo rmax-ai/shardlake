@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use rand::SeedableRng;
+use std::time::Instant;
 use tracing::{info, warn};
 
 use shardlake_core::{
@@ -10,7 +11,7 @@ use shardlake_core::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
     },
 };
-use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
+use shardlake_manifest::{fingerprint_hex, BuildMetadata, Manifest, ShardDef};
 use shardlake_storage::ObjectStore;
 
 use crate::{
@@ -19,10 +20,17 @@ use crate::{
     IndexError, Result,
 };
 
+/// The indexing algorithm name recorded in build metadata.
+const ALGORITHM: &str = "kmeans";
+
 /// Parameters for an index build operation.
 pub struct BuildParams {
     pub records: Vec<VectorRecord>,
+    /// Human-readable dataset identifier (e.g. a slug or UUID).
+    pub dataset_id: String,
     pub dataset_version: DatasetVersion,
+    /// Name of the model that produced the embeddings.
+    pub embedding_model: String,
     pub embedding_version: EmbeddingVersion,
     pub index_version: IndexVersion,
     pub metric: DistanceMetric,
@@ -47,7 +55,9 @@ impl<'a> IndexBuilder<'a> {
     pub fn build(&self, params: BuildParams) -> Result<Manifest> {
         let BuildParams {
             records,
+            dataset_id,
             dataset_version,
+            embedding_model,
             embedding_version,
             index_version,
             metric,
@@ -64,7 +74,17 @@ impl<'a> IndexBuilder<'a> {
         let k = self.config.num_shards as usize;
         let iters = self.config.kmeans_iters;
 
-        info!(n, k, iters, "Running K-means to compute shard centroids");
+        info!(
+            n,
+            k,
+            iters,
+            algorithm = ALGORITHM,
+            metric = %metric,
+            dims,
+            "Running K-means to compute shard centroids"
+        );
+
+        let build_start = Instant::now();
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
@@ -112,9 +132,14 @@ impl<'a> IndexBuilder<'a> {
             });
         }
 
-        let manifest = Manifest {
+        let build_duration_ms = build_start.elapsed().as_millis() as u64;
+        let shard_count = shard_defs.len() as u32;
+
+        let mut manifest = Manifest {
             manifest_version: 1,
+            dataset_id,
             dataset_version,
+            embedding_model,
             embedding_version,
             index_version,
             alias: "latest".into(),
@@ -122,32 +147,29 @@ impl<'a> IndexBuilder<'a> {
             distance_metric: metric,
             vectors_key,
             metadata_key,
+            shard_count,
             total_vector_count: actual_total,
+            checksum: String::new(),
             shards: shard_defs,
             build_metadata: BuildMetadata {
                 built_at: Utc::now(),
                 builder_version: env!("CARGO_PKG_VERSION").into(),
                 num_kmeans_iters: iters,
                 nprobe_default: self.config.nprobe,
+                algorithm: ALGORITHM.into(),
+                compression_method: "none".into(),
+                quantization_parameters: None,
+                recall_estimates: None,
+                build_duration_ms,
             },
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;
-        info!(index_version = %manifest.index_version, "Manifest written");
+        info!(
+            index_version = %manifest.index_version,
+            build_duration_ms,
+            "Manifest written"
+        );
         Ok(manifest)
     }
-}
-
-/// FNV-1a-based artifact fingerprint.
-///
-/// This is intentionally a fast, non-cryptographic hash used to detect
-/// accidental corruption and enable deduplication during prototyping.
-/// Replace with SHA-256 (e.g. `sha2` crate) before using in production.
-fn fingerprint_hex(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
 }

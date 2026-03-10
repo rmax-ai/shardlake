@@ -22,6 +22,12 @@ pub struct BuildIndexArgs {
     /// Dataset version to build index for.
     #[arg(long)]
     pub dataset_version: String,
+    /// Human-readable dataset identifier (slug or UUID; defaults to dataset version).
+    #[arg(long)]
+    pub dataset_id: Option<String>,
+    /// Name of the model that produced the embeddings (e.g. "text-embedding-ada-002").
+    #[arg(long, default_value = "unknown")]
+    pub embedding_model: String,
     /// Embedding version (defaults to dataset version).
     #[arg(long)]
     pub embedding_version: Option<String>,
@@ -45,6 +51,9 @@ pub struct BuildIndexArgs {
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
     let store = LocalObjectStore::new(&storage)?;
     let dataset_ver = DatasetVersion(args.dataset_version.clone());
+    let dataset_id = args
+        .dataset_id
+        .unwrap_or_else(|| args.dataset_version.clone());
     let embedding_ver = EmbeddingVersion(
         args.embedding_version
             .unwrap_or_else(|| args.dataset_version.clone()),
@@ -97,7 +106,9 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
     let builder = IndexBuilder::new(&store, &config);
     let manifest = builder.build(BuildParams {
         records,
+        dataset_id,
         dataset_version: dataset_ver,
+        embedding_model: args.embedding_model,
         embedding_version: embedding_ver,
         index_version: index_ver,
         metric: args.metric,

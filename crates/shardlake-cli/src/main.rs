@@ -27,6 +27,8 @@ enum Commands {
     BuildIndex(commands::build_index::BuildIndexArgs),
     /// Publish (or re-publish) a manifest alias.
     Publish(commands::publish::PublishArgs),
+    /// Validate a manifest and its referenced shard artifacts.
+    ValidateManifest(commands::validate_manifest::ValidateManifestArgs),
     /// Start the HTTP query server.
     Serve(commands::serve::ServeArgs),
     /// Run recall/latency benchmark.
@@ -45,6 +47,9 @@ async fn main() -> Result<()> {
         Commands::Ingest(args) => commands::ingest::run(cli.storage, args).await,
         Commands::BuildIndex(args) => commands::build_index::run(cli.storage, args).await,
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
+        Commands::ValidateManifest(args) => {
+            commands::validate_manifest::run(cli.storage, args).await
+        }
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
     }
