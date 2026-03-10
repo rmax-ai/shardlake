@@ -86,7 +86,7 @@ impl IndexSearcher {
     }
 
     /// Load a shard from cache or store.
-    fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+    pub(crate) fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(idx) = cache.get(&shard_id) {

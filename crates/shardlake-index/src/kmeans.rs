@@ -64,11 +64,14 @@ pub fn nearest_centroid(vec: &[f32], centroids: &[Vec<f32>]) -> usize {
 }
 
 /// Top-`n` nearest centroids (for nprobe).
-pub fn top_n_centroids(vec: &[f32], centroids: &[Vec<f32>], n: usize) -> Vec<usize> {
+///
+/// `centroids` can be any slice whose items dereference to `[f32]`
+/// (e.g. `&[Vec<f32>]` or `&[&Vec<f32>]`), so callers can avoid cloning.
+pub fn top_n_centroids<C: AsRef<[f32]>>(vec: &[f32], centroids: &[C], n: usize) -> Vec<usize> {
     let mut scores: Vec<(usize, f32)> = centroids
         .iter()
         .enumerate()
-        .map(|(i, c)| (i, sq_l2(vec, c)))
+        .map(|(i, c)| (i, sq_l2(vec, c.as_ref())))
         .collect();
     scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scores.iter().take(n).map(|(i, _)| *i).collect()

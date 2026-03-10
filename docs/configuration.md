@@ -26,6 +26,36 @@ kmeans_iters = 20
 nprobe = 2
 ```
 
+---
+
+## `QueryConfig` fields
+
+Per-query configuration that drives the query pipeline. All fields can be overridden
+per-request via the HTTP `/query` endpoint (see [API Reference](api-reference.md)).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `top_k` | usize | *(from request `k`)* | Number of results to return. |
+| `candidate_shards` | usize | server `--nprobe` | Number of shards to probe during centroid routing. Corresponds to `nprobe` in the request and `--nprobe` on the CLI. |
+| `rerank_limit` | usize or null | server `--rerank-limit` | When set, the pipeline gathers up to `rerank_limit` candidates from all probed shards, re-sorts them, and returns the best `top_k`. Use a value larger than `top_k` to improve recall. |
+| `distance_metric` | enum or null | manifest metric | Per-query metric override (`cosine`, `euclidean`, `inner_product`). When `null` the metric stored in the index manifest is used. |
+
+### Pipeline stages
+
+The query engine executes the following stages in order:
+
+1. **embed_query** – accept a pre-computed query vector (pass-through for raw vectors).
+2. **route_centroids** – find the `candidate_shards` nearest shard centroids and select
+   their shard IDs.
+3. **load_shards** – retrieve shard indexes from the in-memory cache or object store.
+4. **search_shards** – run exact ANN candidate search on each selected shard.  When
+   `candidate_shards > 1` the HTTP server runs these searches concurrently using
+   `tokio::task::spawn_blocking`.
+5. **merge** – combine shard-local results into a global top-k list, deduplicating by
+   vector id.
+6. **rerank** – re-sort the merged candidates and trim to `top_k`.  A no-op when
+   `rerank_limit` is not configured.
+
 ## Choosing `num_shards`
 
 `num_shards` controls the coarseness of the IVF-style partition:

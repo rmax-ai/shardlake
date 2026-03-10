@@ -155,12 +155,13 @@ shardlake [--storage <PATH>] serve [OPTIONS]
 | `--alias <STRING>` | string | `latest` | Alias name to resolve at startup |
 | `--bind <ADDR:PORT>` | string | `0.0.0.0:8080` | TCP address to listen on |
 | `--nprobe <N>` | usize | `2` | Default shard probe count for queries that omit `nprobe` |
+| `--rerank-limit <N>` | usize | *(none)* | Default rerank limit: gather up to N candidates before trimming to `k`. When not set, no extra candidates are gathered. Can be overridden per-request. |
 
 ### Example
 
 ```bash
-# Serve the "stable" alias on a non-default port
-shardlake serve --alias stable --bind 127.0.0.1:9090 --nprobe 4
+# Serve the "stable" alias on a non-default port with reranking enabled
+shardlake serve --alias stable --bind 127.0.0.1:9090 --nprobe 4 --rerank-limit 50
 ```
 
 See [API Reference](api-reference.md) for the HTTP endpoints.

@@ -12,5 +12,9 @@ use shardlake_index::IndexSearcher;
 #[derive(Clone)]
 pub struct AppState {
     pub searcher: Arc<IndexSearcher>,
+    /// Default number of candidate shards to probe when the request does not
+    /// specify `candidate_shards` / `nprobe`.
     pub nprobe: usize,
+    /// Default rerank limit (overridden per-request when provided).
+    pub rerank_limit: Option<usize>,
 }

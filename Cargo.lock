@@ -927,6 +927,7 @@ dependencies = [
  "shardlake-storage",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

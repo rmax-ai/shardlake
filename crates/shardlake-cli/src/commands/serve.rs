@@ -19,9 +19,13 @@ pub struct ServeArgs {
     /// Bind address.
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
-    /// Number of shards to probe per query.
+    /// Default number of shards to probe per query (can be overridden per-request).
     #[arg(long, default_value_t = 2)]
     pub nprobe: usize,
+    /// Default rerank limit: collect this many candidates before trimming to
+    /// top-k.  When not set, no extra candidates are gathered.
+    #[arg(long)]
+    pub rerank_limit: Option<usize>,
 }
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
@@ -37,6 +41,7 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     let state = AppState {
         searcher,
         nprobe: args.nprobe,
+        rerank_limit: args.rerank_limit,
     };
     let router = build_router(state);
 

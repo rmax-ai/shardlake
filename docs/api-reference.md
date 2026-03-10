@@ -46,7 +46,9 @@ vector ids with their scores.
 {
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
-  "nprobe": 3
+  "nprobe": 3,
+  "rerank_limit": 50,
+  "distance_metric": "cosine"
 }
 ```
 
@@ -54,7 +56,9 @@ vector ids with their scores.
 |-------|------|----------|-------------|
 | `vector` | `float[]` | Yes | Query vector. Must have the same number of dimensions as the index. |
 | `k` | integer | Yes | Number of results to return. Must be ≥ 1. |
-| `nprobe` | integer | No | Number of shards to probe. Defaults to the value set via `--nprobe` when the server was started. Higher values improve recall at the cost of latency. |
+| `nprobe` | integer | No | Number of shards to probe (candidate_shards). Defaults to the value set via `--nprobe` when the server was started. Higher values improve recall at the cost of latency. |
+| `rerank_limit` | integer | No | When set, the pipeline gathers up to `rerank_limit` candidates from all probed shards, re-sorts them by score, and then returns the best `k`. Use a value larger than `k` to improve recall without growing the result set (e.g. `rerank_limit: 50` with `k: 10`). Defaults to the server-level `--rerank-limit` if configured, otherwise no extra candidates are gathered. |
+| `distance_metric` | string | No | Distance metric override: `"cosine"`, `"euclidean"`, or `"inner_product"`. When omitted the metric baked into the index manifest at build time is used. |
 
 ### Success response — `200 OK`
 
@@ -99,7 +103,9 @@ curl -s -X POST http://localhost:8080/query \
   -d '{
     "vector": [0.5, 0.3, 0.8, 0.1],
     "k": 5,
-    "nprobe": 3
+    "nprobe": 3,
+    "rerank_limit": 20,
+    "distance_metric": "cosine"
   }' | python3 -m json.tool
 ```
 

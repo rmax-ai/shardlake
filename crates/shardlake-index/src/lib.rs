@@ -3,11 +3,13 @@
 pub mod builder;
 pub mod exact;
 pub mod kmeans;
+pub mod pipeline;
 pub mod searcher;
 pub mod shard;
 
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
+pub use pipeline::QueryPipeline;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
 
