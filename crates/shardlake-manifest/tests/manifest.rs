@@ -7,7 +7,7 @@ use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 fn sample_manifest() -> Manifest {
     Manifest {
-        manifest_version: 1,
+        manifest_version: 2,
         dataset_version: DatasetVersion("ds-v1".into()),
         embedding_version: EmbeddingVersion("emb-v1".into()),
         index_version: IndexVersion("idx-v1".into()),
@@ -23,12 +23,14 @@ fn sample_manifest() -> Manifest {
                 artifact_key: "indexes/idx-v1/shards/shard-0000.sidx".into(),
                 vector_count: 5,
                 fingerprint: "abc".into(),
+                centroid: vec![0.1, 0.2, 0.3, 0.4],
             },
             ShardDef {
                 shard_id: ShardId(1),
                 artifact_key: "indexes/idx-v1/shards/shard-0001.sidx".into(),
                 vector_count: 5,
                 fingerprint: "def".into(),
+                centroid: vec![0.9, 0.8, 0.7, 0.6],
             },
         ],
         build_metadata: BuildMetadata {
@@ -117,4 +119,34 @@ fn test_load_accepts_compat_fingerprint_field() {
 
     let manifest: Manifest = serde_json::from_value(compat).unwrap();
     assert_eq!(manifest.shards[0].fingerprint, "compat-fingerprint");
+    // v1 manifests have no centroid data; the field defaults to an empty Vec.
+    assert!(manifest.shards[0].centroid.is_empty());
+}
+
+#[test]
+fn test_v2_centroid_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+    let m = sample_manifest();
+    assert_eq!(m.manifest_version, 2);
+    m.save(&store).unwrap();
+
+    let manifest_key = Manifest::storage_key(&m.index_version);
+    let saved = store.get(&manifest_key).unwrap();
+    let saved_json = String::from_utf8(saved).unwrap();
+    // Centroid is serialised into the JSON for v2 manifests.
+    assert!(saved_json.contains("\"centroid\""));
+
+    let loaded = Manifest::load(&store, &m.index_version).unwrap();
+    assert_eq!(loaded.manifest_version, 2);
+    assert_eq!(loaded.shards[0].centroid, vec![0.1, 0.2, 0.3, 0.4]);
+    assert_eq!(loaded.shards[1].centroid, vec![0.9, 0.8, 0.7, 0.6]);
+}
+
+#[test]
+fn test_validate_rejects_unsupported_manifest_version() {
+    let mut m = sample_manifest();
+    m.manifest_version = 99;
+    let err = m.validate().unwrap_err();
+    assert!(err.to_string().contains("unsupported manifest_version 99"));
 }

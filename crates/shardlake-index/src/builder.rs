@@ -134,11 +134,12 @@ impl<'a> IndexBuilder<'a> {
                 artifact_key: shard_artifact_key,
                 vector_count: count,
                 fingerprint: sha,
+                centroid: centroids[i].clone(),
             });
         }
 
         let manifest = Manifest {
-            manifest_version: 1,
+            manifest_version: 2,
             dataset_version,
             embedding_version,
             index_version,

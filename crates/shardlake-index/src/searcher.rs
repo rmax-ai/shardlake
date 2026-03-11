@@ -60,15 +60,25 @@ impl IndexSearcher {
 
         let metric: DistanceMetric = self.manifest.distance_metric;
 
-        // Collect all centroids and map centroid index → shard id.
+        // Collect centroids for routing from the manifest when available (manifest v2+).
+        // Shards built with an older builder (manifest v1) have an empty centroid vec; for
+        // those shards we fall back to loading the shard body to extract the centroid.
         let mut all_centroids: Vec<Vec<f32>> = Vec::new();
         let mut centroid_to_shard: Vec<ShardId> = Vec::new();
 
         for shard_def in &self.manifest.shards {
-            let shard = self.load_shard(shard_def.shard_id)?;
-            for c in &shard.centroids {
-                all_centroids.push(c.clone());
+            if !shard_def.centroid.is_empty() {
+                // Fast path: centroid is embedded in the manifest -- no I/O needed.
+                all_centroids.push(shard_def.centroid.clone());
                 centroid_to_shard.push(shard_def.shard_id);
+            } else {
+                // Slow path: legacy manifest without centroid metadata -- load the shard
+                // body to read its centroids (preserves backward compatibility).
+                let shard = self.load_shard(shard_def.shard_id)?;
+                for c in &shard.centroids {
+                    all_centroids.push(c.clone());
+                    centroid_to_shard.push(shard_def.shard_id);
+                }
             }
         }
 
