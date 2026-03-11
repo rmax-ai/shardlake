@@ -132,7 +132,7 @@ and index version and describes every shard artifact.
 | `shard_id` | integer | Zero-based shard index. |
 | `artifact_key` | string | Storage key of the `.sidx` file for this shard. |
 | `vector_count` | integer | Number of vectors stored in this shard. |
-| `sha256` | string | FNV-1a fingerprint of the raw shard bytes (prototype; not cryptographic SHA-256). |
+| `sha256` | string | Canonical manifest v1 wire field for the shard fingerprint. Shardlake currently stores an FNV-1a fingerprint here as a prototype, not a cryptographic SHA-256 digest. The reader also accepts `fingerprint` for compatibility with previously emitted manifests. |
 
 ---
 

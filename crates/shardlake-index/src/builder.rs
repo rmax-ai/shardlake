@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use shardlake_core::{
     config::SystemConfig,
+    error::CoreError,
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
     },
@@ -60,6 +61,30 @@ impl<'a> IndexBuilder<'a> {
             return Err(IndexError::Other("no records to index".into()));
         }
 
+        if self.config.num_shards == 0 {
+            return Err(IndexError::Other(
+                "num_shards must be greater than 0".into(),
+            ));
+        }
+
+        for record in &records {
+            if record.data.len() != dims {
+                return Err(IndexError::Other(format!(
+                    "record {} has dimension mismatch: expected {}, got {}",
+                    record.id,
+                    dims,
+                    record.data.len()
+                )));
+            }
+        }
+
+        if dims == 0 {
+            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                expected: 1,
+                got: 0,
+            }));
+        }
+
         let n = records.len();
         let k = self.config.num_shards as usize;
         let iters = self.config.kmeans_iters;
@@ -108,7 +133,7 @@ impl<'a> IndexBuilder<'a> {
                 shard_id,
                 artifact_key: shard_artifact_key,
                 vector_count: count,
-                sha256: sha,
+                fingerprint: sha,
             });
         }
 
@@ -150,4 +175,72 @@ fn fingerprint_hex(bytes: &[u8]) -> String {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{h:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use shardlake_core::types::VectorId;
+    use shardlake_storage::LocalObjectStore;
+
+    fn record(id: u64, dims: usize) -> VectorRecord {
+        VectorRecord {
+            id: VectorId(id),
+            data: (0..dims).map(|idx| idx as f32).collect(),
+            metadata: None,
+        }
+    }
+
+    fn build_params(records: Vec<VectorRecord>, dims: usize) -> BuildParams {
+        BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-test".into()),
+            embedding_version: EmbeddingVersion("emb-test".into()),
+            index_version: IndexVersion("idx-test".into()),
+            metric: DistanceMetric::Cosine,
+            dims,
+            vectors_key: "datasets/ds-test/vectors.jsonl".into(),
+            metadata_key: "datasets/ds-test/metadata.json".into(),
+        }
+    }
+
+    #[test]
+    fn build_rejects_zero_num_shards() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 0,
+            kmeans_iters: 2,
+            nprobe: 1,
+        };
+
+        let err = IndexBuilder::new(&store, &config)
+            .build(build_params(vec![record(1, 2)], 2))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("num_shards must be greater than 0"));
+    }
+
+    #[test]
+    fn build_rejects_record_dimension_mismatch() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+        };
+
+        let err = IndexBuilder::new(&store, &config)
+            .build(build_params(vec![record(1, 2), record(2, 3)], 2))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("record 2 has dimension mismatch: expected 2, got 3"));
+    }
 }

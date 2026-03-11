@@ -89,7 +89,8 @@ vector ids with their scores.
 | Status | Body | Cause |
 |--------|------|-------|
 | `400 Bad Request` | `{"error": "k must be > 0"}` | `k` field is 0 |
-| `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure (e.g. dimension mismatch) |
+| `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
+| `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
 ### Example
 

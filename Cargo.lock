@@ -897,6 +897,7 @@ dependencies = [
  "shardlake-manifest",
  "shardlake-serve",
  "shardlake-storage",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -954,8 +955,10 @@ dependencies = [
  "shardlake-index",
  "shardlake-manifest",
  "shardlake-storage",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 

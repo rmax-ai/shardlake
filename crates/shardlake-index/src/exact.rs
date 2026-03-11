@@ -1,5 +1,7 @@
 //! Exact nearest-neighbour search (ground-truth baseline).
 
+use std::collections::HashSet;
+
 use shardlake_core::types::{DistanceMetric, SearchResult, VectorId, VectorRecord};
 
 /// Zero-sized marker type for constructing exact search results.
@@ -64,7 +66,8 @@ pub fn merge_top_k(mut results: Vec<SearchResult>, k: usize) -> Vec<SearchResult
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    results.dedup_by_key(|r| r.id);
+    let mut seen = HashSet::new();
+    results.retain(|result| seen.insert(result.id));
     results.truncate(k);
     results
 }
@@ -122,5 +125,44 @@ mod tests {
         let ret = vec![VectorId(1), VectorId(2), VectorId(5)];
         let r = recall_at_k(&gt, &ret);
         assert!((r - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_merge_top_k_deduplicates_ids_by_best_score() {
+        let merged = merge_top_k(
+            vec![
+                SearchResult {
+                    id: VectorId(1),
+                    score: 0.30,
+                    metadata: Some(serde_json::json!({ "rank": "worse" })),
+                },
+                SearchResult {
+                    id: VectorId(2),
+                    score: 0.10,
+                    metadata: None,
+                },
+                SearchResult {
+                    id: VectorId(1),
+                    score: 0.20,
+                    metadata: Some(serde_json::json!({ "rank": "best" })),
+                },
+                SearchResult {
+                    id: VectorId(3),
+                    score: 0.15,
+                    metadata: None,
+                },
+            ],
+            3,
+        );
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].id, VectorId(2));
+        assert_eq!(merged[1].id, VectorId(3));
+        assert_eq!(merged[2].id, VectorId(1));
+        assert_eq!(merged[2].score, 0.20);
+        assert_eq!(
+            merged[2].metadata,
+            Some(serde_json::json!({ "rank": "best" }))
+        );
     }
 }
