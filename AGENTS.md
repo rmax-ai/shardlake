@@ -60,7 +60,7 @@ This document captures the conventions and guidelines that all contributors and 
   - `docs/api-reference.md` — HTTP endpoints, request/response schemas, and error codes
   - `docs/data-formats.md` — input JSONL schema, artifact storage layout, manifest schema, `.sidx` binary format
   - `docs/configuration.md` — `SystemConfig` fields, `nprobe`/`num_shards` tuning guidance, logging
-  
+
   **When adding or modifying a CLI flag, HTTP endpoint, data format, configuration field, or any other user-visible behaviour, update the relevant file(s) in `docs/` in the same PR.** Reviewers should treat a docs-only change as incomplete if the corresponding `docs/` page is not updated.
 
 ## 8. Performance
