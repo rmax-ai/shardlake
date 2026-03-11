@@ -35,7 +35,7 @@ This document captures the conventions and guidelines that all contributors and 
 ## 5. Concurrency
 
 - **Prefer message-passing over shared state.** Use channels (`std::sync::mpsc`, `crossbeam`, or async channels) to communicate between threads/tasks.
-- **Mark all public async functions with `#[must_use]`** where the returned future must not be silently dropped.
+- **Use `#[must_use]` on public functions and types whose results must not be ignored** (e.g. important `Result`/status return values or custom future-like types).
 - **Choose an async runtime once and document it.** Do not mix `tokio` and `async-std` in the same crate graph.
 - **Avoid blocking in async contexts.** Offload CPU-intensive work with `tokio::task::spawn_blocking` or a dedicated thread pool.
 
@@ -71,14 +71,14 @@ This document captures the conventions and guidelines that all contributors and 
 
 - **Avoid `unsafe` unless absolutely necessary.** If required, isolate it in a dedicated module with a `# Safety` doc-comment on every `unsafe fn` and `unsafe` block.
 - **Every `unsafe` block must have a comment** explaining why it is sound.
-- **Run `cargo miri test`** on any crate containing `unsafe` code to detect undefined behaviour.
+- **Run `cargo miri test`** on any crate containing `unsafe` code to detect undefined behaviour. This requires installing the `miri` component (e.g. via `rustup +nightly component add miri`) and typically running tests on a nightly toolchain.
 
 ## 10. Dependency Management
 
 - **Pin major versions** in `Cargo.toml` (`dependency = "1"` not `"*"`).
 - **Audit new dependencies** with `cargo audit` before merging.
 - **Prefer `no_std`-compatible crates** when targeting embedded or WASM environments.
-- **Remove unused dependencies** with `cargo machete` or `cargo udeps`.
+- **Remove unused dependencies** with `cargo machete` or `cargo udeps`. These are external tools that must be installed separately (e.g. `cargo install cargo-machete` / `cargo install cargo-udeps`), and `cargo udeps` typically requires a nightly toolchain (`cargo +nightly udeps`).
 
 ## 11. Formatting and Linting
 
