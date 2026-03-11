@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
 use shardlake_core::{error::CoreError, types::SearchResult};
 use shardlake_index::IndexError;
@@ -84,7 +85,7 @@ async fn query_handler(
         )
             .into_response(),
         Err(e) => {
-            eprintln!("search task JoinError: {e}");
+            error!(error = %e, "search task failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "search task failed" })),

@@ -117,6 +117,12 @@ fn parse_records(reader: impl BufRead) -> Result<Vec<VectorRecord>> {
         }
 
         let dims = vector.len();
+        anyhow::ensure!(
+            dims > 0,
+            "line {}: vector for id {} must not be empty",
+            lineno + 1,
+            id
+        );
         if let Some(expected) = expected_dims {
             anyhow::ensure!(
                 dims == expected,
@@ -174,6 +180,16 @@ mod tests {
             .contains("line 2: vector dimension mismatch for id 2: expected 2, got 1"));
     }
 
+    #[test]
+    fn parse_records_rejects_empty_vector() {
+        let input = Cursor::new(b"{\"id\":1,\"vector\":[]}\n");
+
+        let err = parse_records(input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("line 1: vector for id 1 must not be empty"));
+    }
+
     #[tokio::test]
     async fn run_rejects_dimension_mismatch() {
         let tmp = tempdir().unwrap();
@@ -198,5 +214,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("line 2: vector dimension mismatch for id 2: expected 2, got 1"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_empty_vector() {
+        let tmp = tempdir().unwrap();
+        let input = tmp.path().join("vectors.jsonl");
+        fs::write(&input, b"{\"id\":1,\"vector\":[]}\n").unwrap();
+
+        let err = run(
+            tmp.path().join("storage"),
+            IngestArgs {
+                input,
+                dataset_version: Some("ds-test".into()),
+                embedding_version: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("line 1: vector for id 1 must not be empty"));
     }
 }
