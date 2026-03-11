@@ -83,11 +83,14 @@ async fn query_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("search task failed: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            eprintln!("search task JoinError: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "search task failed" })),
+            )
+                .into_response()
+        }
     }
 }
 
