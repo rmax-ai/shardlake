@@ -6,7 +6,9 @@ This document captures the conventions and guidelines that all contributors and 
 
 ## 1. Code Organisation
 
+- **Keep files atomic and conflict-resistant.** Prefer small, single-purpose module files so concurrent changes land in different files and merge cleanly.
 - **One responsibility per module.** Keep each `mod` focused on a single concern (e.g. `storage`, `query`, `network`). Avoid catch-all `utils` modules.
+- **Keep tests equally focused.** Test modules and integration test files should validate one behavior area each, rather than accumulating unrelated scenarios in large omnibus files.
 - **Prefer libraries over binaries for reusable logic.** Place core logic in `lib.rs` (or a `lib/` workspace crate) so it can be unit-tested without a running binary.
 - **Flat module hierarchy first.** Only introduce sub-modules when a module exceeds ~300 lines or contains clearly distinct responsibilities.
 - **Re-export judiciously.** Use `pub use` at crate root to expose a clean public API, hiding internal module paths.
@@ -95,6 +97,17 @@ This document captures the conventions and guidelines that all contributors and 
 - All PRs must pass: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo doc --no-deps`.
 - Security scanning via `cargo audit` runs on every push to `main`.
 - Benchmarks (`cargo bench`) run on release branches to catch regressions.
+
+## 13. Workspace Design References
+
+Use these companion documents for more detailed guidance when changing public APIs, crate boundaries, or system structure:
+
+- **`RUST_API_DESIGN.md`** — concise API design rules for type-driven interfaces, minimal public surface area, builders, trait design, and structured errors.
+- **`RUST_DEVELOPMENT.md`** — day-to-day engineering guidance covering safety-first Rust, async boundaries, performance, observability, testing, and production quality gates.
+- **`RUST_SYSTEM_DESIGN_PATTERNS.md`** — architectural patterns for scalable Rust systems, including actors, pipelines, message passing, backpressure, repositories, and fault tolerance.
+- **`RUST_WORKSPACE_ARCHITECTURE.md`** — workspace-level guidance for crate boundaries, layering, dependency direction, compile-time isolation, and large-codebase maintainability.
+
+When a change affects API shape, crate ownership, async orchestration, or cross-crate structure, review the relevant document first and keep implementation decisions aligned with it.
 
 ---
 
