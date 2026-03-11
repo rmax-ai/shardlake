@@ -51,6 +51,10 @@ fn test_build_and_search() {
     assert!(!manifest.shards.is_empty());
     let shard_sum: u64 = manifest.shards.iter().map(|s| s.vector_count).sum();
     assert_eq!(shard_sum, manifest.total_vector_count);
+    assert!(manifest
+        .shards
+        .iter()
+        .all(|shard| !shard.fingerprint.is_empty()));
 
     let searcher = IndexSearcher::new(
         Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,

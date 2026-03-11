@@ -29,8 +29,12 @@ pub struct ShardDef {
     pub artifact_key: String,
     /// Number of vectors in this shard.
     pub vector_count: u64,
-    /// Fingerprint hex digest of the artifact bytes (filled after build).
-    pub sha256: String,
+    /// Non-cryptographic fingerprint hex digest of the artifact bytes (filled after build).
+    ///
+    /// Serialized as `sha256` for manifest v1 wire compatibility, while still
+    /// accepting `fingerprint` when reading.
+    #[serde(rename = "sha256", alias = "fingerprint")]
+    pub fingerprint: String,
 }
 
 /// Build-time metadata recorded in the manifest.
@@ -123,6 +127,12 @@ impl Manifest {
         }
         if self.shards.is_empty() {
             return Err(ManifestError::Validation("manifest has no shards".into()));
+        }
+        if let Some(shard) = self.shards.iter().find(|shard| shard.fingerprint.is_empty()) {
+            return Err(ManifestError::Validation(format!(
+                "shard {} fingerprint must not be empty",
+                shard.shard_id
+            )));
         }
         let counted: u64 = self.shards.iter().map(|s| s.vector_count).sum();
         if counted != self.total_vector_count {

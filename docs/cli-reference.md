@@ -47,6 +47,11 @@ Writes to `<storage>/datasets/<dataset-version>/`:
 | `metadata.json` | Map of id → metadata for all records that carry metadata |
 | `info.json` | Pointer containing `dataset_version`, `dims`, `count`, and storage keys |
 
+### Validation
+
+- Every non-empty input row must contain a numeric `id` and a numeric `vector` array.
+- All vectors in the input file must have the same dimensionality. Ingest fails with the offending line number and vector id when a row does not match the dataset dimension.
+
 ### Example
 
 ```bash
@@ -76,9 +81,14 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--embedding-version <STRING>` | string | same as `--dataset-version` | Embedding version to record in the manifest |
 | `--index-version <STRING>` | string | `idx-<timestamp>` | Version tag for the index artifact |
 | `--metric <METRIC>` | enum | `cosine` | Distance metric: `cosine`, `euclidean`, or `inner-product` |
-| `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards |
+| `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards. Must be greater than 0. |
 | `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
+
+### Validation
+
+- `--num-shards` must be greater than 0.
+- The stored dataset must contain vectors whose dimensions match the dataset metadata written during `ingest`; index building fails if any record is inconsistent.
 
 ### Output
 

@@ -7,7 +7,10 @@ use std::{
 
 use tracing::{debug, info};
 
-use shardlake_core::types::{DistanceMetric, SearchResult, ShardId};
+use shardlake_core::{
+    error::CoreError,
+    types::{DistanceMetric, SearchResult, ShardId},
+};
 use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
@@ -47,6 +50,14 @@ impl IndexSearcher {
 
     /// Perform approximate top-k search using nprobe shard probing.
     pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+        let expected_dims = self.manifest.dims as usize;
+        if query.len() != expected_dims {
+            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                expected: expected_dims,
+                got: query.len(),
+            }));
+        }
+
         let metric: DistanceMetric = self.manifest.distance_metric;
 
         // Collect all centroids and map centroid index → shard id.
@@ -88,7 +99,10 @@ impl IndexSearcher {
     /// Load a shard from cache or store.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
             if let Some(idx) = cache.get(&shard_id) {
                 return Ok(Arc::clone(idx));
             }
@@ -104,8 +118,63 @@ impl IndexSearcher {
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
         cache.insert(shard_id, Arc::clone(&idx));
         Ok(idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::builder::{BuildParams, IndexBuilder};
+    use shardlake_core::{
+        config::SystemConfig,
+        types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId, VectorRecord},
+    };
+    use shardlake_storage::LocalObjectStore;
+
+    #[test]
+    fn search_rejects_query_dimension_mismatch() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+        };
+        let records = vec![VectorRecord {
+            id: VectorId(1),
+            data: vec![1.0, 2.0],
+            metadata: None,
+        }];
+
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-test".into()),
+                embedding_version: EmbeddingVersion("emb-test".into()),
+                index_version: IndexVersion("idx-test".into()),
+                metric: DistanceMetric::Cosine,
+                dims: 2,
+                vectors_key: "datasets/ds-test/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-test/metadata.json".into(),
+            })
+            .unwrap();
+
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let err = searcher.search(&[1.0, 2.0, 3.0], 1, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "core error: dimension mismatch: expected 2, got 3"
+        );
     }
 }

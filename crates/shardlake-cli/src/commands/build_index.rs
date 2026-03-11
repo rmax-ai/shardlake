@@ -43,6 +43,8 @@ pub struct BuildIndexArgs {
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
+    validate_num_shards(args.num_shards)?;
+
     let store = LocalObjectStore::new(&storage)?;
     let dataset_ver = DatasetVersion(args.dataset_version.clone());
     let embedding_ver = EmbeddingVersion(
@@ -113,4 +115,47 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         manifest.total_vector_count,
     );
     Ok(())
+}
+
+fn validate_num_shards(num_shards: u32) -> Result<()> {
+    anyhow::ensure!(num_shards > 0, "--num-shards must be greater than 0");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn validate_num_shards_rejects_zero() {
+        let err = validate_num_shards(0).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--num-shards must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_zero_num_shards_before_loading_dataset() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexArgs {
+                dataset_version: "missing-dataset".into(),
+                embedding_version: None,
+                index_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 0,
+                kmeans_iters: 20,
+                nprobe: 2,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--num-shards must be greater than 0"));
+    }
 }

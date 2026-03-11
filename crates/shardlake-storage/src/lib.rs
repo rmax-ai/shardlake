@@ -10,6 +10,8 @@ pub use local::LocalObjectStore;
 /// Errors surfaced by storage operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("invalid key {key:?}: {reason}")]
+    InvalidKey { key: String, reason: String },
     #[error("key not found: {0}")]
     NotFound(String),
     #[error("I/O error at {path}: {source}")]

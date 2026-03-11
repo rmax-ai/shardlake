@@ -24,3 +24,6 @@ clap = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
