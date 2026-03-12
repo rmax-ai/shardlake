@@ -10,7 +10,7 @@ use shardlake_index::{
     exact::{exact_search, recall_at_k},
     IndexSearcher,
 };
-use shardlake_storage::ObjectStore;
+use shardlake_storage::{paths, ObjectStore};
 
 /// Summary statistics for one benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +61,7 @@ pub fn run_benchmark(
     let p99_idx = ((latencies_us.len() as f64 * 0.99) as usize).min(latencies_us.len() - 1);
     let p99_latency = latencies_us.get(p99_idx).copied().unwrap_or(0.0);
 
-    let keys = store.list("indexes/").unwrap_or_default();
+    let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
     let artifact_size_bytes: u64 = keys
         .iter()
         .filter_map(|k| store.get(k).ok())

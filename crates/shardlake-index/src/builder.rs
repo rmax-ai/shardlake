@@ -125,7 +125,7 @@ impl<'a> IndexBuilder<'a> {
             let bytes = idx.to_bytes()?;
             let sha = fingerprint_hex(&bytes);
             let shard_artifact_key =
-                format!("indexes/{}/shards/{}.sidx", index_version.0, shard_id);
+                shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
             self.store.put(&shard_artifact_key, bytes)?;
             info!(shard = %shard_id, vectors = count, key = %shard_artifact_key, "Shard written");
             actual_total += count;
@@ -202,8 +202,8 @@ mod tests {
             index_version: IndexVersion("idx-test".into()),
             metric: DistanceMetric::Cosine,
             dims,
-            vectors_key: "datasets/ds-test/vectors.jsonl".into(),
-            metadata_key: "datasets/ds-test/metadata.json".into(),
+            vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-test"),
+            metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-test"),
         }
     }
 

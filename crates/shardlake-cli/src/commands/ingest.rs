@@ -16,7 +16,7 @@ use clap::Parser;
 use tracing::info;
 
 use shardlake_core::types::{VectorId, VectorRecord};
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
 pub struct IngestArgs {
@@ -51,8 +51,8 @@ pub async fn run(storage: PathBuf, args: IngestArgs) -> Result<()> {
     let dims = records[0].data.len();
     info!(records = records.len(), dims, "Parsed vectors");
 
-    let vectors_key = format!("datasets/{dataset_ver}/vectors.jsonl");
-    let metadata_key = format!("datasets/{dataset_ver}/metadata.json");
+    let vectors_key = paths::dataset_vectors_key(&dataset_ver);
+    let metadata_key = paths::dataset_metadata_key(&dataset_ver);
 
     let jsonl = serialise_records_jsonl(&records)?;
     store.put(&vectors_key, jsonl)?;
@@ -72,7 +72,7 @@ pub async fn run(storage: PathBuf, args: IngestArgs) -> Result<()> {
         "metadata_key": metadata_key,
     });
     store.put(
-        &format!("datasets/{dataset_ver}/info.json"),
+        &paths::dataset_info_key(&dataset_ver),
         serde_json::to_vec_pretty(&pointer)?,
     )?;
 

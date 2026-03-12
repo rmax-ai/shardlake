@@ -37,12 +37,10 @@ pub struct ShardDef {
     pub fingerprint: String,
     /// Centroid vector used for query routing (manifest v2+).
     ///
-    /// Populated at build time so that [`IndexSearcher`] can select probe shards
+    /// Populated at build time so that `IndexSearcher` can select probe shards
     /// without deserializing the full shard body.  Empty in manifests produced by
     /// older builders (manifest_version 1); fall back to loading the shard for
     /// routing in that case.
-    ///
-    /// [`IndexSearcher`]: shardlake_index::IndexSearcher
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub centroid: Vec<f32>,
 }
@@ -80,12 +78,12 @@ pub struct Manifest {
 impl Manifest {
     /// Storage key for a manifest given an index version.
     pub fn storage_key(index_version: &IndexVersion) -> String {
-        format!("indexes/{}/manifest.json", index_version.0)
+        shardlake_storage::paths::index_manifest_key(&index_version.0)
     }
 
     /// Storage key for the active alias pointer.
     pub fn alias_key(alias: &str) -> String {
-        format!("aliases/{}.json", alias)
+        shardlake_storage::paths::alias_key(alias)
     }
 
     /// Serialise and store to `store`.
@@ -138,7 +136,11 @@ impl Manifest {
         if self.shards.is_empty() {
             return Err(ManifestError::Validation("manifest has no shards".into()));
         }
-        if let Some(shard) = self.shards.iter().find(|shard| shard.fingerprint.is_empty()) {
+        if let Some(shard) = self
+            .shards
+            .iter()
+            .find(|shard| shard.fingerprint.is_empty())
+        {
             return Err(ManifestError::Validation(format!(
                 "shard {} fingerprint must not be empty",
                 shard.shard_id
