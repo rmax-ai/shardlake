@@ -78,7 +78,7 @@ and index version and describes every shard artifact.
 
 ```json
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "dataset_version": "ds-v1",
   "embedding_version": "emb-v1",
   "index_version": "idx-v1",
@@ -93,7 +93,8 @@ and index version and describes every shard artifact.
       "shard_id": 0,
       "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
       "vector_count": 2504,
-      "sha256": "a1b2c3d4e5f60708"
+      "sha256": "a1b2c3d4e5f60708",
+      "centroid": [0.12, 0.34, 0.56, ...]
     }
   ],
   "build_metadata": {
@@ -105,11 +106,18 @@ and index version and describes every shard artifact.
 }
 ```
 
+### Schema versions
+
+| `manifest_version` | Description |
+|--------------------|-------------|
+| `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
+| `2` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). `ShardDef` includes a `centroid` array so that `IndexSearcher` can select probe shards without deserialising any shard body. |
+
 ### Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `manifest_version` | integer | Schema version. Currently always `1`. |
+| `manifest_version` | integer | Schema version. `1` (legacy) or `2` (current). |
 | `dataset_version` | string | Version tag of the source dataset. |
 | `embedding_version` | string | Version tag of the embedding generation run. |
 | `index_version` | string | Version tag of this index build. |
@@ -133,6 +141,7 @@ and index version and describes every shard artifact.
 | `artifact_key` | string | Storage key of the `.sidx` file for this shard. |
 | `vector_count` | integer | Number of vectors stored in this shard. |
 | `sha256` | string | Canonical manifest v1 wire field for the shard fingerprint. Shardlake currently stores an FNV-1a fingerprint here as a prototype, not a cryptographic SHA-256 digest. The reader also accepts `fingerprint` for compatibility with previously emitted manifests. |
+| `centroid` | array of numbers | *(manifest v2+)* The K-means centroid for this shard (length equals `dims`). Used by `IndexSearcher` to route queries to the nearest shards without loading shard bodies. Absent in manifest v1; when missing the searcher falls back to loading the full shard to extract its centroid. |
 
 ---
 

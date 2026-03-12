@@ -35,6 +35,16 @@ pub struct ShardDef {
     /// accepting `fingerprint` when reading.
     #[serde(rename = "sha256", alias = "fingerprint")]
     pub fingerprint: String,
+    /// Centroid vector used for query routing (manifest v2+).
+    ///
+    /// Populated at build time so that [`IndexSearcher`] can select probe shards
+    /// without deserializing the full shard body.  Empty in manifests produced by
+    /// older builders (manifest_version 1); fall back to loading the shard for
+    /// routing in that case.
+    ///
+    /// [`IndexSearcher`]: shardlake_index::IndexSearcher
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub centroid: Vec<f32>,
 }
 
 /// Build-time metadata recorded in the manifest.
@@ -116,7 +126,7 @@ impl Manifest {
 
     /// Validate internal consistency.
     pub fn validate(&self) -> Result<()> {
-        if self.manifest_version != 1 {
+        if self.manifest_version != 1 && self.manifest_version != 2 {
             return Err(ManifestError::Validation(format!(
                 "unsupported manifest_version {}",
                 self.manifest_version
