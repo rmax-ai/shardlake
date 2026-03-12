@@ -1,6 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use shardlake_core::types::{DatasetVersion, EmbeddingVersion};
-use shardlake_manifest::{DatasetManifest, IngestMetadata, ManifestError, DATASET_MANIFEST_VERSION};
+use shardlake_manifest::{
+    DatasetManifest, IngestMetadata, ManifestError, DATASET_MANIFEST_VERSION,
+};
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 fn fixed_ts() -> DateTime<Utc> {
@@ -113,8 +115,7 @@ fn test_dataset_manifest_validate_rejects_unsupported_version() {
 fn test_dataset_manifest_load_missing_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalObjectStore::new(tmp.path()).unwrap();
-    let err =
-        DatasetManifest::load(&store, &DatasetVersion("nonexistent".into())).unwrap_err();
+    let err = DatasetManifest::load(&store, &DatasetVersion("nonexistent".into())).unwrap_err();
     assert!(matches!(err, ManifestError::Storage(_)));
 }
 
