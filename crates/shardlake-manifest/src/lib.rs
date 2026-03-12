@@ -80,12 +80,12 @@ pub struct Manifest {
 impl Manifest {
     /// Storage key for a manifest given an index version.
     pub fn storage_key(index_version: &IndexVersion) -> String {
-        format!("indexes/{}/manifest.json", index_version.0)
+        shardlake_storage::paths::index_manifest_key(&index_version.0)
     }
 
     /// Storage key for the active alias pointer.
     pub fn alias_key(alias: &str) -> String {
-        format!("aliases/{}.json", alias)
+        shardlake_storage::paths::alias_key(alias)
     }
 
     /// Serialise and store to `store`.
@@ -138,7 +138,11 @@ impl Manifest {
         if self.shards.is_empty() {
             return Err(ManifestError::Validation("manifest has no shards".into()));
         }
-        if let Some(shard) = self.shards.iter().find(|shard| shard.fingerprint.is_empty()) {
+        if let Some(shard) = self
+            .shards
+            .iter()
+            .find(|shard| shard.fingerprint.is_empty())
+        {
             return Err(ManifestError::Validation(format!(
                 "shard {} fingerprint must not be empty",
                 shard.shard_id

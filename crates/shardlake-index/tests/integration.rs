@@ -12,7 +12,7 @@ use shardlake_core::{
     },
 };
 use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher};
-use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
+use shardlake_storage::{paths, LocalObjectStore, ObjectStore, StorageError};
 
 fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
     (0..n)
@@ -87,8 +87,8 @@ fn test_build_and_search() {
             index_version: IndexVersion("idx-test".into()),
             metric: DistanceMetric::Euclidean,
             dims: 4,
-            vectors_key: "datasets/ds-test/vectors.jsonl".into(),
-            metadata_key: "datasets/ds-test/metadata.json".into(),
+            vectors_key: paths::dataset_vectors_key("ds-test"),
+            metadata_key: paths::dataset_metadata_key("ds-test"),
         })
         .unwrap();
 
@@ -136,8 +136,8 @@ fn test_search_does_not_load_non_probed_shards() {
             index_version: IndexVersion("idx-lazy".into()),
             metric: DistanceMetric::Euclidean,
             dims: 4,
-            vectors_key: "datasets/ds-lazy/vectors.jsonl".into(),
-            metadata_key: "datasets/ds-lazy/metadata.json".into(),
+            vectors_key: paths::dataset_vectors_key("ds-lazy"),
+            metadata_key: paths::dataset_metadata_key("ds-lazy"),
         })
         .unwrap();
 

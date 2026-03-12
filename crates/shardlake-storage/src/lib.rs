@@ -4,6 +4,7 @@
 //! A future backend (S3, MinIO) only needs to implement [`ObjectStore`].
 
 pub mod local;
+pub mod paths;
 
 pub use local::LocalObjectStore;
 

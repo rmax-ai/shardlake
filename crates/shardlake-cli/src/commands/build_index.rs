@@ -15,7 +15,7 @@ use shardlake_core::{
     types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
 };
 use shardlake_index::{BuildParams, IndexBuilder};
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
 pub struct BuildIndexArgs {
@@ -63,7 +63,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         nprobe: args.nprobe,
     };
 
-    let info_key = format!("datasets/{}/info.json", dataset_ver.0);
+    let info_key = paths::dataset_info_key(&dataset_ver.0);
     let info_bytes = store.get(&info_key).with_context(|| {
         format!(
             "Dataset {} not found; run `shardlake ingest` first",

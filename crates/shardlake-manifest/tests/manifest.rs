@@ -3,7 +3,7 @@ use shardlake_core::types::{
     DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
 };
 use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 fn sample_manifest() -> Manifest {
     Manifest {
@@ -14,20 +14,20 @@ fn sample_manifest() -> Manifest {
         alias: "latest".into(),
         dims: 4,
         distance_metric: DistanceMetric::Cosine,
-        vectors_key: "datasets/ds-v1/vectors.jsonl".into(),
-        metadata_key: "datasets/ds-v1/metadata.json".into(),
+        vectors_key: paths::dataset_vectors_key("ds-v1"),
+        metadata_key: paths::dataset_metadata_key("ds-v1"),
         total_vector_count: 10,
         shards: vec![
             ShardDef {
                 shard_id: ShardId(0),
-                artifact_key: "indexes/idx-v1/shards/shard-0000.sidx".into(),
+                artifact_key: paths::index_shard_key("idx-v1", 0),
                 vector_count: 5,
                 fingerprint: "abc".into(),
                 centroid: vec![0.1, 0.2, 0.3, 0.4],
             },
             ShardDef {
                 shard_id: ShardId(1),
-                artifact_key: "indexes/idx-v1/shards/shard-0001.sidx".into(),
+                artifact_key: paths::index_shard_key("idx-v1", 1),
                 vector_count: 5,
                 fingerprint: "def".into(),
                 centroid: vec![0.9, 0.8, 0.7, 0.6],
