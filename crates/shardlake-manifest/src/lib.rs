@@ -2,6 +2,8 @@
 //! all shard artifacts.  Also provides the versioned dataset manifest written
 //! by `shardlake ingest` and consumed by `shardlake build-index`.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shardlake_core::types::{
@@ -18,6 +20,11 @@ pub enum ManifestError {
     Parse(#[from] serde_json::Error),
     #[error("validation: {0}")]
     Validation(String),
+    /// Returned by the `check_*_compat` helpers when the manifest and the
+    /// caller disagree on a key parameter (dimension, dataset version, or
+    /// algorithm).
+    #[error("compatibility: {0}")]
+    Compatibility(String),
 }
 
 pub type Result<T> = std::result::Result<T, ManifestError>;
@@ -46,6 +53,93 @@ pub struct ShardDef {
     pub centroid: Vec<f32>,
 }
 
+/// Identifies the indexing algorithm used to build the index (manifest v3+).
+///
+/// Defaults to `AlgorithmMetadata::default()` (algorithm `"kmeans-flat"`) when
+/// deserializing older manifests that pre-date this field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlgorithmMetadata {
+    /// Canonical algorithm family name (e.g. `"kmeans-flat"`).
+    pub algorithm: String,
+    /// Optional algorithm variant (e.g. `"cosine-normalised"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    /// Free-form algorithm parameters recorded at build time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for AlgorithmMetadata {
+    /// Returns an `AlgorithmMetadata` representing the default K-means flat
+    /// index algorithm with no variant and no extra parameters.
+    fn default() -> Self {
+        Self {
+            algorithm: "kmeans-flat".into(),
+            variant: None,
+            params: BTreeMap::new(),
+        }
+    }
+}
+
+/// Summary statistics across all shards (manifest v3+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSummary {
+    /// Total number of non-empty shards in the index.
+    pub num_shards: u32,
+    /// Vector count of the smallest shard.
+    pub min_shard_vector_count: u64,
+    /// Vector count of the largest shard.
+    pub max_shard_vector_count: u64,
+}
+
+/// Placeholder for compression / quantization configuration (manifest v3+).
+///
+/// Full quantization support is not yet implemented; this struct is reserved
+/// for future use.  Set `enabled = false` and `codec = "none"` for all current
+/// prototype builds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    /// Whether compression / quantization is active.  Always `false` in the
+    /// current prototype.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Codec identifier.  `"none"` means no compression is applied.
+    /// Reserved values for future use: `"pq8"`, `"sq8"`.
+    #[serde(default = "CompressionConfig::default_codec")]
+    pub codec: String,
+}
+
+impl CompressionConfig {
+    fn default_codec() -> String {
+        "none".into()
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            codec: Self::default_codec(),
+        }
+    }
+}
+
+/// Approximate recall estimate recorded at build time (manifest v3+).
+///
+/// The estimate is produced by running a small sample query against the
+/// freshly-built index and comparing approximate nearest-neighbour results
+/// with a brute-force ground truth.  `None` when the estimate was not
+/// computed (e.g. in fast prototype builds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallEstimate {
+    /// The *k* used for the estimate (e.g. `10` for recall@10).
+    pub k: u32,
+    /// Estimated recall@k in the closed interval [0, 1].
+    pub recall_at_k: f32,
+    /// Number of sample queries used to compute the estimate.
+    pub sample_size: u64,
+}
+
 /// Build-time metadata recorded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -53,6 +147,12 @@ pub struct BuildMetadata {
     pub builder_version: String,
     pub num_kmeans_iters: u32,
     pub nprobe_default: u32,
+    /// Wall-clock duration of the full build in seconds (manifest v3+).
+    ///
+    /// Defaults to `0.0` when deserializing older manifests that do not
+    /// include this field.
+    #[serde(default)]
+    pub build_duration_secs: f64,
 }
 
 /// Full manifest tying dataset, embeddings, and index together.
@@ -74,6 +174,29 @@ pub struct Manifest {
     pub shards: Vec<ShardDef>,
     pub total_vector_count: u64,
     pub build_metadata: BuildMetadata,
+    /// Algorithm used to build this index (manifest v3+).
+    ///
+    /// Defaults to `AlgorithmMetadata::default()` (`"kmeans-flat"`) when
+    /// deserializing manifest v1 or v2 documents.
+    #[serde(default)]
+    pub algorithm: AlgorithmMetadata,
+    /// Shard count and per-shard vector-count statistics (manifest v3+).
+    ///
+    /// `None` when deserializing manifest v1 or v2 documents that do not
+    /// include this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_summary: Option<ShardSummary>,
+    /// Compression / quantization configuration (manifest v3+).
+    ///
+    /// Defaults to `CompressionConfig::default()` (disabled, codec `"none"`)
+    /// when deserializing manifest v1 or v2 documents.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+    /// Approximate recall estimate recorded at build time (manifest v3+).
+    ///
+    /// `None` when not computed (e.g. prototype builds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_estimate: Option<RecallEstimate>,
 }
 
 impl Manifest {
@@ -125,7 +248,7 @@ impl Manifest {
 
     /// Validate internal consistency.
     pub fn validate(&self) -> Result<()> {
-        if self.manifest_version != 1 && self.manifest_version != 2 {
+        if self.manifest_version != 1 && self.manifest_version != 2 && self.manifest_version != 3 {
             return Err(ManifestError::Validation(format!(
                 "unsupported manifest_version {}",
                 self.manifest_version
@@ -152,6 +275,49 @@ impl Manifest {
             return Err(ManifestError::Validation(format!(
                 "shard vector counts ({counted}) don't sum to total ({})",
                 self.total_vector_count
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check that this manifest is compatible with the requested vector
+    /// dimension.
+    ///
+    /// Returns [`ManifestError::Compatibility`] when `dims` does not match the
+    /// dimension stored in the manifest.
+    pub fn check_dimension_compat(&self, dims: u32) -> Result<()> {
+        if self.dims != dims {
+            return Err(ManifestError::Compatibility(format!(
+                "dimension mismatch: manifest has {}, requested {}",
+                self.dims, dims
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check that this manifest was built from the given dataset version.
+    ///
+    /// Returns [`ManifestError::Compatibility`] when the stored
+    /// `dataset_version` does not match `dataset_version`.
+    pub fn check_dataset_version_compat(&self, dataset_version: &DatasetVersion) -> Result<()> {
+        if &self.dataset_version != dataset_version {
+            return Err(ManifestError::Compatibility(format!(
+                "dataset version mismatch: manifest has {}, requested {}",
+                self.dataset_version, dataset_version
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check that this manifest was built with a compatible indexing algorithm.
+    ///
+    /// Returns [`ManifestError::Compatibility`] when the stored
+    /// [`AlgorithmMetadata::algorithm`] name does not match `algorithm`.
+    pub fn check_algorithm_compat(&self, algorithm: &str) -> Result<()> {
+        if self.algorithm.algorithm != algorithm {
+            return Err(ManifestError::Compatibility(format!(
+                "algorithm mismatch: manifest has {}, requested {}",
+                self.algorithm.algorithm, algorithm
             )));
         }
         Ok(())

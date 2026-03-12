@@ -2,12 +2,15 @@ use chrono::Utc;
 use shardlake_core::types::{
     DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
 };
-use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
+use shardlake_manifest::{
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ManifestError, ShardDef,
+    ShardSummary,
+};
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 fn sample_manifest() -> Manifest {
     Manifest {
-        manifest_version: 2,
+        manifest_version: 3,
         dataset_version: DatasetVersion("ds-v1".into()),
         embedding_version: EmbeddingVersion("emb-v1".into()),
         index_version: IndexVersion("idx-v1".into()),
@@ -38,8 +41,65 @@ fn sample_manifest() -> Manifest {
             builder_version: "0.1.0".into(),
             num_kmeans_iters: 20,
             nprobe_default: 2,
+            build_duration_secs: 1.5,
         },
+        algorithm: AlgorithmMetadata {
+            algorithm: "kmeans-flat".into(),
+            variant: None,
+            params: {
+                let mut p = std::collections::BTreeMap::new();
+                p.insert("num_shards".into(), serde_json::json!(2));
+                p.insert("kmeans_iters".into(), serde_json::json!(20));
+                p
+            },
+        },
+        shard_summary: Some(ShardSummary {
+            num_shards: 2,
+            min_shard_vector_count: 5,
+            max_shard_vector_count: 5,
+        }),
+        compression: CompressionConfig::default(),
+        recall_estimate: None,
     }
+}
+
+/// A genuine v2 manifest with centroid data but without v3 lifecycle fields.
+/// Used to verify that v3 readers can still round-trip v2 documents.
+fn sample_v2_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "manifest_version": 2,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 10,
+        "shards": [
+            {
+                "shard_id": 0,
+                "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+                "vector_count": 5,
+                "sha256": "abc",
+                "centroid": [0.1, 0.2, 0.3, 0.4]
+            },
+            {
+                "shard_id": 1,
+                "artifact_key": "indexes/idx-v1/shards/shard-0001.sidx",
+                "vector_count": 5,
+                "sha256": "def",
+                "centroid": [0.9, 0.8, 0.7, 0.6]
+            }
+        ],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2
+        }
+    })
 }
 
 #[test]
@@ -127,14 +187,17 @@ fn test_load_accepts_compat_fingerprint_field() {
 fn test_v2_centroid_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalObjectStore::new(tmp.path()).unwrap();
-    let m = sample_manifest();
+
+    // Deserialize a genuine v2 document (no v3 lifecycle fields).
+    let v2_value = sample_v2_manifest();
+    let m: Manifest = serde_json::from_value(v2_value).unwrap();
     assert_eq!(m.manifest_version, 2);
     m.save(&store).unwrap();
 
     let manifest_key = Manifest::storage_key(&m.index_version);
     let saved = store.get(&manifest_key).unwrap();
     let saved_json = String::from_utf8(saved).unwrap();
-    // Centroid is serialised into the JSON for v2 manifests.
+    // Centroid is re-serialised into the saved JSON.
     assert!(saved_json.contains("\"centroid\""));
 
     let loaded = Manifest::load(&store, &m.index_version).unwrap();
@@ -149,4 +212,172 @@ fn test_validate_rejects_unsupported_manifest_version() {
     m.manifest_version = 99;
     let err = m.validate().unwrap_err();
     assert!(err.to_string().contains("unsupported manifest_version 99"));
+}
+
+// ── manifest v3 lifecycle fields ─────────────────────────────────────────────
+
+#[test]
+fn test_v3_round_trips_lifecycle_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+    let m = sample_manifest();
+    assert_eq!(m.manifest_version, 3);
+    m.save(&store).unwrap();
+
+    let saved = store.get(&Manifest::storage_key(&m.index_version)).unwrap();
+    let saved_json = String::from_utf8(saved).unwrap();
+
+    // Lifecycle fields must be present in the serialised output.
+    assert!(saved_json.contains("\"algorithm\""));
+    assert!(saved_json.contains("\"shard_summary\""));
+    assert!(saved_json.contains("\"compression\""));
+    assert!(saved_json.contains("\"build_duration_secs\""));
+    // recall_estimate is None, so it must be absent.
+    assert!(!saved_json.contains("\"recall_estimate\""));
+
+    let loaded = Manifest::load(&store, &m.index_version).unwrap();
+    assert_eq!(loaded.manifest_version, 3);
+    assert_eq!(loaded.algorithm.algorithm, "kmeans-flat");
+    assert!(loaded.algorithm.params.contains_key("num_shards"));
+    let summary = loaded.shard_summary.as_ref().unwrap();
+    assert_eq!(summary.num_shards, 2);
+    assert_eq!(summary.min_shard_vector_count, 5);
+    assert_eq!(summary.max_shard_vector_count, 5);
+    assert!(!loaded.compression.enabled);
+    assert_eq!(loaded.compression.codec, "none");
+    assert_eq!(loaded.build_metadata.build_duration_secs, 1.5);
+    assert!(loaded.recall_estimate.is_none());
+}
+
+#[test]
+fn test_v1_manifest_defaults_new_fields() {
+    // A v1 manifest (no algorithm / shard_summary / compression / build_duration_secs)
+    // must deserialize with sensible defaults for all v3 fields.
+    let compat = serde_json::json!({
+        "manifest_version": 1,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 5,
+        "shards": [{
+            "shard_id": 0,
+            "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+            "vector_count": 5,
+            "fingerprint": "compat-fingerprint"
+        }],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2
+        }
+    });
+
+    let manifest: Manifest = serde_json::from_value(compat).unwrap();
+    // Algorithm defaults to kmeans-flat.
+    assert_eq!(manifest.algorithm.algorithm, "kmeans-flat");
+    assert!(manifest.algorithm.variant.is_none());
+    assert!(manifest.algorithm.params.is_empty());
+    // ShardSummary is absent for old manifests.
+    assert!(manifest.shard_summary.is_none());
+    // Compression defaults to disabled / none.
+    assert!(!manifest.compression.enabled);
+    assert_eq!(manifest.compression.codec, "none");
+    // build_duration_secs defaults to 0.0.
+    assert_eq!(manifest.build_metadata.build_duration_secs, 0.0);
+    // recall_estimate is absent.
+    assert!(manifest.recall_estimate.is_none());
+}
+
+// ── compatibility checks ──────────────────────────────────────────────────────
+
+#[test]
+fn test_check_dimension_compat_ok() {
+    let m = sample_manifest();
+    assert!(m.check_dimension_compat(4).is_ok());
+}
+
+#[test]
+fn test_check_dimension_compat_mismatch() {
+    let m = sample_manifest();
+    let err = m.check_dimension_compat(128).unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("dimension mismatch"));
+    assert!(err.to_string().contains("manifest has 4"));
+    assert!(err.to_string().contains("requested 128"));
+}
+
+#[test]
+fn test_check_dataset_version_compat_ok() {
+    let m = sample_manifest();
+    assert!(m
+        .check_dataset_version_compat(&DatasetVersion("ds-v1".into()))
+        .is_ok());
+}
+
+#[test]
+fn test_check_dataset_version_compat_mismatch() {
+    let m = sample_manifest();
+    let err = m
+        .check_dataset_version_compat(&DatasetVersion("ds-v2".into()))
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("dataset version mismatch"));
+    assert!(err.to_string().contains("manifest has ds-v1"));
+    assert!(err.to_string().contains("requested ds-v2"));
+}
+
+#[test]
+fn test_check_algorithm_compat_ok() {
+    let m = sample_manifest();
+    assert!(m.check_algorithm_compat("kmeans-flat").is_ok());
+}
+
+#[test]
+fn test_check_algorithm_compat_mismatch() {
+    let m = sample_manifest();
+    let err = m.check_algorithm_compat("hnsw").unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm mismatch"));
+    assert!(err.to_string().contains("manifest has kmeans-flat"));
+    assert!(err.to_string().contains("requested hnsw"));
+}
+
+#[test]
+fn test_check_algorithm_compat_uses_v1_default() {
+    // A v1/v2 manifest has no algorithm field; it deserializes to the
+    // default "kmeans-flat", so the compatibility check should pass for
+    // "kmeans-flat" and fail for anything else.
+    let compat = serde_json::json!({
+        "manifest_version": 2,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 5,
+        "shards": [{
+            "shard_id": 0,
+            "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+            "vector_count": 5,
+            "sha256": "abc"
+        }],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2
+        }
+    });
+    let manifest: Manifest = serde_json::from_value(compat).unwrap();
+    assert!(manifest.check_algorithm_compat("kmeans-flat").is_ok());
+    assert!(manifest.check_algorithm_compat("hnsw").is_err());
 }

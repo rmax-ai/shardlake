@@ -141,8 +141,8 @@ fn test_search_does_not_load_non_probed_shards() {
         })
         .unwrap();
 
-    // Manifest v2 embeds centroids so routing requires zero shard loads.
-    assert_eq!(manifest.manifest_version, 2);
+    // Manifest v3 embeds centroids so routing requires zero shard loads.
+    assert_eq!(manifest.manifest_version, 3);
     assert!(manifest.shards.iter().all(|s| !s.centroid.is_empty()));
 
     let (counting_store, counter) = CountingStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>);

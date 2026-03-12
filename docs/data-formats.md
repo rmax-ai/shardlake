@@ -109,7 +109,7 @@ and index version and describes every shard artifact.
 
 ```json
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "dataset_version": "ds-v1",
   "embedding_version": "emb-v1",
   "index_version": "idx-v1",
@@ -132,23 +132,48 @@ and index version and describes every shard artifact.
     "built_at": "2026-03-10T17:44:00Z",
     "builder_version": "0.1.0",
     "num_kmeans_iters": 20,
-    "nprobe_default": 2
+    "nprobe_default": 2,
+    "build_duration_secs": 3.14
+  },
+  "algorithm": {
+    "algorithm": "kmeans-flat",
+    "params": {
+      "num_shards": 4,
+      "kmeans_iters": 20
+    }
+  },
+  "shard_summary": {
+    "num_shards": 4,
+    "min_shard_vector_count": 2400,
+    "max_shard_vector_count": 2700
+  },
+  "compression": {
+    "enabled": false,
+    "codec": "none"
   }
 }
 ```
+
+> `recall_estimate` is omitted from the example above because it is absent in prototype
+> builds (the field is skipped when `None`).  When present it looks like:
+>
+> ```json
+> "recall_estimate": { "k": 10, "recall_at_k": 0.97, "sample_size": 500 }
+> ```
 
 ### Schema versions
 
 | `manifest_version` | Description |
 |--------------------|-------------|
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
-| `2` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). `ShardDef` includes a `centroid` array so that `IndexSearcher` can select probe shards without deserialising any shard body. |
+| `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
+| `3` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. All new fields use `serde` defaults so older readers can still parse v3 documents by ignoring unknown fields, and v3 readers can still load v1/v2 documents by applying the defaults described below. |
 
 ### Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `manifest_version` | integer | Schema version. `1` (legacy) or `2` (current). |
+| `manifest_version` | integer | Schema version. `1` (legacy), `2`, or `3` (current). |
 | `dataset_version` | string | Version tag of the source dataset. |
 | `embedding_version` | string | Version tag of the embedding generation run. |
 | `index_version` | string | Version tag of this index build. |
@@ -163,6 +188,19 @@ and index version and describes every shard artifact.
 | `build_metadata.builder_version` | string | Semver version of the `shardlake` binary that built this index. |
 | `build_metadata.num_kmeans_iters` | integer | K-means iterations used. |
 | `build_metadata.nprobe_default` | integer | Default nprobe recorded at build time. |
+| `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
+| `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name (e.g. `"kmeans-flat"`). Defaults to `"kmeans-flat"` for v1/v2 manifests. |
+| `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. |
+| `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
+| `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
+| `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
+| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. Always `false` in the current prototype. Defaults to `false`. |
+| `compression.codec` | string | *(v3+)* Codec identifier. `"none"` in the current prototype. Reserved: `"pq8"`, `"sq8"`. Defaults to `"none"`. |
+| `recall_estimate` | object \| null | *(v3+, optional)* Approximate recall estimate from a build-time sample query. `null` / absent when not computed. |
+| `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). |
+| `recall_estimate.recall_at_k` | float | Estimated recall@k in [0, 1]. |
+| `recall_estimate.sample_size` | integer | Number of sample queries used. |
 
 ### Shard definition fields
 
@@ -173,6 +211,20 @@ and index version and describes every shard artifact.
 | `vector_count` | integer | Number of vectors stored in this shard. |
 | `sha256` | string | Canonical manifest v1 wire field for the shard fingerprint. Shardlake currently stores an FNV-1a fingerprint here as a prototype, not a cryptographic SHA-256 digest. The reader also accepts `fingerprint` for compatibility with previously emitted manifests. |
 | `centroid` | array of numbers | *(manifest v2+)* The K-means centroid for this shard (length equals `dims`). Used by `IndexSearcher` to route queries to the nearest shards without loading shard bodies. Absent in manifest v1; when missing the searcher falls back to loading the full shard to extract its centroid. |
+
+### Compatibility checks
+
+`shardlake_manifest::Manifest` exposes three typed helpers for call-site compatibility
+validation:
+
+| Method | Error condition |
+|--------|----------------|
+| `check_dimension_compat(dims)` | `dims` does not match `manifest.dims` |
+| `check_dataset_version_compat(version)` | `version` does not match `manifest.dataset_version` |
+| `check_algorithm_compat(algorithm)` | `algorithm` does not match `manifest.algorithm.algorithm` |
+
+All three return `ManifestError::Compatibility(…)` on failure so callers can distinguish
+compatibility errors from parse or validation errors.
 
 ---
 
