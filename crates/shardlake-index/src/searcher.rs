@@ -69,6 +69,13 @@ impl IndexSearcher {
         for shard_def in &self.manifest.shards {
             if !shard_def.centroid.is_empty() {
                 // Fast path: centroid is embedded in the manifest -- no I/O needed.
+                // Validate that the centroid dimensionality matches the index dimensionality.
+                if shard_def.centroid.len() != expected_dims {
+                    return Err(IndexError::Core(CoreError::DimensionMismatch {
+                        expected: expected_dims,
+                        got: shard_def.centroid.len(),
+                    }));
+                }
                 all_centroids.push(shard_def.centroid.clone());
                 centroid_to_shard.push(shard_def.shard_id);
             } else {
