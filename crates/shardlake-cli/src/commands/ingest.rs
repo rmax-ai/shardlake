@@ -15,7 +15,8 @@ use chrono::Utc;
 use clap::Parser;
 use tracing::info;
 
-use shardlake_core::types::{VectorId, VectorRecord};
+use shardlake_core::types::{DatasetVersion, EmbeddingVersion, VectorId, VectorRecord};
+use shardlake_manifest::{DatasetManifest, IngestMetadata, DATASET_MANIFEST_VERSION};
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
@@ -63,18 +64,20 @@ pub async fn run(storage: PathBuf, args: IngestArgs) -> Result<()> {
         .collect();
     store.put(&metadata_key, serde_json::to_vec_pretty(&meta_map)?)?;
 
-    let pointer = serde_json::json!({
-        "dataset_version": dataset_ver,
-        "embedding_version": embedding_ver,
-        "dims": dims,
-        "count": records.len(),
-        "vectors_key": vectors_key,
-        "metadata_key": metadata_key,
-    });
-    store.put(
-        &paths::dataset_info_key(&dataset_ver),
-        serde_json::to_vec_pretty(&pointer)?,
-    )?;
+    let dataset_manifest = DatasetManifest {
+        manifest_version: DATASET_MANIFEST_VERSION,
+        dataset_version: DatasetVersion(dataset_ver.clone()),
+        embedding_version: EmbeddingVersion(embedding_ver.clone()),
+        dims: dims as u32,
+        vector_count: records.len() as u64,
+        vectors_key: vectors_key.clone(),
+        metadata_key: metadata_key.clone(),
+        ingest_metadata: Some(IngestMetadata {
+            ingested_at: Utc::now(),
+            ingester_version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    };
+    dataset_manifest.save(&store)?;
 
     info!(vectors_key, metadata_key, "Ingest complete");
     println!(

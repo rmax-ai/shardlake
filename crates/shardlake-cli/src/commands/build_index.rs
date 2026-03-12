@@ -15,7 +15,8 @@ use shardlake_core::{
     types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
 };
 use shardlake_index::{BuildParams, IndexBuilder};
-use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
+use shardlake_manifest::DatasetManifest;
+use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
 pub struct BuildIndexArgs {
@@ -63,23 +64,15 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         nprobe: args.nprobe,
     };
 
-    let info_key = paths::dataset_info_key(&dataset_ver.0);
-    let info_bytes = store.get(&info_key).with_context(|| {
+    let dm = DatasetManifest::load(&store, &dataset_ver).with_context(|| {
         format!(
             "Dataset {} not found; run `shardlake ingest` first",
             dataset_ver.0
         )
     })?;
-    let info: serde_json::Value = serde_json::from_slice(&info_bytes)?;
-    let vectors_key = info["vectors_key"]
-        .as_str()
-        .context("info.json missing vectors_key")?
-        .to_string();
-    let metadata_key = info["metadata_key"]
-        .as_str()
-        .context("info.json missing metadata_key")?
-        .to_string();
-    let dims = info["dims"].as_u64().context("info.json missing dims")? as usize;
+    let vectors_key = dm.vectors_key.clone();
+    let metadata_key = dm.metadata_key.clone();
+    let dims = dm.dims as usize;
 
     info!(dataset_version = %dataset_ver.0, "Loading vectors");
     let vecs_bytes = store.get(&vectors_key)?;

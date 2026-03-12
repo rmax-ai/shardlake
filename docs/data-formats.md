@@ -58,21 +58,47 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 
 ---
 
-## Dataset info pointer (`datasets/<version>/info.json`)
+## Dataset manifest (`datasets/<version>/info.json`)
 
-Written by `shardlake ingest`. Contains a quick summary of the dataset for use by
-`shardlake build-index` without re-reading the full JSONL file.
+Written by `shardlake ingest`. Contains a versioned description of the dataset
+for use by `shardlake build-index` without re-reading the full JSONL file.
 
 ```json
 {
+  "manifest_version": 1,
   "dataset_version": "ds-v1",
   "embedding_version": "emb-v1",
   "dims": 128,
-  "count": 10000,
+  "vector_count": 10000,
   "vectors_key": "datasets/ds-v1/vectors.jsonl",
-  "metadata_key": "datasets/ds-v1/metadata.json"
+  "metadata_key": "datasets/ds-v1/metadata.json",
+  "ingest_metadata": {
+    "ingested_at": "2026-03-12T22:43:29Z",
+    "ingester_version": "0.1.0"
+  }
 }
 ```
+
+### Schema versions
+
+| `manifest_version` | Description |
+|--------------------|-------------|
+| `0` | Pre-versioning legacy file. No `manifest_version` field (defaults to `0`), no `ingest_metadata`. Uses `"count"` instead of `"vector_count"`. Still accepted by `shardlake build-index`. |
+| `1` | Current schema (produced by `shardlake ingest` ≥ 0.1.0). Includes `ingest_metadata` with lifecycle fields. Uses `"vector_count"`. |
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `manifest_version` | integer | Schema version. `0` (legacy/absent) or `1` (current). |
+| `dataset_version` | string | Version tag of this dataset. |
+| `embedding_version` | string | Version tag of the embedding generation run. |
+| `dims` | integer | Vector dimension. Must be > 0. |
+| `vector_count` | integer | Total number of vectors in this dataset. Must be > 0. |
+| `vectors_key` | string | Storage key of the raw vectors JSONL file. |
+| `metadata_key` | string | Storage key of the id → metadata JSON file. |
+| `ingest_metadata.ingested_at` | ISO 8601 datetime | When the dataset was ingested (UTC). |
+| `ingest_metadata.ingester_version` | string | Semver version of the `shardlake` binary that ingested this dataset. |
 
 ---
 

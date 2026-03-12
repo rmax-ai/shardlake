@@ -1,5 +1,6 @@
 //! Manifest schema: ties a dataset version to an index version and describes
-//! all shard artifacts.
+//! all shard artifacts.  Also provides the versioned dataset manifest written
+//! by `shardlake ingest` and consumed by `shardlake build-index`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -162,4 +163,113 @@ impl Manifest {
 struct AliasPointer {
     pub alias: String,
     pub index_version: IndexVersion,
+}
+
+// ── Dataset manifest ──────────────────────────────────────────────────────────
+
+/// Current schema version of the dataset manifest.
+///
+/// Written by `shardlake ingest` into `datasets/<version>/info.json`.
+pub const DATASET_MANIFEST_VERSION: u32 = 1;
+
+/// Ingest-time lifecycle metadata recorded in the dataset manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestMetadata {
+    /// When the dataset was ingested (UTC).
+    pub ingested_at: DateTime<Utc>,
+    /// Version of the `shardlake` binary that produced this dataset.
+    pub ingester_version: String,
+}
+
+/// Versioned dataset manifest stored at `datasets/<version>/info.json`.
+///
+/// Written by `shardlake ingest`, loaded by `shardlake build-index`.
+///
+/// # Backwards compatibility
+///
+/// Pre-versioning `info.json` files (schema version `0`) are still accepted:
+/// - `manifest_version` defaults to `0` when the field is absent.
+/// - `vector_count` accepts the legacy `count` field name via a serde alias.
+/// - `ingest_metadata` is `None` when the field is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetManifest {
+    /// Schema version of this manifest document.
+    ///
+    /// `0` = pre-versioning legacy file; [`DATASET_MANIFEST_VERSION`] = current.
+    #[serde(default)]
+    pub manifest_version: u32,
+    pub dataset_version: DatasetVersion,
+    pub embedding_version: EmbeddingVersion,
+    /// Vector dimension.
+    pub dims: u32,
+    /// Total number of vectors in this dataset.
+    ///
+    /// Serialised as `vector_count`; also accepts the legacy `count` field name
+    /// for backward compatibility with pre-versioning `info.json` files.
+    #[serde(alias = "count")]
+    pub vector_count: u64,
+    /// Storage key of the raw vectors JSONL file.
+    pub vectors_key: String,
+    /// Storage key of the metadata JSON file.
+    pub metadata_key: String,
+    /// Lifecycle metadata captured at ingest time.
+    ///
+    /// `None` when loading a legacy `info.json` that predates the versioned schema.
+    #[serde(default)]
+    pub ingest_metadata: Option<IngestMetadata>,
+}
+
+impl DatasetManifest {
+    /// Storage key for a dataset manifest given a dataset version.
+    pub fn storage_key(dataset_version: &DatasetVersion) -> String {
+        shardlake_storage::paths::dataset_info_key(&dataset_version.0)
+    }
+
+    /// Serialise and store to `store`.
+    pub fn save(&self, store: &dyn ObjectStore) -> Result<()> {
+        let key = Self::storage_key(&self.dataset_version);
+        let bytes = serde_json::to_vec_pretty(self)?;
+        store.put(&key, bytes)?;
+        Ok(())
+    }
+
+    /// Load from `store` by dataset version.
+    pub fn load(store: &dyn ObjectStore, dataset_version: &DatasetVersion) -> Result<Self> {
+        let key = Self::storage_key(dataset_version);
+        let bytes = store.get(&key)?;
+        let m: Self = serde_json::from_slice(&bytes)?;
+        m.validate()?;
+        Ok(m)
+    }
+
+    /// Validate internal consistency of this dataset manifest.
+    pub fn validate(&self) -> Result<()> {
+        if self.manifest_version > DATASET_MANIFEST_VERSION {
+            return Err(ManifestError::Validation(format!(
+                "unsupported dataset manifest_version {}",
+                self.manifest_version
+            )));
+        }
+        if self.dims == 0 {
+            return Err(ManifestError::Validation(
+                "dataset manifest: dims must be > 0".into(),
+            ));
+        }
+        if self.vector_count == 0 {
+            return Err(ManifestError::Validation(
+                "dataset manifest: vector_count must be > 0".into(),
+            ));
+        }
+        if self.vectors_key.is_empty() {
+            return Err(ManifestError::Validation(
+                "dataset manifest: vectors_key must not be empty".into(),
+            ));
+        }
+        if self.metadata_key.is_empty() {
+            return Err(ManifestError::Validation(
+                "dataset manifest: metadata_key must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
 }
