@@ -11,7 +11,9 @@ use shardlake_core::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
     },
 };
-use shardlake_manifest::{BuildMetadata, Manifest, ShardDef};
+use shardlake_manifest::{
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ShardDef, ShardSummary,
+};
 use shardlake_storage::ObjectStore;
 
 use crate::{
@@ -85,6 +87,8 @@ impl<'a> IndexBuilder<'a> {
             }));
         }
 
+        let build_start = std::time::Instant::now();
+
         let n = records.len();
         let k = self.config.num_shards as usize;
         let iters = self.config.kmeans_iters;
@@ -138,8 +142,26 @@ impl<'a> IndexBuilder<'a> {
             });
         }
 
+        let build_duration_secs = build_start.elapsed().as_secs_f64();
+
+        let shard_summary = if shard_defs.is_empty() {
+            None
+        } else {
+            let min_count = shard_defs.iter().map(|s| s.vector_count).min().unwrap_or(0);
+            let max_count = shard_defs.iter().map(|s| s.vector_count).max().unwrap_or(0);
+            Some(ShardSummary {
+                num_shards: shard_defs.len() as u32,
+                min_shard_vector_count: min_count,
+                max_shard_vector_count: max_count,
+            })
+        };
+
+        let mut algo_params = std::collections::BTreeMap::new();
+        algo_params.insert("num_shards".into(), serde_json::json!(k));
+        algo_params.insert("kmeans_iters".into(), serde_json::json!(iters));
+
         let manifest = Manifest {
-            manifest_version: 2,
+            manifest_version: 3,
             dataset_version,
             embedding_version,
             index_version,
@@ -155,7 +177,16 @@ impl<'a> IndexBuilder<'a> {
                 builder_version: env!("CARGO_PKG_VERSION").into(),
                 num_kmeans_iters: iters,
                 nprobe_default: self.config.nprobe,
+                build_duration_secs,
             },
+            algorithm: AlgorithmMetadata {
+                algorithm: "kmeans-flat".into(),
+                variant: None,
+                params: algo_params,
+            },
+            shard_summary,
+            compression: CompressionConfig::default(),
+            recall_estimate: None,
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;
