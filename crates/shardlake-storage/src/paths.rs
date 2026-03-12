@@ -43,6 +43,11 @@ pub fn index_manifest_key(index_version: &str) -> String {
     format!("indexes/{index_version}/manifest.json")
 }
 
+/// Storage-key prefix containing all index artifacts.
+pub fn indexes_prefix() -> &'static str {
+    "indexes/"
+}
+
 /// Storage key for a single shard `.sidx` artifact.
 ///
 /// Shard numbers are zero-padded to four digits so that lexicographic and
@@ -75,6 +80,7 @@ mod tests {
     #[test]
     fn index_keys_have_stable_layout() {
         assert_eq!(index_manifest_key("idx-v1"), "indexes/idx-v1/manifest.json");
+        assert_eq!(indexes_prefix(), "indexes/");
         assert_eq!(
             index_shard_key("idx-v1", 0),
             "indexes/idx-v1/shards/shard-0000.sidx"
