@@ -127,7 +127,7 @@ impl<'a> IndexBuilder<'a> {
                 records: shard_recs,
             };
             let bytes = idx.to_bytes()?;
-            let sha = fingerprint_hex(&bytes);
+            let sha = crate::artifact_fingerprint(&bytes);
             let shard_artifact_key =
                 shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
             self.store.put(&shard_artifact_key, bytes)?;
@@ -193,20 +193,6 @@ impl<'a> IndexBuilder<'a> {
         info!(index_version = %manifest.index_version, "Manifest written");
         Ok(manifest)
     }
-}
-
-/// FNV-1a-based artifact fingerprint.
-///
-/// This is intentionally a fast, non-cryptographic hash used to detect
-/// accidental corruption and enable deduplication during prototyping.
-/// Replace with SHA-256 (e.g. `sha2` crate) before using in production.
-fn fingerprint_hex(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
 }
 
 #[cfg(test)]

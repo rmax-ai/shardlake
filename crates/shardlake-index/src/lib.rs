@@ -5,11 +5,13 @@ pub mod exact;
 pub mod kmeans;
 pub mod searcher;
 pub mod shard;
+pub mod validator;
 
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
+pub use validator::{ValidationFailure, ValidationReport};
 
 /// Errors that can arise in index operations.
 #[derive(Debug, thiserror::Error)]
@@ -27,3 +29,19 @@ pub enum IndexError {
 }
 
 pub type Result<T> = std::result::Result<T, IndexError>;
+
+/// Compute the FNV-1a fingerprint of `bytes` and return it as a lowercase
+/// 16-digit hex string.
+///
+/// This is a fast, non-cryptographic hash used to detect accidental artifact
+/// corruption and to enable deduplication during prototyping.  It is shared by
+/// the builder (which records fingerprints in the manifest) and the validator
+/// (which recomputes them from stored artifact bytes for comparison).
+pub fn artifact_fingerprint(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
