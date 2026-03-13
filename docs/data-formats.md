@@ -271,3 +271,74 @@ per vector:
 
 The magic bytes and format version allow the reader to detect corrupt or incompatible
 artifacts before parsing any vector data.
+
+---
+
+## Manifest integrity validation
+
+`shardlake_index::validator` provides a reusable validation layer that checks manifests
+and their referenced artifacts end-to-end.  The engine is pure library logic with no
+dependency on the CLI.
+
+### API
+
+```rust
+use shardlake_index::validator::{validate_index, validate_dataset};
+
+let report = validate_index(&manifest, store.as_ref());
+if !report.is_valid() {
+    for failure in &report.failures {
+        eprintln!("validation failure: {failure}");
+    }
+}
+```
+
+Both functions return a [`ValidationReport`] whose `failures` field contains every
+problem detected; validation does **not** stop at the first error.
+
+`ValidationReport::into_result()` converts to `Result<(), Vec<ValidationFailure>>` for
+use in code that treats validation failure as an error.
+
+### `validate_index` checks
+
+| Order | Check | Failure variant |
+|-------|-------|----------------|
+| 1 | [`Manifest::validate()`] structural consistency | `ManifestInvalid` |
+| 2 | `manifest.vectors_key` exists in storage | `ArtifactMissing` |
+| 3 | `manifest.metadata_key` exists in storage | `ArtifactMissing` |
+| 4 | Each shard `artifact_key` exists in storage | `ArtifactMissing` |
+| 5 | Shard bytes FNV-1a fingerprint matches `shard.fingerprint` | `FingerprintMismatch` |
+| 6 | Shard binary `dims` matches `manifest.dims` | `ShardDimensionMismatch` |
+| 7 | Shard binary vector count matches `shard.vector_count` | `ShardVectorCountMismatch` |
+
+### `validate_dataset` checks
+
+| Order | Check | Failure variant |
+|-------|-------|----------------|
+| 1 | [`DatasetManifest::validate()`] structural consistency | `ManifestInvalid` |
+| 2 | `manifest.vectors_key` exists in storage | `ArtifactMissing` |
+| 3 | `manifest.metadata_key` exists in storage | `ArtifactMissing` |
+
+### `ValidationFailure` variants
+
+| Variant | Description |
+|---------|-------------|
+| `ManifestInvalid(String)` | The manifest document is structurally or semantically invalid. |
+| `ArtifactMissing { key }` | A referenced storage key does not exist. |
+| `FingerprintMismatch { key, expected, actual }` | A shard artifact's FNV-1a fingerprint does not match the value recorded in the manifest. |
+| `ShardDimensionMismatch { shard_id, expected, actual }` | A shard's embedded vector dimension is inconsistent with `manifest.dims`. |
+| `ShardVectorCountMismatch { shard_id, expected, actual }` | A shard's embedded vector count differs from `shard.vector_count` in the manifest. |
+| `StorageError { key, message }` | A storage access error prevented a key from being checked. |
+| `ShardParseError { key, message }` | A shard artifact's binary data could not be parsed (e.g. wrong magic bytes, unsupported format version). |
+
+### Artifact fingerprint
+
+The FNV-1a fingerprint used by the builder and validator is a fast, non-cryptographic
+hash intended for prototype-grade corruption detection and deduplication.  The same
+algorithm is exposed via `shardlake_index::artifact_fingerprint(bytes: &[u8]) -> String`
+so external code can verify or record fingerprints without depending on internal modules.
+
+> **Note:** The `sha256` JSON field in `ShardDef` stores an FNV-1a digest, not a
+> cryptographic SHA-256 hash.  The field name `sha256` is kept for wire compatibility
+> with manifest v1 consumers (the reader also accepts `fingerprint` as an alias).
+> Replace with a cryptographic hash (e.g. `sha2` crate) before using in production.
