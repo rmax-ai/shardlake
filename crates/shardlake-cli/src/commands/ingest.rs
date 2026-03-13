@@ -64,11 +64,13 @@ pub async fn run(storage: PathBuf, args: IngestArgs) -> Result<()> {
         .collect();
     store.put(&metadata_key, serde_json::to_vec_pretty(&meta_map)?)?;
 
+    let manifest_dims = dataset_manifest_dims(dims)?;
+
     let dataset_manifest = DatasetManifest {
         manifest_version: DATASET_MANIFEST_VERSION,
         dataset_version: DatasetVersion(dataset_ver.clone()),
         embedding_version: EmbeddingVersion(embedding_ver.clone()),
-        dims: dims as u32,
+        dims: manifest_dims,
         vector_count: records.len() as u64,
         vectors_key: vectors_key.clone(),
         metadata_key: metadata_key.clone(),
@@ -154,6 +156,10 @@ fn parse_records(reader: impl BufRead) -> Result<Vec<VectorRecord>> {
     Ok(records)
 }
 
+fn dataset_manifest_dims(dims: usize) -> Result<u32> {
+    u32::try_from(dims).context("vector dimension exceeds supported maximum of u32::MAX")
+}
+
 fn serialise_records_jsonl(records: &[VectorRecord]) -> Result<Vec<u8>> {
     let mut jsonl = Vec::new();
     for record in records {
@@ -191,6 +197,18 @@ mod tests {
         assert!(err
             .to_string()
             .contains("line 1: vector for id 1 must not be empty"));
+    }
+
+    #[test]
+    fn dataset_manifest_dims_rejects_overflow() {
+        let Some(too_large) = usize::try_from(u64::from(u32::MAX) + 1).ok() else {
+            return;
+        };
+
+        let err = dataset_manifest_dims(too_large).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("vector dimension exceeds supported maximum of u32::MAX"));
     }
 
     #[tokio::test]
