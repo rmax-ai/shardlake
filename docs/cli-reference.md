@@ -78,7 +78,7 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--dataset-version <STRING>` | string | *(required)* | Dataset version to index (must match a prior `ingest` run) |
-| `--embedding-version <STRING>` | string | same as `--dataset-version` | Embedding version to record in the manifest |
+| `--embedding-version <STRING>` | string | dataset manifest `embedding_version` | Embedding version to record in the manifest |
 | `--index-version <STRING>` | string | `idx-<timestamp>` | Version tag for the index artifact |
 | `--metric <METRIC>` | enum | `cosine` | Distance metric: `cosine`, `euclidean`, or `inner-product` |
 | `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards. Must be greater than 0. |
