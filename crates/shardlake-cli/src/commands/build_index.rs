@@ -41,6 +41,12 @@ pub struct BuildIndexArgs {
     /// Number of shards to probe at query time.
     #[arg(long, default_value_t = 2)]
     pub nprobe: u32,
+    /// RNG seed for K-means initialisation.
+    ///
+    /// Using the same seed with identical inputs produces the same shard
+    /// layout and artifact fingerprints, enabling reproducible builds.
+    #[arg(long, default_value_t = shardlake_core::config::DEFAULT_KMEANS_SEED)]
+    pub kmeans_seed: u64,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
@@ -58,6 +64,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         num_shards: args.num_shards,
         kmeans_iters: args.kmeans_iters,
         nprobe: args.nprobe,
+        kmeans_seed: args.kmeans_seed,
     };
 
     let dm = match DatasetManifest::load(&store, &dataset_ver) {
@@ -148,6 +155,7 @@ mod tests {
                 num_shards: 0,
                 kmeans_iters: 20,
                 nprobe: 2,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
             },
         )
         .await
@@ -203,6 +211,7 @@ mod tests {
                 num_shards: 2,
                 kmeans_iters: 2,
                 nprobe: 1,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
             },
         )
         .await
@@ -234,6 +243,7 @@ mod tests {
                 num_shards: 1,
                 kmeans_iters: 2,
                 nprobe: 1,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
             },
         )
         .await

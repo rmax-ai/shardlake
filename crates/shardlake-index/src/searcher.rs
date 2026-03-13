@@ -167,6 +167,7 @@ mod tests {
             num_shards: 1,
             kmeans_iters: 2,
             nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
         };
         let records = vec![VectorRecord {
             id: VectorId(1),

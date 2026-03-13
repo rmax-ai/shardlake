@@ -2,3 +2,4 @@ storage_root = "./data"
 num_shards = 4
 kmeans_iters = 20
 nprobe = 2
+kmeans_seed = 3735928559

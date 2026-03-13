@@ -139,7 +139,8 @@ and index version and describes every shard artifact.
     "algorithm": "kmeans-flat",
     "params": {
       "num_shards": 4,
-      "kmeans_iters": 20
+      "kmeans_iters": 20,
+      "kmeans_seed": 3735928559
     }
   },
   "shard_summary": {
@@ -191,7 +192,7 @@ and index version and describes every shard artifact.
 | `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
 | `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name (e.g. `"kmeans-flat"`). Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds. |
 | `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
 | `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
 | `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
@@ -225,6 +226,38 @@ validation:
 
 All three return `ManifestError::Compatibility(…)` on failure so callers can distinguish
 compatibility errors from parse or validation errors.
+
+### Reproducibility contract
+
+A Shardlake index build is **reproducible** when the following inputs are held constant:
+
+| Input | Where recorded |
+|-------|---------------|
+| Input vectors (dataset) | `dataset_version` + `vectors_key` |
+| Vector dimension | `dims` |
+| Distance metric | `distance_metric` |
+| Number of shards | `algorithm.params.num_shards` |
+| K-means iterations | `algorithm.params.kmeans_iters` |
+| K-means RNG seed | `algorithm.params.kmeans_seed` |
+| Builder binary version | `build_metadata.builder_version` |
+
+Given identical values for all of the above, two builds produce identical shard
+assignments and identical artifact byte sequences, and therefore identical
+`ShardDef.fingerprint` values.
+
+**Variable fields** — fields whose values change between runs even with identical inputs
+— are explicitly **not** part of the reproducibility contract:
+
+| Field | Why it varies |
+|-------|--------------|
+| `build_metadata.built_at` | Wall-clock timestamp |
+| `build_metadata.build_duration_secs` | Wall-clock duration |
+| `index_version` | Caller-supplied version tag |
+
+The default `kmeans_seed` (`3735928559` / `0xDEADBEEF`) is applied automatically by
+`shardlake build-index` when `--kmeans-seed` is not specified.  Supply an explicit
+`--kmeans-seed` value to override it and have it documented directly in the CLI
+invocation.
 
 ---
 
