@@ -119,6 +119,25 @@ fn test_dataset_manifest_load_missing_returns_error() {
     assert!(matches!(err, ManifestError::Storage(_)));
 }
 
+#[test]
+fn test_dataset_manifest_load_rejects_dataset_version_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+
+    let dm = sample_dataset_manifest();
+    store
+        .put(
+            &DatasetManifest::storage_key(&DatasetVersion("other-dataset".into())),
+            serde_json::to_vec_pretty(&dm).unwrap(),
+        )
+        .unwrap();
+
+    let err = DatasetManifest::load(&store, &DatasetVersion("other-dataset".into())).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("dataset manifest: dataset_version mismatch"));
+}
+
 /// Backward compatibility: old `info.json` files written before the versioned
 /// schema are still accepted by `DatasetManifest::load`.
 ///

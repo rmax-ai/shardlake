@@ -239,6 +239,12 @@ impl DatasetManifest {
         let bytes = store.get(&key)?;
         let m: Self = serde_json::from_slice(&bytes)?;
         m.validate()?;
+        if m.dataset_version != *dataset_version {
+            return Err(ManifestError::Validation(format!(
+                "dataset manifest: dataset_version mismatch (expected {}, found {})",
+                dataset_version.0, m.dataset_version.0
+            )));
+        }
         Ok(m)
     }
 
