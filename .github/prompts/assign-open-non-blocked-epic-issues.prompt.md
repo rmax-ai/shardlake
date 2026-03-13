@@ -26,6 +26,8 @@ Requirements:
    - sub-issue state is `open`
    - the sub-issue has zero open blockers
 6. Assign every actionable sub-issue to `copilot-swe-agent`.
+   - Emit `assign_to_agent` for each actionable issue with `issue_number=<n>` and `agent="copilot-swe-agent"`.
+   - Do not use direct repository writes to perform assignment.
 7. Do not assign:
    - closed issues
    - issues that still have open blockers
@@ -40,6 +42,7 @@ Execution guidance:
 - Use the GitHub issue dependency API to retrieve `blocked_by` relationships.
 - When evaluating blockers, inspect the blocker issues’ current states.
 - Prefer a workflow that first computes the actionable set, then performs assignment.
+- Perform assignment by emitting the approved `assign_to_agent` safe output, not by editing issues directly.
 - If the epic has no sub-issues, report that clearly and do not attempt assignment.
 - If there are no actionable issues, report that clearly and do not treat it as an error.
 
