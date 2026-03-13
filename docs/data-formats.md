@@ -254,7 +254,7 @@ assignments and identical artifact byte sequences, and therefore identical
 | `build_metadata.build_duration_secs` | Wall-clock duration |
 | `index_version` | Caller-supplied version tag |
 
-The default `kmeans_seed` (`3735928559` / `0xDEADBEEF`) is applied automatically by
+The default `kmeans_seed` (`3735928559` / `0xdeadbeef`) is applied automatically by
 `shardlake build-index` when `--kmeans-seed` is not specified.  Supply an explicit
 `--kmeans-seed` value to override it and have it documented directly in the CLI
 invocation.
