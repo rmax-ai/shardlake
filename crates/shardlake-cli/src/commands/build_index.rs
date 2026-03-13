@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
 use tracing::info;
@@ -15,8 +15,8 @@ use shardlake_core::{
     types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
 };
 use shardlake_index::{BuildParams, IndexBuilder};
-use shardlake_manifest::DatasetManifest;
-use shardlake_storage::{LocalObjectStore, ObjectStore};
+use shardlake_manifest::{DatasetManifest, ManifestError};
+use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
 
 #[derive(Parser, Debug)]
 pub struct BuildIndexArgs {
@@ -60,12 +60,16 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         nprobe: args.nprobe,
     };
 
-    let dm = DatasetManifest::load(&store, &dataset_ver).with_context(|| {
-        format!(
-            "Dataset {} not found; run `shardlake ingest` first",
-            dataset_ver.0
-        )
-    })?;
+    let dm = match DatasetManifest::load(&store, &dataset_ver) {
+        Ok(dm) => dm,
+        Err(err @ ManifestError::Storage(StorageError::NotFound(_))) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "Dataset {} not found; run `shardlake ingest` first",
+                dataset_ver.0
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let embedding_ver = EmbeddingVersion(
         args.embedding_version
             .unwrap_or_else(|| dm.embedding_version.0.clone()),
@@ -206,5 +210,38 @@ mod tests {
 
         let manifest = Manifest::load(&store, &IndexVersion("idx-test".into())).unwrap();
         assert_eq!(manifest.embedding_version, embedding_version);
+    }
+
+    #[tokio::test]
+    async fn run_preserves_manifest_parse_errors() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+        store
+            .put(
+                &DatasetManifest::storage_key(&DatasetVersion("ds-test".into())),
+                b"{".to_vec(),
+            )
+            .unwrap();
+
+        let err = run(
+            storage,
+            BuildIndexArgs {
+                dataset_version: "ds-test".into(),
+                embedding_version: None,
+                index_version: Some("idx-test".into()),
+                metric: DistanceMetric::Cosine,
+                num_shards: 1,
+                kmeans_iters: 2,
+                nprobe: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!err
+            .to_string()
+            .contains("Dataset ds-test not found; run `shardlake ingest` first"));
+        assert!(err.to_string().contains("parse error"));
     }
 }
