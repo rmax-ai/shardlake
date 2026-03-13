@@ -83,6 +83,7 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--metric <METRIC>` | enum | `cosine` | Distance metric: `cosine`, `euclidean`, or `inner-product` |
 | `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards. Must be greater than 0. |
 | `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
+| `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for K-means centroid initialisation. Use the same seed with identical inputs to reproduce shard layout and manifest fingerprints. |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
 
 ### Validation
@@ -107,6 +108,7 @@ shardlake build-index \
   --index-version idx-v1 \
   --num-shards 8 \
   --kmeans-iters 30 \
+  --kmeans-seed 3735928559 \
   --metric cosine \
   --nprobe 3
 ```
