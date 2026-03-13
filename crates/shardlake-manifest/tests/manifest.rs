@@ -50,6 +50,10 @@ fn sample_manifest() -> Manifest {
                 let mut p = std::collections::BTreeMap::new();
                 p.insert("num_shards".into(), serde_json::json!(2));
                 p.insert("kmeans_iters".into(), serde_json::json!(20));
+                p.insert(
+                    "kmeans_seed".into(),
+                    serde_json::json!(shardlake_core::config::DEFAULT_KMEANS_SEED),
+                );
                 p
             },
         },
@@ -284,6 +288,20 @@ fn test_v3_round_trips_lifecycle_fields() {
     assert_eq!(loaded.manifest_version, 3);
     assert_eq!(loaded.algorithm.algorithm, "kmeans-flat");
     assert!(loaded.algorithm.params.contains_key("num_shards"));
+    assert!(
+        loaded.algorithm.params.contains_key("kmeans_seed"),
+        "kmeans_seed must be recorded in algorithm.params for reproducibility"
+    );
+    assert_eq!(
+        loaded
+            .algorithm
+            .params
+            .get("kmeans_seed")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        shardlake_core::config::DEFAULT_KMEANS_SEED,
+    );
     let summary = loaded.shard_summary.as_ref().unwrap();
     assert_eq!(summary.num_shards, 2);
     assert_eq!(summary.min_shard_vector_count, 5);

@@ -95,7 +95,7 @@ impl<'a> IndexBuilder<'a> {
 
         info!(n, k, iters, "Running K-means to compute shard centroids");
 
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.config.kmeans_seed);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
         let centroids = kmeans(&vecs, k, iters, &mut rng);
 
@@ -159,6 +159,10 @@ impl<'a> IndexBuilder<'a> {
         let mut algo_params = std::collections::BTreeMap::new();
         algo_params.insert("num_shards".into(), serde_json::json!(k));
         algo_params.insert("kmeans_iters".into(), serde_json::json!(iters));
+        algo_params.insert(
+            "kmeans_seed".into(),
+            serde_json::json!(self.config.kmeans_seed),
+        );
 
         let manifest = Manifest {
             manifest_version: 3,
@@ -247,6 +251,7 @@ mod tests {
             num_shards: 0,
             kmeans_iters: 2,
             nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
         };
 
         let err = IndexBuilder::new(&store, &config)
@@ -266,6 +271,7 @@ mod tests {
             num_shards: 1,
             kmeans_iters: 2,
             nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
         };
 
         let err = IndexBuilder::new(&store, &config)
