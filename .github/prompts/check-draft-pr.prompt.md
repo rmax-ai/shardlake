@@ -36,15 +36,26 @@ Requirements:
    - acceptance criteria coverage
    - docs completeness
    - obvious missing tests or follow-up work
-9. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
-10. If any command fails, continue gathering as much context as possible and report the failure clearly.
+9. Update PR metadata if needed:
+   - if the current PR title is misleading, incomplete, or no longer matches the actual scope, update it
+   - if the PR body is missing important summary, acceptance-criteria mapping, linked issue context, docs notes, or follow-up callouts, update it
+   - keep edits factual, concise, and aligned with the actual diff
+10. Add a PR comment if needed:
+   - if the checks reveal blocking issues, unclear acceptance criteria, notable follow-up items, or readiness concerns, leave a concise PR comment summarizing them
+   - if no extra comment would add value, do not add one
+11. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
+12. If any command fails, continue gathering as much context as possible and report the failure clearly.
 
 Execution guidance:
 - Use `gh pr view <input>` to resolve the PR.
 - Use `gh pr checkout <input>` to switch to the PR branch.
+- Use `gh pr edit <input>` (or equivalent GitHub API calls) if the title/body should be corrected.
+- Use `gh pr comment <input>` if a reviewer-facing summary comment would be useful.
 - Prefer concise, evidence-based reporting.
 - When judging acceptance criteria, use linked issues or issue references from the PR body when available.
 - If no linked issue exists, evaluate only against the PR description and changed files.
+- Only update the title/body when the improvement is clearly justified by the diff or review findings.
+- Only add a PR comment when it creates useful reviewer context beyond the final local report.
 - Be explicit about whether the branch was actually checked out.
 - Leave the repository on the checked-out PR branch unless the user asks otherwise.
 
@@ -64,7 +75,13 @@ Output format:
    - whether they are present
 5. Acceptance criteria review
    - covered / unclear / missing
-6. Recommendation
+6. PR metadata updates
+   - whether title or description changed
+   - short summary of what changed and why
+7. PR comment
+   - whether a comment was added
+   - short summary of what it said and why
+8. Recommendation
    - `ready for review`, `needs fixes before review`, or `could not fully assess`
-7. Next actions
+9. Next actions
    - short actionable bullets

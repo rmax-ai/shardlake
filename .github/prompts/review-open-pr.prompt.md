@@ -58,17 +58,28 @@ Requirements:
    - watch for mismatch between PR description and actual diff scope
    - watch for dead code, TODO-shaped gaps, or partially implemented behavior
    - watch for error handling regressions, panics, unchecked assumptions, or obvious maintainability concerns
-12. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
-13. If any command fails, continue gathering as much context as possible and report the failure clearly.
+12. Update PR metadata if needed:
+   - if the PR title no longer reflects the actual scope, update it
+   - if the PR body is missing important summary, issue linkage, acceptance-criteria coverage, docs notes, or follow-up context, update it
+   - keep edits factual, concise, and directly supported by the diff and review findings
+13. Add a PR comment if needed:
+   - if maintainers or reviewers would benefit from a concise summary of must-fix items, deferred issues, or merge-readiness concerns, leave a PR comment
+   - if the PR already has sufficient context and no added comment is needed, do not add one
+14. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
+15. If any command fails, continue gathering as much context as possible and report the failure clearly.
 
 Execution guidance:
 - Use `gh pr view <input>` to resolve the PR.
 - Use `gh pr checkout <input>` to switch to the PR branch.
+- Use `gh pr edit <input>` (or equivalent GitHub API calls) if the title/body should be corrected.
+- Use `gh pr comment <input>` if a reviewer-facing summary comment would add value.
 - Prefer concise, evidence-based reporting.
 - When judging acceptance criteria, use linked issues or issue references from the PR body when available.
 - If no linked issue exists, evaluate only against the PR description, review discussion, and changed files.
 - Treat explicit reviewer requests, failed CI, broken quality gates, and missing acceptance-criteria coverage as strong signals for must-fix items.
 - Treat stylistic cleanup, naming preferences, optional refactors, and broader future work as candidates for follow-up issues unless they hide correctness or maintainability risks.
+- Only update the title/body when the change clearly improves reviewer understanding or accuracy.
+- Only add a PR comment when it usefully summarizes findings, decisions, or deferred work beyond the final local report.
 - Be explicit about whether the branch was actually checked out.
 - Leave the repository on the checked-out PR branch unless the user asks otherwise.
 
@@ -102,7 +113,13 @@ Output format:
      - why defer is acceptable
      - problem statement
      - acceptance criteria / next steps
-9. Recommendation
+9. PR metadata updates
+   - whether title or description changed
+   - short summary of what changed and why
+10. PR comment
+   - whether a comment was added
+   - short summary of what it said and why
+11. Recommendation
    - `ready to merge`, `needs author updates`, `needs reviewer discussion`, or `could not fully assess`
-10. Next actions
+12. Next actions
    - short actionable bullets
