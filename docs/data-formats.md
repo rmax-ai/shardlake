@@ -167,7 +167,7 @@ and index version and describes every shard artifact.
 |--------------------|-------------|
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
 | `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
-| `3` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. All new fields use `serde` defaults so older readers can still parse v3 documents by ignoring unknown fields, and v3 readers can still load v1/v2 documents by applying the defaults described below. |
+| `3` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The v3 reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v3 documents. |
 
 ### Fields
 

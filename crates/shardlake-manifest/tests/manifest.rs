@@ -197,11 +197,15 @@ fn test_v2_centroid_round_trips() {
     let manifest_key = Manifest::storage_key(&m.index_version);
     let saved = store.get(&manifest_key).unwrap();
     let saved_json = String::from_utf8(saved).unwrap();
+    // Legacy manifests are upgraded to the current schema on write.
+    assert!(saved_json.contains("\"manifest_version\": 3"));
+    assert!(saved_json.contains("\"algorithm\""));
+    assert!(saved_json.contains("\"compression\""));
     // Centroid is re-serialised into the saved JSON.
     assert!(saved_json.contains("\"centroid\""));
 
     let loaded = Manifest::load(&store, &m.index_version).unwrap();
-    assert_eq!(loaded.manifest_version, 2);
+    assert_eq!(loaded.manifest_version, 3);
     assert_eq!(loaded.shards[0].centroid, vec![0.1, 0.2, 0.3, 0.4]);
     assert_eq!(loaded.shards[1].centroid, vec![0.9, 0.8, 0.7, 0.6]);
 }
