@@ -1,2 +1,3 @@
 /target
 /tmp
+!.github/workflows/*.lock.yml
