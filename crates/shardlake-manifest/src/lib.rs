@@ -213,9 +213,21 @@ impl Manifest {
     /// Serialise and store to `store`.
     pub fn save(&self, store: &dyn ObjectStore) -> Result<()> {
         let key = Self::storage_key(&self.index_version);
-        let bytes = serde_json::to_vec_pretty(self)?;
+        let bytes = serde_json::to_vec_pretty(&self.normalised_for_save())?;
         store.put(&key, bytes)?;
         Ok(())
+    }
+
+    /// Return the manifest document that should be emitted to storage.
+    ///
+    /// Legacy manifest versions are upgraded to the current schema on write so
+    /// the stored wire format stays internally consistent.
+    fn normalised_for_save(&self) -> Self {
+        let mut manifest = self.clone();
+        if manifest.manifest_version < 3 {
+            manifest.manifest_version = 3;
+        }
+        manifest
     }
 
     /// Load from `store` by index version.
