@@ -289,6 +289,89 @@ impl Manifest {
                 self.total_vector_count
             )));
         }
+        self.validate_lifecycle_metadata()?;
+        Ok(())
+    }
+
+    fn validate_lifecycle_metadata(&self) -> Result<()> {
+        if self.algorithm.algorithm.trim().is_empty() {
+            return Err(ManifestError::Validation(
+                "algorithm.algorithm must not be empty".into(),
+            ));
+        }
+        if !self.build_metadata.build_duration_secs.is_finite()
+            || self.build_metadata.build_duration_secs < 0.0
+        {
+            return Err(ManifestError::Validation(
+                "build_metadata.build_duration_secs must be finite and >= 0".into(),
+            ));
+        }
+        if self.compression.codec.trim().is_empty() {
+            return Err(ManifestError::Validation(
+                "compression.codec must not be empty".into(),
+            ));
+        }
+
+        if let Some(summary) = &self.shard_summary {
+            let actual_num_shards = self.shards.len() as u32;
+            let actual_min = self
+                .shards
+                .iter()
+                .map(|shard| shard.vector_count)
+                .min()
+                .unwrap_or(0);
+            let actual_max = self
+                .shards
+                .iter()
+                .map(|shard| shard.vector_count)
+                .max()
+                .unwrap_or(0);
+
+            if summary.num_shards != actual_num_shards {
+                return Err(ManifestError::Validation(format!(
+                    "shard_summary.num_shards mismatch: expected {}, found {}",
+                    actual_num_shards, summary.num_shards
+                )));
+            }
+            if summary.min_shard_vector_count > summary.max_shard_vector_count {
+                return Err(ManifestError::Validation(
+                    "shard_summary.min_shard_vector_count must be <= max_shard_vector_count".into(),
+                ));
+            }
+            if summary.min_shard_vector_count != actual_min {
+                return Err(ManifestError::Validation(format!(
+                    "shard_summary.min_shard_vector_count mismatch: expected {}, found {}",
+                    actual_min, summary.min_shard_vector_count
+                )));
+            }
+            if summary.max_shard_vector_count != actual_max {
+                return Err(ManifestError::Validation(format!(
+                    "shard_summary.max_shard_vector_count mismatch: expected {}, found {}",
+                    actual_max, summary.max_shard_vector_count
+                )));
+            }
+        }
+
+        if let Some(recall_estimate) = &self.recall_estimate {
+            if recall_estimate.k == 0 {
+                return Err(ManifestError::Validation(
+                    "recall_estimate.k must be > 0".into(),
+                ));
+            }
+            if recall_estimate.sample_size == 0 {
+                return Err(ManifestError::Validation(
+                    "recall_estimate.sample_size must be > 0".into(),
+                ));
+            }
+            if !recall_estimate.recall_at_k.is_finite()
+                || !(0.0..=1.0).contains(&recall_estimate.recall_at_k)
+            {
+                return Err(ManifestError::Validation(
+                    "recall_estimate.recall_at_k must be finite and within [0, 1]".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 

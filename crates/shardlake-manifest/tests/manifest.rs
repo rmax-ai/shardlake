@@ -3,8 +3,8 @@ use shardlake_core::types::{
     DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
 };
 use shardlake_manifest::{
-    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ManifestError, ShardDef,
-    ShardSummary,
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ManifestError, RecallEstimate,
+    ShardDef, ShardSummary,
 };
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
@@ -216,6 +216,47 @@ fn test_validate_rejects_unsupported_manifest_version() {
     m.manifest_version = 99;
     let err = m.validate().unwrap_err();
     assert!(err.to_string().contains("unsupported manifest_version 99"));
+}
+
+#[test]
+fn test_validate_rejects_inconsistent_shard_summary() {
+    let mut m = sample_manifest();
+    m.shard_summary = Some(ShardSummary {
+        num_shards: 99,
+        min_shard_vector_count: 5,
+        max_shard_vector_count: 5,
+    });
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("shard_summary.num_shards mismatch: expected 2, found 99"));
+}
+
+#[test]
+fn test_validate_rejects_invalid_recall_estimate() {
+    let mut m = sample_manifest();
+    m.recall_estimate = Some(RecallEstimate {
+        k: 10,
+        recall_at_k: 1.5,
+        sample_size: 100,
+    });
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("recall_estimate.recall_at_k must be finite and within [0, 1]"));
+}
+
+#[test]
+fn test_validate_rejects_negative_build_duration() {
+    let mut m = sample_manifest();
+    m.build_metadata.build_duration_secs = -0.25;
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("build_metadata.build_duration_secs must be finite and >= 0"));
 }
 
 // ── manifest v3 lifecycle fields ─────────────────────────────────────────────
