@@ -23,7 +23,7 @@ pub struct BuildIndexArgs {
     /// Dataset version to build index for.
     #[arg(long)]
     pub dataset_version: String,
-    /// Embedding version (defaults to dataset version).
+    /// Embedding version (defaults to the dataset manifest embedding version).
     #[arg(long)]
     pub embedding_version: Option<String>,
     /// Index version tag (defaults to a timestamp).
@@ -48,10 +48,6 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
 
     let store = LocalObjectStore::new(&storage)?;
     let dataset_ver = DatasetVersion(args.dataset_version.clone());
-    let embedding_ver = EmbeddingVersion(
-        args.embedding_version
-            .unwrap_or_else(|| args.dataset_version.clone()),
-    );
     let index_ver = IndexVersion(
         args.index_version
             .unwrap_or_else(|| format!("idx-{}", Utc::now().format("%Y%m%dT%H%M%S"))),
@@ -70,6 +66,10 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
             dataset_ver.0
         )
     })?;
+    let embedding_ver = EmbeddingVersion(
+        args.embedding_version
+            .unwrap_or_else(|| dm.embedding_version.0.clone()),
+    );
     let vectors_key = dm.vectors_key.clone();
     let metadata_key = dm.metadata_key.clone();
     let dims = dm.dims as usize;
@@ -117,6 +117,8 @@ fn validate_num_shards(num_shards: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use shardlake_manifest::{DatasetManifest, Manifest, DATASET_MANIFEST_VERSION};
+    use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
     use tempfile::tempdir;
 
     use super::*;
@@ -150,5 +152,59 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--num-shards must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn run_defaults_embedding_version_from_dataset_manifest() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+        let dataset_version = DatasetVersion("ds-test".into());
+        let embedding_version = EmbeddingVersion("emb-manifest".into());
+
+        let vectors_key = paths::dataset_vectors_key(&dataset_version.0);
+        store
+            .put(
+                &vectors_key,
+                br#"{"id":1,"data":[1.0,0.0],"metadata":null}
+{"id":2,"data":[0.0,1.0],"metadata":null}
+"#
+                .to_vec(),
+            )
+            .unwrap();
+
+        let metadata_key = paths::dataset_metadata_key(&dataset_version.0);
+        store.put(&metadata_key, br#"{}"#.to_vec()).unwrap();
+
+        DatasetManifest {
+            manifest_version: DATASET_MANIFEST_VERSION,
+            dataset_version: dataset_version.clone(),
+            embedding_version: embedding_version.clone(),
+            dims: 2,
+            vector_count: 2,
+            vectors_key: vectors_key.clone(),
+            metadata_key: metadata_key.clone(),
+            ingest_metadata: None,
+        }
+        .save(&store)
+        .unwrap();
+
+        run(
+            storage,
+            BuildIndexArgs {
+                dataset_version: dataset_version.0.clone(),
+                embedding_version: None,
+                index_version: Some("idx-test".into()),
+                metric: DistanceMetric::Cosine,
+                num_shards: 2,
+                kmeans_iters: 2,
+                nprobe: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest = Manifest::load(&store, &IndexVersion("idx-test".into())).unwrap();
+        assert_eq!(manifest.embedding_version, embedding_version);
     }
 }
