@@ -39,6 +39,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         num_shards: 2,
         kmeans_iters: 5,
         nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
     }
 }
 
