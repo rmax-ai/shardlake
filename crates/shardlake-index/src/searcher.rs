@@ -65,8 +65,8 @@ impl IndexSearcher {
         }
 
         let metric: DistanceMetric = self.manifest.distance_metric;
-        let pq_enabled = self.manifest.compression.enabled
-            && self.manifest.compression.codec == PQ8_CODEC;
+        let pq_enabled =
+            self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
         // Collect centroids for routing from the manifest when available (manifest v2+).
         // Shards built with an older builder (manifest v1) have an empty centroid vec; for
@@ -188,13 +188,29 @@ impl IndexSearcher {
             .codebook_key
             .as_deref()
             .ok_or_else(|| {
-                IndexError::Other(
-                    "PQ index has no codebook_key in compression config".into(),
-                )
+                IndexError::Other("PQ index has no codebook_key in compression config".into())
             })?;
 
         let bytes = self.store.get(cb_key)?;
         let cb = Arc::new(PqCodebook::from_bytes(&bytes)?);
+        if cb.dims != self.manifest.dims as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook dims {} do not match manifest dims {}",
+                cb.dims, self.manifest.dims
+            )));
+        }
+        if cb.params.num_subspaces != self.manifest.compression.pq_num_subspaces as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook subspaces {} do not match manifest pq_num_subspaces {}",
+                cb.params.num_subspaces, self.manifest.compression.pq_num_subspaces
+            )));
+        }
+        if cb.params.codebook_size != self.manifest.compression.pq_codebook_size as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook size {} do not match manifest pq_codebook_size {}",
+                cb.params.codebook_size, self.manifest.compression.pq_codebook_size
+            )));
+        }
 
         let mut guard = self
             .codebook
@@ -225,6 +241,24 @@ impl IndexSearcher {
 
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+        if shard.dims != self.manifest.dims as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} dims {} do not match manifest dims {}",
+                shard.dims, self.manifest.dims
+            )));
+        }
+        if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
+                shard.pq_m, self.manifest.compression.pq_num_subspaces
+            )));
+        }
+        if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
+                shard.pq_k, self.manifest.compression.pq_codebook_size
+            )));
+        }
 
         let mut cache = self
             .pq_shard_cache

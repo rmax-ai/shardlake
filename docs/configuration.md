@@ -17,6 +17,9 @@ individual command flags.
 | `kmeans_iters` | u32 | `20` | Maximum number of K-means iterations. Equivalent to `--kmeans-iters`. |
 | `nprobe` | u32 | `2` | Number of shard centroids to probe during a query. Equivalent to `--nprobe` on both `build-index` (recorded in the manifest) and `serve` (runtime default). |
 | `kmeans_seed` | u64 | `3735928559` (0xdeadbeef) | RNG seed for K-means centroid initialisation. Recorded in `algorithm.params.kmeans_seed` in the manifest. Two builds with the same seed and all other inputs identical produce the same shard layout and fingerprints. Equivalent to `--kmeans-seed`. |
+| `pq_enabled` | bool | `false` | Enables PQ-compressed shard builds. When `true`, `build-index` trains a PQ codebook, stores `pq_codebook.bin`, and emits format-v2 `.sidx` shards with `compression.codec = "pq8"` in the manifest. |
+| `pq_num_subspaces` | u32 | `8` | Number of PQ sub-spaces (`M`) used when `pq_enabled` is `true`. Must be at least 1 and divide the embedding dimension evenly. |
+| `pq_codebook_size` | u32 | `256` | Number of centroids (`K`) per PQ sub-space when `pq_enabled` is `true`. Must be in the range `1..=256`. |
 
 ### `config/default.toml` (reference)
 
@@ -26,6 +29,9 @@ num_shards = 4
 kmeans_iters = 20
 nprobe = 2
 kmeans_seed = 3735928559
+pq_enabled = false
+pq_num_subspaces = 8
+pq_codebook_size = 256
 ```
 
 ## Choosing `num_shards`

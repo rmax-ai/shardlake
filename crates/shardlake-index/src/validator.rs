@@ -22,7 +22,11 @@ use shardlake_core::types::ShardId;
 use shardlake_manifest::{DatasetManifest, Manifest};
 use shardlake_storage::{ObjectStore, StorageError};
 
-use crate::{artifact_fingerprint, shard::{PqShard, ShardIndex}, PQ8_CODEC};
+use crate::{
+    artifact_fingerprint,
+    shard::{PqShard, ShardIndex},
+    PQ8_CODEC,
+};
 
 /// A single structured validation failure returned by the integrity engine.
 ///
@@ -163,11 +167,9 @@ pub fn validate_index(manifest: &Manifest, store: &dyn ObjectStore) -> Validatio
         if let Some(cb_key) = &manifest.compression.codebook_key {
             check_exists(cb_key, &mut report, store);
         } else {
-            report
-                .failures
-                .push(ValidationFailure::ManifestInvalid(
-                    "compression.codec is \"pq8\" but codebook_key is absent".into(),
-                ));
+            report.failures.push(ValidationFailure::ManifestInvalid(
+                "compression.codec is \"pq8\" but codebook_key is absent".into(),
+            ));
         }
     }
 
@@ -296,6 +298,26 @@ fn check_pq_shard(
                         expected: shard.vector_count,
                         actual: actual_count,
                     });
+            }
+
+            let expected_pq_m = manifest.compression.pq_num_subspaces as usize;
+            if pq_shard.pq_m != expected_pq_m {
+                report
+                    .failures
+                    .push(ValidationFailure::ManifestInvalid(format!(
+                        "shard {} pq_m mismatch: expected {}, actual {}",
+                        shard.shard_id, expected_pq_m, pq_shard.pq_m
+                    )));
+            }
+
+            let expected_pq_k = manifest.compression.pq_codebook_size as usize;
+            if pq_shard.pq_k != expected_pq_k {
+                report
+                    .failures
+                    .push(ValidationFailure::ManifestInvalid(format!(
+                        "shard {} pq_k mismatch: expected {}, actual {}",
+                        shard.shard_id, expected_pq_k, pq_shard.pq_k
+                    )));
             }
 
             check_centroid_match(shard, &pq_shard.centroids, report);

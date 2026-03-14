@@ -348,6 +348,9 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+            pq_enabled: false,
+            pq_num_subspaces: shardlake_core::config::SystemConfig::default_pq_num_subspaces(),
+            pq_codebook_size: shardlake_core::config::SystemConfig::default_pq_codebook_size(),
         };
         let builder = IndexBuilder::new(&store, &config);
         builder
@@ -360,6 +363,7 @@ mod tests {
                 dims: 2,
                 vectors_key: paths::dataset_vectors_key("ds-combo"),
                 metadata_key: paths::dataset_metadata_key("ds-combo"),
+                pq_params: None,
             })
             .unwrap();
 

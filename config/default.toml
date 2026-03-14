@@ -3,3 +3,6 @@ num_shards = 4
 kmeans_iters = 20
 nprobe = 2
 kmeans_seed = 3735928559
+pq_enabled = false
+pq_num_subspaces = 8
+pq_codebook_size = 256

@@ -388,7 +388,10 @@ fn test_pq_build_is_deterministic() {
                 dims: 8,
                 vectors_key: paths::dataset_vectors_key("ds-pqdet"),
                 metadata_key: paths::dataset_metadata_key("ds-pqdet"),
-                pq_params: Some(PqParams { num_subspaces: 4, codebook_size: 8 }),
+                pq_params: Some(PqParams {
+                    num_subspaces: 4,
+                    codebook_size: 8,
+                }),
             })
             .unwrap()
     };

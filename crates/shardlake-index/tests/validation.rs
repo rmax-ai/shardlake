@@ -9,6 +9,7 @@ use shardlake_core::{
     },
 };
 use shardlake_index::{
+    shard::PqShard,
     validator::{validate_dataset, validate_index, ValidationFailure},
     BuildParams, IndexBuilder,
 };
@@ -40,6 +41,9 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         kmeans_iters: 5,
         nprobe: 2,
         kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+        pq_enabled: false,
+        pq_num_subspaces: SystemConfig::default_pq_num_subspaces(),
+        pq_codebook_size: SystemConfig::default_pq_codebook_size(),
     }
 }
 
@@ -425,6 +429,47 @@ fn test_validate_index_detects_centroid_mismatch() {
         "expected ShardCentroidMismatch, got: {:?}",
         report.failures
     );
+}
+
+/// A PQ shard whose encoded parameters diverge from the manifest must fail
+/// validation even when the bytes parse successfully.
+#[test]
+fn test_validate_index_detects_pq_parameter_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, mut manifest) = build_index(tmp.path());
+    store_dataset_artifacts(store.as_ref(), "ds-v1");
+
+    manifest.compression.enabled = true;
+    manifest.compression.codec = shardlake_index::PQ8_CODEC.into();
+    manifest.compression.pq_num_subspaces = 2;
+    manifest.compression.pq_codebook_size = 4;
+    manifest.compression.codebook_key = Some(paths::index_pq_codebook_key("idx-v1"));
+
+    let shard_key = manifest.shards[0].artifact_key.clone();
+    let replacement = PqShard {
+        shard_id: ShardId(0),
+        dims: 4,
+        pq_m: 1,
+        pq_k: 3,
+        centroids: vec![manifest.shards[0].centroid.clone()],
+        entries: vec![(VectorId(0), vec![0])],
+    };
+    let bytes = replacement.to_bytes().unwrap();
+    manifest.shards[0].fingerprint = shardlake_index::artifact_fingerprint(&bytes);
+    manifest.shards[0].vector_count = 1;
+    manifest.total_vector_count = 1;
+    store.put(&shard_key, bytes).unwrap();
+
+    let report = validate_index(&manifest, store.as_ref());
+    assert!(!report.is_valid());
+    assert!(report.failures.iter().any(|failure| matches!(
+        failure,
+        ValidationFailure::ManifestInvalid(message) if message.contains("pq_m mismatch")
+    )));
+    assert!(report.failures.iter().any(|failure| matches!(
+        failure,
+        ValidationFailure::ManifestInvalid(message) if message.contains("pq_k mismatch")
+    )));
 }
 
 /// A structurally invalid manifest (empty shards list) must produce a

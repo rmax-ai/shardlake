@@ -142,8 +142,7 @@ impl<'a> IndexBuilder<'a> {
             );
             let cb = PqCodebook::train(&vecs, pq.clone(), self.config.kmeans_seed, iters)?;
             // Persist the codebook as a separate artifact.
-            let cb_key =
-                shardlake_storage::paths::index_pq_codebook_key(&index_version.0);
+            let cb_key = shardlake_storage::paths::index_pq_codebook_key(&index_version.0);
             let cb_bytes = cb.to_bytes();
             self.store.put(&cb_key, cb_bytes)?;
             info!(key = %cb_key, "PQ codebook written");

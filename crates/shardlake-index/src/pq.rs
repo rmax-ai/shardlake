@@ -98,7 +98,12 @@ impl PqCodebook {
     /// - `params.num_subspaces` is 0,
     /// - `params.codebook_size` is 0 or > 256,
     /// - `dims` is 0 or is not evenly divisible by `num_subspaces`.
-    pub fn train(vectors: &[Vec<f32>], params: PqParams, seed: u64, kmeans_iters: u32) -> Result<Self> {
+    pub fn train(
+        vectors: &[Vec<f32>],
+        params: PqParams,
+        seed: u64,
+        kmeans_iters: u32,
+    ) -> Result<Self> {
         if vectors.is_empty() {
             return Err(IndexError::Other("PQ training: empty vector set".into()));
         }
@@ -114,10 +119,7 @@ impl PqCodebook {
             let end = start + sub_dims;
 
             // Extract sub-vectors for sub-space m.
-            let sub_vecs: Vec<Vec<f32>> = vectors
-                .iter()
-                .map(|v| v[start..end].to_vec())
-                .collect();
+            let sub_vecs: Vec<Vec<f32>> = vectors.iter().map(|v| v[start..end].to_vec()).collect();
 
             // Each sub-space gets its own seeded RNG derived from the global
             // seed to ensure full reproducibility while avoiding identical
@@ -269,6 +271,12 @@ impl PqCodebook {
             num_subspaces: pq_m,
             codebook_size: pq_k,
         };
+        Self::validate_params(&params, dims)?;
+        if sub_dims != dims / pq_m {
+            return Err(IndexError::Other(format!(
+                "PQ codebook: sub_dims ({sub_dims}) inconsistent with dims ({dims}) / pq_m ({pq_m})"
+            )));
+        }
 
         let mut codebooks = Vec::with_capacity(pq_m);
         for _ in 0..pq_m {
@@ -349,13 +357,18 @@ mod tests {
     fn make_vectors(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..n).map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect()).collect()
+        (0..n)
+            .map(|_| (0..dims).map(|_| rng.gen::<f32>()).collect())
+            .collect()
     }
 
     #[test]
     fn train_produces_correct_shape() {
         let vectors = make_vectors(100, 8, 42);
-        let params = PqParams { num_subspaces: 4, codebook_size: 8 };
+        let params = PqParams {
+            num_subspaces: 4,
+            codebook_size: 8,
+        };
         let cb = PqCodebook::train(&vectors, params.clone(), 0, 10).unwrap();
 
         assert_eq!(cb.dims, 8);
@@ -376,7 +389,10 @@ mod tests {
         // num_subspaces does not divide dims
         let err = PqCodebook::train(
             &vectors,
-            PqParams { num_subspaces: 3, codebook_size: 8 },
+            PqParams {
+                num_subspaces: 3,
+                codebook_size: 8,
+            },
             0,
             10,
         )
@@ -386,7 +402,10 @@ mod tests {
         // codebook_size > 256
         let err = PqCodebook::train(
             &vectors,
-            PqParams { num_subspaces: 2, codebook_size: 300 },
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 300,
+            },
             0,
             10,
         )
@@ -397,7 +416,10 @@ mod tests {
     #[test]
     fn encode_returns_valid_codes() {
         let vectors = make_vectors(50, 8, 1);
-        let params = PqParams { num_subspaces: 4, codebook_size: 16 };
+        let params = PqParams {
+            num_subspaces: 4,
+            codebook_size: 16,
+        };
         let cb = PqCodebook::train(&vectors, params.clone(), 0, 10).unwrap();
 
         let codes = cb.encode(&vectors[0]);
@@ -410,7 +432,10 @@ mod tests {
     #[test]
     fn encoding_is_deterministic() {
         let vectors = make_vectors(30, 8, 7);
-        let params = PqParams { num_subspaces: 2, codebook_size: 4 };
+        let params = PqParams {
+            num_subspaces: 2,
+            codebook_size: 4,
+        };
         let cb = PqCodebook::train(&vectors, params, 42, 10).unwrap();
 
         let c1 = cb.encode(&vectors[0]);
@@ -421,7 +446,10 @@ mod tests {
     #[test]
     fn adc_distance_is_non_negative() {
         let vectors = make_vectors(40, 8, 3);
-        let params = PqParams { num_subspaces: 4, codebook_size: 8 };
+        let params = PqParams {
+            num_subspaces: 4,
+            codebook_size: 8,
+        };
         let cb = PqCodebook::train(&vectors, params, 0, 10).unwrap();
 
         let query = &vectors[0];
@@ -437,7 +465,10 @@ mod tests {
         // ADC distance should be small (but not necessarily exactly zero
         // because of quantisation error).
         let vectors = make_vectors(200, 8, 9);
-        let params = PqParams { num_subspaces: 4, codebook_size: 64 };
+        let params = PqParams {
+            num_subspaces: 4,
+            codebook_size: 64,
+        };
         let cb = PqCodebook::train(&vectors, params, 0, 10).unwrap();
 
         // Use the centroid of sub-space 0 as a test vector — its encode is
@@ -462,7 +493,10 @@ mod tests {
     #[test]
     fn codebook_roundtrip() {
         let vectors = make_vectors(50, 8, 5);
-        let params = PqParams { num_subspaces: 4, codebook_size: 8 };
+        let params = PqParams {
+            num_subspaces: 4,
+            codebook_size: 8,
+        };
         let cb = PqCodebook::train(&vectors, params.clone(), 0, 10).unwrap();
 
         let bytes = cb.to_bytes();
@@ -490,5 +524,31 @@ mod tests {
         bytes.extend_from_slice(&1u32.to_le_bytes()); // version
         let err = PqCodebook::from_bytes(&bytes).unwrap_err();
         assert!(err.to_string().contains("invalid magic"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_invalid_params() {
+        let mut bytes = PQ_CODEBOOK_MAGIC.to_vec();
+        bytes.extend_from_slice(&PQ_CODEBOOK_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // dims
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // pq_m
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // pq_k
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // sub_dims
+
+        let err = PqCodebook::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("num_subspaces"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_inconsistent_sub_dims() {
+        let mut bytes = PQ_CODEBOOK_MAGIC.to_vec();
+        bytes.extend_from_slice(&PQ_CODEBOOK_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // dims
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // pq_m
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // pq_k
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // sub_dims (should be 2)
+
+        let err = PqCodebook::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("sub_dims"));
     }
 }

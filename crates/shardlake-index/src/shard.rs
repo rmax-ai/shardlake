@@ -209,6 +209,14 @@ impl PqShard {
         let vector_count = read_u64(&mut cur)? as usize;
         let pq_m = read_u32(&mut cur)? as usize;
         let pq_k = read_u32(&mut cur)? as usize;
+        if pq_m == 0 {
+            return Err(IndexError::Other("PqShard: pq_m must be at least 1".into()));
+        }
+        if pq_k == 0 || pq_k > 256 {
+            return Err(IndexError::Other(
+                "PqShard: pq_k must be in range [1, 256]".into(),
+            ));
+        }
 
         let mut centroids = Vec::with_capacity(centroid_count);
         for _ in 0..centroid_count {
@@ -220,6 +228,11 @@ impl PqShard {
             let id = VectorId(read_u64(&mut cur)?);
             let mut codes = vec![0u8; pq_m];
             cur.read_exact(&mut codes)?;
+            if let Some(&code) = codes.iter().find(|&&code| code as usize >= pq_k) {
+                return Err(IndexError::Other(format!(
+                    "PqShard: code {code} out of range for pq_k {pq_k}"
+                )));
+            }
             entries.push((id, codes));
         }
 
@@ -307,10 +320,7 @@ mod tests {
             pq_m: 2,
             pq_k: 8,
             centroids: vec![vec![0.1, 0.2, 0.3, 0.4]],
-            entries: vec![
-                (VectorId(10), vec![3, 7]),
-                (VectorId(11), vec![0, 1]),
-            ],
+            entries: vec![(VectorId(10), vec![3, 7]), (VectorId(11), vec![0, 1])],
         };
         let bytes = shard.to_bytes().unwrap();
         let decoded = PqShard::from_bytes(&bytes).unwrap();
@@ -346,5 +356,20 @@ mod tests {
         let err = PqShard::from_bytes(&bytes).unwrap_err();
         assert!(err.to_string().contains("unsupported format version"));
     }
-}
 
+    #[test]
+    fn pq_shard_rejects_code_out_of_range() {
+        let shard = PqShard {
+            shard_id: ShardId(1),
+            dims: 4,
+            pq_m: 2,
+            pq_k: 4,
+            centroids: vec![vec![0.1, 0.2, 0.3, 0.4]],
+            entries: vec![(VectorId(10), vec![1, 4])],
+        };
+        let bytes = shard.to_bytes().unwrap();
+
+        let err = PqShard::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+}
