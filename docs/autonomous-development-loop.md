@@ -82,6 +82,7 @@ Current labels defined by the orchestrator:
 | `ready-for-draft-check` | A draft PR appears ready for a readiness review |
 | `ready-for-open-review` | An open non-draft PR is ready for review handling |
 | `ready-to-merge` | An open PR has completed review handling and is ready for a final merge pass |
+| `needs-human` | A PR is blocked on manual intervention and must not be advanced automatically |
 
 This gives operators a visible state machine in GitHub instead of hidden in local process memory.
 
@@ -241,6 +242,8 @@ The loop attempts at most one merge candidate per iteration: the lowest-numbered
 
 The merge pass must not advance a PR while blocking checks, unresolved blocking feedback, merge conflicts, or policy blockers remain.
 
+If any stage detects merge conflicts on a PR, the loop should add the `needs-human` label so the manual handoff is explicit in GitHub state.
+
 ## Dedicated Worktree Rule
 
 The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
@@ -371,6 +374,7 @@ This is intentional. Silent continuation after malformed control data would make
 The loop is not meant to replace all operator judgment. Human intervention is still required when:
 
 - a PR has merge conflicts
+- when merge conflicts are detected, the loop should label the PR `needs-human`
 - a PR needs product or architecture decisions rather than mechanical review
 - GitHub permissions, token scopes, or branch protections block automation
 - prompt files drift out of sync with the orchestrator contract

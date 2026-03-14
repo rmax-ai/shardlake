@@ -1,6 +1,6 @@
 ---
 name: merge-ready-pr
-description: Merge one open PR labeled ready-to-merge with a rebase merge after final verification.
+description: Merge one open PR labeled ready-to-merge with a merge commit after final verification.
 ---
 Primary goal: merge exactly one PR already labeled `ready-to-merge`.
 
@@ -35,7 +35,7 @@ Requirements:
    - `cargo test`
    - `cargo doc --no-deps`
 7. Verify there is no blocking review feedback, merge conflict, or misleading PR metadata.
-8. Merge with rebase using `gh pr merge <pr-number> --rebase --delete-branch=false`.
+8. Merge with a merge commit using `gh pr merge <pr-number> --merge --delete-branch=false --subject "Merge PR #<pr-number>: <current-pr-title>"`.
 9. Confirm the merge succeeded.
 10. If the merge fails, report the exact failure clearly and do not guess.
 11. Do not process any other PR.
