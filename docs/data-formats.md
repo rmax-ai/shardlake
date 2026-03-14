@@ -46,6 +46,7 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 ├── indexes/
 │   └── <index-version>/
 │       ├── manifest.json      ← index_manifest_key
+│       ├── pq_codebook.bin    ← index_pq_codebook_key (PQ builds only)
 │       └── shards/
 │           ├── shard-0000.sidx  ← index_shard_key(…, 0)
 │           ├── shard-0001.sidx  ← index_shard_key(…, 1)
@@ -162,6 +163,18 @@ and index version and describes every shard artifact.
 > "recall_estimate": { "k": 10, "recall_at_k": 0.97, "sample_size": 500 }
 > ```
 
+For a PQ-compressed index the `compression` block looks like:
+
+```json
+"compression": {
+  "enabled": true,
+  "codec": "pq8",
+  "pq_num_subspaces": 8,
+  "pq_codebook_size": 256,
+  "codebook_key": "indexes/idx-v1/pq_codebook.bin"
+}
+```
+
 ### Schema versions
 
 | `manifest_version` | Description |
@@ -196,8 +209,11 @@ and index version and describes every shard artifact.
 | `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
 | `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
 | `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
-| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. Always `false` in the current prototype. Defaults to `false`. |
-| `compression.codec` | string | *(v3+)* Codec identifier. `"none"` in the current prototype. Reserved: `"pq8"`, `"sq8"`. Defaults to `"none"`. |
+| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. `false` for uncompressed builds, `true` for PQ builds. Defaults to `false`. |
+| `compression.codec` | string | *(v3+)* Codec identifier. `"none"` for uncompressed builds; `"pq8"` for 8-bit product quantisation. Defaults to `"none"`. |
+| `compression.pq_num_subspaces` | integer | *(v3+, `"pq8"` only)* Number of PQ sub-spaces `M`. Omitted when codec is `"none"`. |
+| `compression.pq_codebook_size` | integer | *(v3+, `"pq8"` only)* PQ codebook size `K` (number of centroids per sub-space). Must be ≤ 256. Omitted when codec is `"none"`. |
+| `compression.codebook_key` | string | *(v3+, `"pq8"` only)* Storage key of the PQ codebook artifact (`pq_codebook.bin`). Omitted when codec is `"none"`. |
 | `recall_estimate` | object \| null | *(v3+, optional)* Approximate recall estimate from a build-time sample query. `null` / absent when not computed. |
 | `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). |
 | `recall_estimate.recall_at_k` | float | Estimated recall@k in [0, 1]. |
@@ -281,12 +297,15 @@ version strings.
 ## Shard index binary format (`.sidx`)
 
 Written by `shardlake build-index` for each shard. Binary, little-endian throughout.
+Two format versions exist; the format version field at offset 8 identifies which one.
+
+### Format version 1 — raw vectors
 
 ```
 Offset   Size    Field
 ------   ----    -----
 0        8       Magic bytes: 0x534C4B4944580000 ("SLKIDX\0\0")
-8        4       Format version (u32) — currently 1
+8        4       Format version (u32) = 1
 12       4       Shard ID (u32)
 16       4       Vector dimension `dims` (u32)
 20       4       Number of centroids `C` (u32)
@@ -302,8 +321,62 @@ per vector:
   dims * 4       Vector data (f32 × dims)
 ```
 
+### Format version 2 — PQ-encoded vectors
+
+Used when `compression.codec` is `"pq8"`.  The full PQ codebook is stored
+separately at the key given by `compression.codebook_key`.
+
+```
+Offset   Size    Field
+------   ----    -----
+0        8       Magic bytes: 0x534C4B4944580000 ("SLKIDX\0\0")
+8        4       Format version (u32) = 2
+12       4       Shard ID (u32)
+16       4       Vector dimension `dims` (u32)
+20       4       Number of centroids `C` (u32)
+24       8       Number of vectors `N` (u64)
+32       4       Number of PQ sub-spaces `M` (u32)
+36       4       PQ codebook size `K` (u32)
+
+--- Centroids (C entries) ---
+per centroid:
+  dims * 4       Centroid coordinates (f32 × dims)
+
+--- PQ-encoded vectors (N entries) ---
+per vector:
+  8              Vector ID (u64)
+  M * 1          PQ codes (u8 × M); each byte is in [0, K)
+```
+
 The magic bytes and format version allow the reader to detect corrupt or incompatible
 artifacts before parsing any vector data.
+
+---
+
+## PQ codebook binary format (`pq_codebook.bin`)
+
+Written by `shardlake build-index` when `compression.codec` is `"pq8"`. Stored at the
+key given by `compression.codebook_key` (e.g. `indexes/<version>/pq_codebook.bin`).
+Binary, little-endian throughout.
+
+```
+Offset   Size    Field
+------   ----    -----
+0        8       Magic bytes: 0x534C4B5051434200 ("SLKPQCB\0")
+8        4       Format version (u32) = 1
+12       4       Full vector dimension `dims` (u32)
+16       4       Number of sub-spaces `M` (u32)
+20       4       Codebook size `K` (u32)
+24       4       Sub-vector dimension `sub_dims` = dims / M (u32)
+
+--- Codebook entries (M × K entries) ---
+for each sub-space m in [0, M):
+  for each centroid k in [0, K):
+    sub_dims * 4   Centroid coordinates (f32 × sub_dims)
+```
+
+At search time, the PQ codebook is loaded once and used to compute an Asymmetric
+Distance Computation (ADC) table for each query.
 
 ---
 
@@ -339,11 +412,12 @@ use in code that treats validation failure as an error.
 | 1 | [`Manifest::validate()`] structural consistency | `ManifestInvalid` |
 | 2 | `manifest.vectors_key` exists in storage | `ArtifactMissing` |
 | 3 | `manifest.metadata_key` exists in storage | `ArtifactMissing` |
-| 4 | Each shard `artifact_key` exists in storage | `ArtifactMissing` |
-| 5 | Shard bytes FNV-1a fingerprint matches `shard.fingerprint` | `FingerprintMismatch` |
-| 6 | Shard binary `dims` matches `manifest.dims` | `ShardDimensionMismatch` |
-| 7 | Shard binary vector count matches `shard.vector_count` | `ShardVectorCountMismatch` |
-| 8 | When present, `shard.centroid` matches the shard binary centroid | `ShardCentroidMismatch` |
+| 4 | *(PQ only)* `compression.codebook_key` exists in storage | `ArtifactMissing` / `ManifestInvalid` |
+| 5 | Each shard `artifact_key` exists in storage | `ArtifactMissing` |
+| 6 | Shard bytes FNV-1a fingerprint matches `shard.fingerprint` | `FingerprintMismatch` |
+| 7 | Shard binary `dims` matches `manifest.dims` | `ShardDimensionMismatch` |
+| 8 | Shard binary vector count matches `shard.vector_count` | `ShardVectorCountMismatch` |
+| 9 | When present, `shard.centroid` matches the shard binary centroid | `ShardCentroidMismatch` |
 
 ### `validate_dataset` checks
 

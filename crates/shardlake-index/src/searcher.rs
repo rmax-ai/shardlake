@@ -17,8 +17,9 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
-    shard::ShardIndex,
-    IndexError, Result,
+    pq::PqCodebook,
+    shard::{PqShard, ShardIndex},
+    IndexError, Result, PQ8_CODEC,
 };
 
 /// Searcher that loads shard indexes lazily from `store`, caching them in RAM.
@@ -26,6 +27,9 @@ pub struct IndexSearcher {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
     cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    pq_shard_cache: Mutex<HashMap<ShardId, Arc<PqShard>>>,
+    /// PQ codebook; loaded once on first PQ search, then cached.
+    codebook: Mutex<Option<Arc<PqCodebook>>>,
 }
 
 impl IndexSearcher {
@@ -40,6 +44,8 @@ impl IndexSearcher {
             store,
             manifest,
             cache: Mutex::new(HashMap::new()),
+            pq_shard_cache: Mutex::new(HashMap::new()),
+            codebook: Mutex::new(None),
         }
     }
 
@@ -59,6 +65,8 @@ impl IndexSearcher {
         }
 
         let metric: DistanceMetric = self.manifest.distance_metric;
+        let pq_enabled = self.manifest.compression.enabled
+            && self.manifest.compression.codec == PQ8_CODEC;
 
         // Collect centroids for routing from the manifest when available (manifest v2+).
         // Shards built with an older builder (manifest v1) have an empty centroid vec; for
@@ -81,10 +89,18 @@ impl IndexSearcher {
             } else {
                 // Slow path: legacy manifest without centroid metadata -- load the shard
                 // body to read its centroids (preserves backward compatibility).
-                let shard = self.load_shard(shard_def.shard_id)?;
-                for c in &shard.centroids {
-                    all_centroids.push(c.clone());
-                    centroid_to_shard.push(shard_def.shard_id);
+                if pq_enabled {
+                    let shard = self.load_pq_shard(shard_def.shard_id)?;
+                    for c in &shard.centroids {
+                        all_centroids.push(c.clone());
+                        centroid_to_shard.push(shard_def.shard_id);
+                    }
+                } else {
+                    let shard = self.load_shard(shard_def.shard_id)?;
+                    for c in &shard.centroids {
+                        all_centroids.push(c.clone());
+                        centroid_to_shard.push(shard_def.shard_id);
+                    }
                 }
             }
         }
@@ -103,17 +119,124 @@ impl IndexSearcher {
 
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
-        let mut all_results = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.load_shard(shard_id)?;
-            let results = exact_search(query, &shard.records, metric, k);
-            all_results.extend(results);
+        if pq_enabled {
+            self.search_pq_shards(query, &probe_shards, k, metric)
+        } else {
+            let mut all_results = Vec::new();
+            for shard_id in probe_shards {
+                let shard = self.load_shard(shard_id)?;
+                let results = exact_search(query, &shard.records, metric, k);
+                all_results.extend(results);
+            }
+            Ok(merge_top_k(all_results, k))
+        }
+    }
+
+    // ── PQ search path ────────────────────────────────────────────────────────
+
+    /// Search probed PQ-encoded shards using Asymmetric Distance Computation.
+    fn search_pq_shards(
+        &self,
+        query: &[f32],
+        probe_shards: &[ShardId],
+        k: usize,
+        _metric: DistanceMetric,
+    ) -> Result<Vec<SearchResult>> {
+        let codebook = self.load_codebook()?;
+        let table = codebook.compute_distance_table(query);
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+
+        for &shard_id in probe_shards {
+            let shard = self.load_pq_shard(shard_id)?;
+            let mut scored: Vec<SearchResult> = shard
+                .entries
+                .iter()
+                .map(|(id, codes)| SearchResult {
+                    id: *id,
+                    score: codebook.adc_distance(codes, &table),
+                    metadata: None,
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(k);
+            all_results.extend(scored);
         }
 
         Ok(merge_top_k(all_results, k))
     }
 
-    /// Load a shard from cache or store.
+    /// Load (or return from cache) the PQ codebook for this index.
+    fn load_codebook(&self) -> Result<Arc<PqCodebook>> {
+        {
+            let guard = self
+                .codebook
+                .lock()
+                .map_err(|_| IndexError::Other("codebook lock poisoned".into()))?;
+            if let Some(ref cb) = *guard {
+                return Ok(Arc::clone(cb));
+            }
+        }
+
+        let cb_key = self
+            .manifest
+            .compression
+            .codebook_key
+            .as_deref()
+            .ok_or_else(|| {
+                IndexError::Other(
+                    "PQ index has no codebook_key in compression config".into(),
+                )
+            })?;
+
+        let bytes = self.store.get(cb_key)?;
+        let cb = Arc::new(PqCodebook::from_bytes(&bytes)?);
+
+        let mut guard = self
+            .codebook
+            .lock()
+            .map_err(|_| IndexError::Other("codebook lock poisoned".into()))?;
+        *guard = Some(Arc::clone(&cb));
+        Ok(cb)
+    }
+
+    /// Load a PQ-encoded shard from cache or store.
+    fn load_pq_shard(&self, shard_id: ShardId) -> Result<Arc<PqShard>> {
+        {
+            let cache = self
+                .pq_shard_cache
+                .lock()
+                .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
+            if let Some(s) = cache.get(&shard_id) {
+                return Ok(Arc::clone(s));
+            }
+        }
+
+        let shard_def = self
+            .manifest
+            .shards
+            .iter()
+            .find(|s| s.shard_id == shard_id)
+            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+        let bytes = self.store.get(&shard_def.artifact_key)?;
+        let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+
+        let mut cache = self
+            .pq_shard_cache
+            .lock()
+            .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
+        cache.insert(shard_id, Arc::clone(&shard));
+        Ok(shard)
+    }
+
+    // ── Raw shard path ────────────────────────────────────────────────────────
+
+    /// Load a raw shard from cache or store.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
             let cache = self
@@ -168,6 +291,7 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            ..SystemConfig::default()
         };
         let records = vec![VectorRecord {
             id: VectorId(1),
@@ -185,6 +309,7 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
 
