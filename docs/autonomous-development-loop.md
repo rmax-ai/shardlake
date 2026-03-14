@@ -26,7 +26,7 @@ The loop is split into three layers.
 - selecting the orchestrator prompt
 - running one iteration through the Copilot CLI
 - storing iteration logs under `tmp/loop_iterations/`
-- running a second control-synthesis prompt over the iteration log
+- extracting the final numbered report and control block from the iteration log into a JSON sidecar
 - extracting the machine-readable control markers
 - deciding whether to sleep before the next pass
 
@@ -44,9 +44,9 @@ This prompt is the behavioral contract for the loop. It defines:
 - safety constraints around ambiguous items
 - the requirement to report carry-forward state for the next pass
 
-### 3. Control-synthesis prompt
+### 3. Final control block
 
-`.github/prompts/loop_control.prompt.md` reads a completed iteration log and emits only a small machine-readable block:
+The orchestrator prompt emits a small machine-readable block at the end of each completed iteration log:
 
 ```text
 BEGIN_LOOP_CONTROL
@@ -56,7 +56,7 @@ SLEEP_NEXT_ITERATION: <yes|no>
 END_LOOP_CONTROL
 ```
 
-The shell script parses that block and decides whether the loop should sleep before continuing.
+The shell script parses that block, stores the final report as JSON, and decides whether the loop should sleep before continuing.
 
 ## Design Principles
 
@@ -117,6 +117,7 @@ The script requires these commands to exist:
 - `tee`
 - `awk`
 - `sleep`
+- `python3`
 
 It also sets stable CLI output defaults before running the loop:
 
@@ -154,9 +155,8 @@ For each iteration, the shell driver does the following:
 
 1. Streams that output to the main iteration log.
 1. If the Copilot command fails, exits immediately with the same status.
-1. Runs the control-synthesis prompt against the completed log.
-1. Appends the control block output to the main iteration log.
-1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the control log.
+1. Extracts the final numbered report and control block from the completed log into a JSON sidecar.
+1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the final control block in the main log.
 1. Normalizes boolean values so only `yes` and `no` are used operationally.
 1. Applies one safety fallback: if `SLEEP_NEXT_ITERATION=no`, `PRS_PROCESSED=0`, and `ALL_WAITING_ON_OTHER_AGENTS=yes`, the shell overrides `SLEEP_NEXT_ITERATION` to `yes`.
 1. Sleeps for `WAIT_SECONDS` before the next pass when the current iteration is not the last allowed iteration and the final sleep decision is `yes`.
@@ -340,15 +340,22 @@ Operators should treat prompt-name drift as an operational risk. Keep the orches
 
 ## Logs and Auditability
 
-Each iteration writes two timestamped files under `tmp/loop_iterations/`:
+Each iteration writes timestamped artifacts under `tmp/loop_iterations/`:
 
 - `iteration_<n>_<timestamp>.log`
-- `iteration_<n>_<timestamp>.control.log`
+- `iteration_<n>_<timestamp>.json`
 
 The main log contains:
 
 - the full orchestrator output
-- the appended loop-control block
+- the final loop-control block
+
+The JSON sidecar contains:
+
+- the full final numbered report as text
+- structured sections for each report heading
+- parsed carry-forward and loop-control fields
+- parsed machine-readable control values
 
 These logs are the primary audit trail for:
 
@@ -362,7 +369,7 @@ These logs are the primary audit trail for:
 The shell driver exits immediately when:
 
 - the Copilot iteration command exits non-zero
-- the control-synthesis prompt exits non-zero
+- JSON sidecar extraction fails
 - required control markers are missing
 - `PRS_PROCESSED` is not numeric
 - a required local command is missing

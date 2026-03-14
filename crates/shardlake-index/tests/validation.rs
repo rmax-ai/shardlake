@@ -98,7 +98,7 @@ fn sample_dataset_manifest() -> DatasetManifest {
 
 fn sample_manifest() -> Manifest {
     Manifest {
-        manifest_version: 3,
+        manifest_version: 4,
         dataset_version: DatasetVersion("ds-v1".into()),
         embedding_version: EmbeddingVersion("emb-v1".into()),
         index_version: IndexVersion("idx-v1".into()),
@@ -114,6 +114,7 @@ fn sample_manifest() -> Manifest {
             vector_count: 5,
             fingerprint: "abc123".into(),
             centroid: vec![0.1, 0.2, 0.3, 0.4],
+            routing: None,
         }],
         build_metadata: BuildMetadata {
             built_at: Utc::now(),

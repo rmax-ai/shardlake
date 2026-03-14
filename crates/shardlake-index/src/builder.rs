@@ -12,7 +12,8 @@ use shardlake_core::{
     },
 };
 use shardlake_manifest::{
-    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ShardDef, ShardSummary,
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, RoutingMetadata, ShardDef,
+    ShardSummary,
 };
 use shardlake_storage::ObjectStore;
 
@@ -167,12 +168,18 @@ impl<'a> IndexBuilder<'a> {
             self.store.put(&shard_artifact_key, bytes)?;
             info!(shard = %shard_id, vectors = count, key = %shard_artifact_key, "Shard written");
             actual_total += count;
+            let file_location = shard_artifact_key.clone();
             shard_defs.push(ShardDef {
                 shard_id,
                 artifact_key: shard_artifact_key,
                 vector_count: count,
                 fingerprint: sha,
                 centroid: centroids[i].clone(),
+                routing: Some(RoutingMetadata {
+                    centroid_id: format!("shard-{:04}", shard_id.0),
+                    index_type: "flat".into(),
+                    file_location,
+                }),
             });
         }
 
@@ -202,7 +209,7 @@ impl<'a> IndexBuilder<'a> {
         }
 
         let manifest = Manifest {
-            manifest_version: 3,
+            manifest_version: 4,
             dataset_version,
             embedding_version,
             index_version,
