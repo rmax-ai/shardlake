@@ -95,7 +95,6 @@ impl<'a> IndexBuilder<'a> {
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(self.config.kmeans_seed);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
-        let quantizer = IvfQuantizer::train(&vecs, k, iters, &mut rng);
 
         // Optionally sample a subset for centroid training.  All vectors are
         // still assigned to the nearest centroid after training, so no data
@@ -130,7 +129,7 @@ impl<'a> IndexBuilder<'a> {
             );
         }
 
-        let centroids = kmeans(training_vecs, k, iters, &mut rng);
+        let quantizer = IvfQuantizer::train(training_vecs, k, iters, &mut rng);
 
         info!("Assigning vectors to IVF posting-list shards");
         let mut shard_records: Vec<Vec<VectorRecord>> = vec![Vec::new(); quantizer.num_clusters()];
