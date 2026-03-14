@@ -25,7 +25,7 @@ extract_marker() {
   local marker="$1"
   local file="$2"
 
-  awk -v key="$marker" '
+  LC_ALL=C LANG=C awk -v key="$marker" '
     function trim(value) {
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+$/, "", value)
