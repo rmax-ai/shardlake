@@ -4,13 +4,13 @@ use shardlake_core::types::{
 };
 use shardlake_manifest::{
     AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ManifestError, RecallEstimate,
-    ShardDef, ShardSummary,
+    RoutingMetadata, ShardDef, ShardSummary,
 };
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
 fn sample_manifest() -> Manifest {
     Manifest {
-        manifest_version: 3,
+        manifest_version: 4,
         dataset_version: DatasetVersion("ds-v1".into()),
         embedding_version: EmbeddingVersion("emb-v1".into()),
         index_version: IndexVersion("idx-v1".into()),
@@ -27,6 +27,11 @@ fn sample_manifest() -> Manifest {
                 vector_count: 5,
                 fingerprint: "abc".into(),
                 centroid: vec![0.1, 0.2, 0.3, 0.4],
+                routing: Some(RoutingMetadata {
+                    centroid_id: "shard-0000".into(),
+                    index_type: "flat".into(),
+                    file_location: paths::index_shard_key("idx-v1", 0),
+                }),
             },
             ShardDef {
                 shard_id: ShardId(1),
@@ -34,6 +39,11 @@ fn sample_manifest() -> Manifest {
                 vector_count: 5,
                 fingerprint: "def".into(),
                 centroid: vec![0.9, 0.8, 0.7, 0.6],
+                routing: Some(RoutingMetadata {
+                    centroid_id: "shard-0001".into(),
+                    index_type: "flat".into(),
+                    file_location: paths::index_shard_key("idx-v1", 1),
+                }),
             },
         ],
         build_metadata: BuildMetadata {
@@ -202,16 +212,19 @@ fn test_v2_centroid_round_trips() {
     let saved = store.get(&manifest_key).unwrap();
     let saved_json = String::from_utf8(saved).unwrap();
     // Legacy manifests are upgraded to the current schema on write.
-    assert!(saved_json.contains("\"manifest_version\": 3"));
+    assert!(saved_json.contains("\"manifest_version\": 4"));
     assert!(saved_json.contains("\"algorithm\""));
     assert!(saved_json.contains("\"compression\""));
     // Centroid is re-serialised into the saved JSON.
     assert!(saved_json.contains("\"centroid\""));
 
     let loaded = Manifest::load(&store, &m.index_version).unwrap();
-    assert_eq!(loaded.manifest_version, 3);
+    assert_eq!(loaded.manifest_version, 4);
     assert_eq!(loaded.shards[0].centroid, vec![0.1, 0.2, 0.3, 0.4]);
     assert_eq!(loaded.shards[1].centroid, vec![0.9, 0.8, 0.7, 0.6]);
+    // v2 shards have no routing metadata; the field must remain None on upgrade.
+    assert!(loaded.shards[0].routing.is_none());
+    assert!(loaded.shards[1].routing.is_none());
 }
 
 #[test]
@@ -263,14 +276,14 @@ fn test_validate_rejects_negative_build_duration() {
         .contains("build_metadata.build_duration_secs must be finite and >= 0"));
 }
 
-// ── manifest v3 lifecycle fields ─────────────────────────────────────────────
+// ── manifest v4 routing metadata + lifecycle fields ───────────────────────────
 
 #[test]
-fn test_v3_round_trips_lifecycle_fields() {
+fn test_v4_round_trips_lifecycle_and_routing_fields() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LocalObjectStore::new(tmp.path()).unwrap();
     let m = sample_manifest();
-    assert_eq!(m.manifest_version, 3);
+    assert_eq!(m.manifest_version, 4);
     m.save(&store).unwrap();
 
     let saved = store.get(&Manifest::storage_key(&m.index_version)).unwrap();
@@ -283,9 +296,14 @@ fn test_v3_round_trips_lifecycle_fields() {
     assert!(saved_json.contains("\"build_duration_secs\""));
     // recall_estimate is None, so it must be absent.
     assert!(!saved_json.contains("\"recall_estimate\""));
+    // Routing metadata must be serialised.
+    assert!(saved_json.contains("\"routing\""));
+    assert!(saved_json.contains("\"centroid_id\""));
+    assert!(saved_json.contains("\"index_type\""));
+    assert!(saved_json.contains("\"file_location\""));
 
     let loaded = Manifest::load(&store, &m.index_version).unwrap();
-    assert_eq!(loaded.manifest_version, 3);
+    assert_eq!(loaded.manifest_version, 4);
     assert_eq!(loaded.algorithm.algorithm, "kmeans-flat");
     assert!(loaded.algorithm.params.contains_key("num_shards"));
     assert!(
@@ -310,6 +328,17 @@ fn test_v3_round_trips_lifecycle_fields() {
     assert_eq!(loaded.compression.codec, "none");
     assert_eq!(loaded.build_metadata.build_duration_secs, 1.5);
     assert!(loaded.recall_estimate.is_none());
+
+    // Routing metadata round-trips correctly.
+    let r0 = loaded.shards[0].routing.as_ref().unwrap();
+    assert_eq!(r0.centroid_id, "shard-0000");
+    assert_eq!(r0.index_type, "flat");
+    assert_eq!(r0.file_location, paths::index_shard_key("idx-v1", 0));
+
+    let r1 = loaded.shards[1].routing.as_ref().unwrap();
+    assert_eq!(r1.centroid_id, "shard-0001");
+    assert_eq!(r1.index_type, "flat");
+    assert_eq!(r1.file_location, paths::index_shard_key("idx-v1", 1));
 }
 
 #[test]
@@ -355,6 +384,8 @@ fn test_v1_manifest_defaults_new_fields() {
     assert_eq!(manifest.build_metadata.build_duration_secs, 0.0);
     // recall_estimate is absent.
     assert!(manifest.recall_estimate.is_none());
+    // routing is absent for v1 manifests.
+    assert!(manifest.shards[0].routing.is_none());
 }
 
 // ── compatibility checks ──────────────────────────────────────────────────────
@@ -443,4 +474,86 @@ fn test_check_algorithm_compat_uses_v1_default() {
     let manifest: Manifest = serde_json::from_value(compat).unwrap();
     assert!(manifest.check_algorithm_compat("kmeans-flat").is_ok());
     assert!(manifest.check_algorithm_compat("hnsw").is_err());
+}
+
+// ── routing metadata validation ───────────────────────────────────────────────
+
+/// A v4 manifest with a shard whose `routing.centroid_id` is empty must fail
+/// validation.
+#[test]
+fn test_validate_rejects_empty_routing_centroid_id() {
+    let mut m = sample_manifest();
+    if let Some(routing) = m.shards[0].routing.as_mut() {
+        routing.centroid_id.clear();
+    }
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("routing.centroid_id must not be empty"));
+}
+
+/// A v4 manifest with a shard whose `routing.index_type` is empty must fail
+/// validation.
+#[test]
+fn test_validate_rejects_empty_routing_index_type() {
+    let mut m = sample_manifest();
+    if let Some(routing) = m.shards[0].routing.as_mut() {
+        routing.index_type.clear();
+    }
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("routing.index_type must not be empty"));
+}
+
+/// A v4 manifest with a shard whose `routing.file_location` is empty must fail
+/// validation.
+#[test]
+fn test_validate_rejects_empty_routing_file_location() {
+    let mut m = sample_manifest();
+    if let Some(routing) = m.shards[0].routing.as_mut() {
+        routing.file_location.clear();
+    }
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("routing.file_location must not be empty"));
+}
+
+/// A v3 manifest without routing metadata must still pass validation (backward
+/// compatibility — `routing` is optional).
+#[test]
+fn test_v3_manifest_without_routing_passes_validation() {
+    let compat = serde_json::json!({
+        "manifest_version": 3,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 5,
+        "shards": [{
+            "shard_id": 0,
+            "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+            "vector_count": 5,
+            "sha256": "abc",
+            "centroid": [0.1, 0.2, 0.3, 0.4]
+        }],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2,
+            "build_duration_secs": 1.0
+        },
+        "algorithm": { "algorithm": "kmeans-flat" },
+        "compression": { "enabled": false, "codec": "none" }
+    });
+    let manifest: Manifest = serde_json::from_value(compat).unwrap();
+    assert!(manifest.validate().is_ok());
+    // routing must default to None for older manifests.
+    assert!(manifest.shards[0].routing.is_none());
 }

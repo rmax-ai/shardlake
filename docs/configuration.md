@@ -20,6 +20,7 @@ individual command flags.
 | `pq_enabled` | bool | `false` | Enables PQ-compressed shard builds. When `true`, `build-index` trains a PQ codebook, stores `pq_codebook.bin`, and emits format-v2 `.sidx` shards with `compression.codec = "pq8"` in the manifest. |
 | `pq_num_subspaces` | u32 | `8` | Number of PQ sub-spaces (`M`) used when `pq_enabled` is `true`. Must be at least 1 and divide the embedding dimension evenly. |
 | `pq_codebook_size` | u32 | `256` | Number of centroids (`K`) per PQ sub-space when `pq_enabled` is `true`. Must be in the range `1..=256`. |
+| `kmeans_sample_size` | u32 or absent | absent (`None`) | Maximum number of vectors used to train K-means centroids. When absent, all vectors are used. When set to a positive `n` smaller than the dataset size, a reproducible random sample of up to `n` vectors is drawn (using `kmeans_seed`) before running K-means. All vectors—including those not in the sample—are still assigned to the nearest centroid after training, so no data is lost. Recorded in `algorithm.params.kmeans_sample_size` in the manifest only when bounded sampling actually occurs. Equivalent to `--kmeans-sample-size`. |
 
 ### `config/default.toml` (reference)
 
@@ -32,6 +33,9 @@ kmeans_seed = 3735928559
 pq_enabled = false
 pq_num_subspaces = 8
 pq_codebook_size = 256
+# kmeans_sample_size is absent by default (all vectors used for training).
+# Set to a positive integer to limit centroid training to a sample:
+# kmeans_sample_size = 50000
 ```
 
 ## Choosing `num_shards`

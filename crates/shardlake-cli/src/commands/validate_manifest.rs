@@ -351,6 +351,7 @@ mod tests {
             pq_enabled: false,
             pq_num_subspaces: shardlake_core::config::SystemConfig::default_pq_num_subspaces(),
             pq_codebook_size: shardlake_core::config::SystemConfig::default_pq_codebook_size(),
+            kmeans_sample_size: None,
         };
         let builder = IndexBuilder::new(&store, &config);
         builder

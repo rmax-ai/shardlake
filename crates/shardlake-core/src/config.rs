@@ -43,6 +43,19 @@ pub struct SystemConfig {
     /// `false`.  Must be in the range `[1, 256]`.  Defaults to `256`.
     #[serde(default = "SystemConfig::default_pq_codebook_size")]
     pub pq_codebook_size: u32,
+    /// Maximum number of vectors to use for K-means centroid training.
+    ///
+    /// When `None` (default), every vector in the dataset is used to train
+    /// centroids.  When `Some(n)`, a random sample of up to `n` vectors is
+    /// drawn (without replacement) using the seeded RNG before K-means runs.
+    /// All vectors—including those not in the sample—are still assigned to the
+    /// nearest centroid after training, so no data is lost.
+    ///
+    /// Sampling speeds up centroid training on large datasets while preserving
+    /// shard assignment correctness.  Two builds with the same seed and the
+    /// same `kmeans_sample_size` produce identical centroids and fingerprints.
+    #[serde(default)]
+    pub kmeans_sample_size: Option<u32>,
 }
 
 impl SystemConfig {
@@ -73,6 +86,7 @@ impl Default for SystemConfig {
             kmeans_iters: 20,
             nprobe: 2,
             kmeans_seed: DEFAULT_KMEANS_SEED,
+            kmeans_sample_size: None,
             pq_enabled: false,
             pq_num_subspaces: Self::default_pq_num_subspaces(),
             pq_codebook_size: Self::default_pq_codebook_size(),

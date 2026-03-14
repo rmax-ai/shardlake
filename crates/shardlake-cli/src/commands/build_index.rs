@@ -47,10 +47,18 @@ pub struct BuildIndexArgs {
     /// layout and artifact fingerprints, enabling reproducible builds.
     #[arg(long, default_value_t = shardlake_core::config::DEFAULT_KMEANS_SEED)]
     pub kmeans_seed: u64,
+    /// Maximum number of vectors to sample for K-means centroid training.
+    ///
+    /// When absent, all vectors are used.  When set, a reproducible random
+    /// sample of up to this many vectors is drawn before running K-means.
+    /// All vectors are still assigned to the nearest centroid after training.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub kmeans_sample_size: Option<u32>,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
     validate_num_shards(args.num_shards)?;
+    validate_kmeans_sample_size(args.kmeans_sample_size)?;
 
     let store = LocalObjectStore::new(&storage)?;
     let dataset_ver = DatasetVersion(args.dataset_version.clone());
@@ -65,6 +73,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         kmeans_iters: args.kmeans_iters,
         nprobe: args.nprobe,
         kmeans_seed: args.kmeans_seed,
+        kmeans_sample_size: args.kmeans_sample_size,
         ..SystemConfig::default()
     };
 
@@ -128,6 +137,14 @@ fn validate_num_shards(num_shards: u32) -> Result<()> {
     Ok(())
 }
 
+fn validate_kmeans_sample_size(kmeans_sample_size: Option<u32>) -> Result<()> {
+    anyhow::ensure!(
+        kmeans_sample_size.unwrap_or(1) > 0,
+        "--kmeans-sample-size must be greater than 0"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use shardlake_manifest::{DatasetManifest, Manifest, DATASET_MANIFEST_VERSION};
@@ -144,6 +161,14 @@ mod tests {
             .contains("--num-shards must be greater than 0"));
     }
 
+    #[test]
+    fn validate_kmeans_sample_size_rejects_zero() {
+        let err = validate_kmeans_sample_size(Some(0)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--kmeans-sample-size must be greater than 0"));
+    }
+
     #[tokio::test]
     async fn run_rejects_zero_num_shards_before_loading_dataset() {
         let tmp = tempdir().unwrap();
@@ -158,6 +183,7 @@ mod tests {
                 kmeans_iters: 20,
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
             },
         )
         .await
@@ -166,6 +192,31 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--num-shards must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_zero_kmeans_sample_size_before_loading_dataset() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexArgs {
+                dataset_version: "missing-dataset".into(),
+                embedding_version: None,
+                index_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 1,
+                kmeans_iters: 20,
+                nprobe: 2,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: Some(0),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--kmeans-sample-size must be greater than 0"));
     }
 
     #[tokio::test]
@@ -214,6 +265,7 @@ mod tests {
                 kmeans_iters: 2,
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
             },
         )
         .await
@@ -246,6 +298,7 @@ mod tests {
                 kmeans_iters: 2,
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
             },
         )
         .await

@@ -76,6 +76,7 @@ fn test_build_and_search() {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
         ..SystemConfig::default()
     };
 
@@ -103,6 +104,11 @@ fn test_build_and_search() {
         .shards
         .iter()
         .all(|shard| !shard.fingerprint.is_empty()));
+    // v4 builder must populate routing metadata for every shard.
+    assert!(manifest.shards.iter().all(|shard| {
+        let r = shard.routing.as_ref().expect("routing must be populated");
+        !r.centroid_id.is_empty() && !r.index_type.is_empty() && !r.file_location.is_empty()
+    }));
 
     let searcher = IndexSearcher::new(
         Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
@@ -129,6 +135,7 @@ fn test_search_does_not_load_non_probed_shards() {
         kmeans_iters: 10,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
         ..SystemConfig::default()
     };
 
@@ -147,8 +154,8 @@ fn test_search_does_not_load_non_probed_shards() {
         })
         .unwrap();
 
-    // Manifest v3 embeds centroids so routing requires zero shard loads.
-    assert_eq!(manifest.manifest_version, 3);
+    // Manifest v4 embeds centroids so routing requires zero shard loads.
+    assert_eq!(manifest.manifest_version, 4);
     assert!(manifest.shards.iter().all(|s| !s.centroid.is_empty()));
 
     let (counting_store, counter) = CountingStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>);
@@ -187,6 +194,7 @@ fn test_build_is_deterministic() {
             kmeans_iters: 10,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
             ..SystemConfig::default()
         };
         IndexBuilder::new(store.as_ref(), &config)
@@ -223,6 +231,21 @@ fn test_build_is_deterministic() {
         assert_eq!(
             s1.centroid, s2.centroid,
             "shard {} centroid differs between builds",
+            s1.shard_id
+        );
+        // Routing metadata must be consistent between builds (centroid_id and
+        // index_type are deterministic; file_location varies by index_version
+        // just as index_version itself does).
+        let r1 = s1.routing.as_ref().expect("routing must be populated");
+        let r2 = s2.routing.as_ref().expect("routing must be populated");
+        assert_eq!(
+            r1.centroid_id, r2.centroid_id,
+            "shard {} routing.centroid_id differs between builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            r1.index_type, r2.index_type,
+            "shard {} routing.index_type differs between builds",
             s1.shard_id
         );
     }
