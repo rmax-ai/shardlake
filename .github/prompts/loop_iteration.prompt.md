@@ -49,8 +49,8 @@ Stage order:
 2. Run `assign-ready-issues.prompt.md`.
 3. Run `triage-draft-prs.prompt.md`.
 4. Run `triage-open-prs.prompt.md`.
-5. Find the lowest-numbered open draft PR labeled `ready-for-draft-check` and run `review-ready-draft-pr.prompt.md` for that one PR, if any.
-6. Find the lowest-numbered open non-draft PR labeled `ready-for-open-review` and run `review-ready-open-pr.prompt.md` for that one PR, if any. After reviewing an open PR, create follow-up issues for any remaining work that should not be completed in that PR.
+5. Find the lowest-numbered open draft PR labeled `ready-for-draft-check` and run `review-ready-draft-pr.prompt.md` for that one PR, if any. After the draft PR check, update a comment on the PR with the outcome of the check and the next steps.
+6. Find the lowest-numbered open non-draft PR labeled `ready-for-open-review` and run `review-ready-open-pr.prompt.md` for that one PR, if any. After reviewing an open PR, create follow-up issues for any remaining work that should not be completed in that PR, and update a comment on the PR with the outcome of the review and the next steps.
 7. Find the lowest-numbered open non-draft PR labeled `ready-to-merge` and run `merge-ready-pr.prompt.md` for that one PR, if any.
 
 Definitions:
