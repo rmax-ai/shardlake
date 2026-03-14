@@ -155,7 +155,7 @@ For each iteration, the shell driver does the following:
 1. Streams that output to the main iteration log.
 1. If the Copilot command fails, exits immediately with the same status.
 1. Extracts the final numbered report and control block from the completed log into a JSON sidecar.
-1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the control log.
+1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the final control block in the main log.
 1. Normalizes boolean values so only `yes` and `no` are used operationally.
 1. Applies one safety fallback: if `SLEEP_NEXT_ITERATION=no`, `PRS_PROCESSED=0`, and `ALL_WAITING_ON_OTHER_AGENTS=yes`, the shell overrides `SLEEP_NEXT_ITERATION` to `yes`.
 1. Sleeps for `WAIT_SECONDS` before the next pass when the current iteration is not the last allowed iteration and the final sleep decision is `yes`.
@@ -368,7 +368,7 @@ These logs are the primary audit trail for:
 The shell driver exits immediately when:
 
 - the Copilot iteration command exits non-zero
-- the control-synthesis prompt exits non-zero
+- JSON sidecar extraction fails
 - required control markers are missing
 - `PRS_PROCESSED` is not numeric
 - a required local command is missing
