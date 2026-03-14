@@ -16,7 +16,7 @@ use tracing::info;
 use shardlake_core::types::{DatasetVersion, IndexVersion};
 use shardlake_index::validator::{validate_dataset, validate_index};
 use shardlake_manifest::{DatasetManifest, Manifest};
-use shardlake_storage::LocalObjectStore;
+use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 /// Arguments for the `validate-manifest` subcommand.
 #[derive(Parser, Debug)]
@@ -48,21 +48,7 @@ pub async fn run(storage: PathBuf, args: ValidateManifestArgs) -> Result<()> {
         let index_ver = IndexVersion(iv.clone());
         info!(index_version = %iv, "Validating index manifest");
 
-        let manifest = Manifest::load(&store, &index_ver)?;
-        let report = validate_index(&manifest, &store);
-
-        if report.is_valid() {
-            println!("index manifest '{iv}': OK");
-        } else {
-            eprintln!(
-                "index manifest '{iv}': {} failure(s)",
-                report.failures.len()
-            );
-            for failure in &report.failures {
-                eprintln!("  - {failure}");
-            }
-            total_failures += report.failures.len();
-        }
+        total_failures += validate_requested_index_manifest(&store, &index_ver);
     }
 
     // ── Dataset manifest validation ────────────────────────────────────────────
@@ -70,21 +56,7 @@ pub async fn run(storage: PathBuf, args: ValidateManifestArgs) -> Result<()> {
         let dataset_ver = DatasetVersion(dv.clone());
         info!(dataset_version = %dv, "Validating dataset manifest");
 
-        let manifest = DatasetManifest::load(&store, &dataset_ver)?;
-        let report = validate_dataset(&manifest, &store);
-
-        if report.is_valid() {
-            println!("dataset manifest '{dv}': OK");
-        } else {
-            eprintln!(
-                "dataset manifest '{dv}': {} failure(s)",
-                report.failures.len()
-            );
-            for failure in &report.failures {
-                eprintln!("  - {failure}");
-            }
-            total_failures += report.failures.len();
-        }
+        total_failures += validate_requested_dataset_manifest(&store, &dataset_ver);
     }
 
     if total_failures > 0 {
@@ -92,6 +64,95 @@ pub async fn run(storage: PathBuf, args: ValidateManifestArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_requested_index_manifest(store: &LocalObjectStore, index_ver: &IndexVersion) -> usize {
+    let name = format!("index manifest '{}'", index_ver.0);
+    match load_index_manifest_for_validation(store, index_ver) {
+        Ok((manifest, mut extra_failures)) => {
+            let report = validate_index(&manifest, store);
+            extra_failures.extend(
+                report
+                    .failures
+                    .into_iter()
+                    .map(|failure| failure.to_string()),
+            );
+            print_validation_outcome(&name, &extra_failures)
+        }
+        Err(err) => print_validation_outcome(&name, &[err]),
+    }
+}
+
+fn validate_requested_dataset_manifest(
+    store: &LocalObjectStore,
+    dataset_ver: &DatasetVersion,
+) -> usize {
+    let name = format!("dataset manifest '{}'", dataset_ver.0);
+    match load_dataset_manifest_for_validation(store, dataset_ver) {
+        Ok((manifest, mut extra_failures)) => {
+            let report = validate_dataset(&manifest, store);
+            extra_failures.extend(
+                report
+                    .failures
+                    .into_iter()
+                    .map(|failure| failure.to_string()),
+            );
+            print_validation_outcome(&name, &extra_failures)
+        }
+        Err(err) => print_validation_outcome(&name, &[err]),
+    }
+}
+
+fn print_validation_outcome(name: &str, failures: &[String]) -> usize {
+    if failures.is_empty() {
+        println!("{name}: OK");
+        0
+    } else {
+        eprintln!("{name}: {} failure(s)", failures.len());
+        for failure in failures {
+            eprintln!("  - {failure}");
+        }
+        failures.len()
+    }
+}
+
+fn load_index_manifest_for_validation(
+    store: &LocalObjectStore,
+    index_ver: &IndexVersion,
+) -> std::result::Result<(Manifest, Vec<String>), String> {
+    let key = Manifest::storage_key(index_ver);
+    let bytes = store.get(&key).map_err(|err| err.to_string())?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+
+    let mut extra_failures = Vec::new();
+    if manifest.index_version != *index_ver {
+        extra_failures.push(format!(
+            "manifest invalid: index_version mismatch (expected {}, found {})",
+            index_ver.0, manifest.index_version.0
+        ));
+    }
+
+    Ok((manifest, extra_failures))
+}
+
+fn load_dataset_manifest_for_validation(
+    store: &LocalObjectStore,
+    dataset_ver: &DatasetVersion,
+) -> std::result::Result<(DatasetManifest, Vec<String>), String> {
+    let key = DatasetManifest::storage_key(dataset_ver);
+    let bytes = store.get(&key).map_err(|err| err.to_string())?;
+    let manifest: DatasetManifest =
+        serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+
+    let mut extra_failures = Vec::new();
+    if manifest.dataset_version != *dataset_ver {
+        extra_failures.push(format!(
+            "manifest invalid: dataset manifest: dataset_version mismatch (expected {}, found {})",
+            dataset_ver.0, manifest.dataset_version.0
+        ));
+    }
+
+    Ok((manifest, extra_failures))
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -226,11 +287,44 @@ mod tests {
         .await
         .unwrap_err();
 
-        // The error should mention a storage / not-found problem, not a validation failure.
         let msg = err.to_string();
         assert!(
-            msg.contains("not found") || msg.contains("storage") || msg.contains("No such"),
+            msg.contains("validation failed with 1 failure"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validates_invalid_dataset_manifest_as_failure_report() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+
+        let invalid = DatasetManifest {
+            manifest_version: DATASET_MANIFEST_VERSION,
+            dataset_version: DatasetVersion("ds-invalid".into()),
+            embedding_version: EmbeddingVersion("emb-v1".into()),
+            dims: 2,
+            vector_count: 0,
+            vectors_key: paths::dataset_vectors_key("ds-invalid"),
+            metadata_key: paths::dataset_metadata_key("ds-invalid"),
+            ingest_metadata: None,
+        };
+        invalid.save(&store).unwrap();
+
+        let err = run(
+            storage,
+            ValidateManifestArgs {
+                index_version: None,
+                dataset_version: Some("ds-invalid".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("validation failed with 3 failure"),
+            "unexpected error: {err}"
         );
     }
 
@@ -278,5 +372,28 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn continues_after_index_load_error_when_dataset_requested_too() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+        write_dataset(&store, "ds-ok");
+
+        let err = run(
+            storage,
+            ValidateManifestArgs {
+                index_version: Some("idx-missing".into()),
+                dataset_version: Some("ds-ok".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("validation failed with 1 failure"),
+            "unexpected error: {err}"
+        );
     }
 }
