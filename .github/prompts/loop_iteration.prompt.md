@@ -66,6 +66,7 @@ Execution guidance:
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
+- Any run of `review-ready-draft-pr.prompt.md` or `review-ready-open-pr.prompt.md` must perform branch edits in a dedicated git worktree, not in the repository's primary checkout.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
 Required final report:

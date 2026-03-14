@@ -26,25 +26,33 @@ Requirements:
    - open
    - not in draft state
    - labeled `ready-for-open-review`
-3. Before checkout, verify the local worktree is safe with `git status --short`.
+3. Before any branch checkout, verify the repository's primary checkout is safe with `git status --short`.
 4. Fetch PR metadata, changed files, labels, linked issues, CI/status checks, reviews, review comments, and general comments.
-5. Check out the PR locally with `gh pr checkout`.
-6. Separate must-fix items from safe deferrals using actual review feedback and direct code/doc/test observations.
-7. Apply the minimal safe code, docs, and metadata fixes needed now.
-8. Run the repository quality gates:
+5. Create or refresh a dedicated git worktree for this PR under `tmp/pr_worktrees/pr-<pr-number>`.
+6. Inside that worktree, check out the PR branch and do all branch edits there. Do not modify files from the repository's primary checkout.
+7. Separate must-fix items from safe deferrals using actual review feedback and direct code/doc/test observations.
+8. Apply the minimal safe code, docs, and metadata fixes needed now in the dedicated worktree.
+9. Run the repository quality gates from inside the dedicated worktree:
    - `cargo fmt --check`
    - `cargo clippy -- -D warnings`
    - `cargo test`
    - `cargo doc --no-deps`
-9. If changes were made:
+10. If changes were made:
    - commit and push only the changes needed for this PR
-10. Add or update a concise PR comment when maintainers need a durable summary of what was fixed, what was deferred, and whether the PR is now merge-ready.
-11. If the PR is ready to merge:
+11. Add or update a concise PR comment when maintainers need a durable summary of what was fixed, what was deferred, and whether the PR is now merge-ready.
+12. If the PR is ready to merge:
    - add the `ready-to-merge` label
    - remove the `ready-for-open-review` label
-12. If the PR is not ready to merge, keep or update labels to reflect that it still needs open-review handling.
-13. Do not merge the PR in this prompt.
-14. Do not inspect or modify any other PR.
+13. If the PR is not ready to merge, keep or update labels to reflect that it still needs open-review handling.
+14. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
+15. Do not merge the PR in this prompt.
+16. Do not inspect or modify any other PR.
+
+Worktree guidance:
+
+- Prefer `git worktree add --force tmp/pr_worktrees/pr-<pr-number> <base-branch>` to create the worktree, then enter it and run `gh pr checkout <pr-number>` there.
+- If `tmp/pr_worktrees/pr-<pr-number>` already exists, verify it is for the same PR branch before reusing it; otherwise remove and recreate it safely.
+- After push and final verification, remove the worktree with `git worktree remove --force` when the tree is clean.
 
 Output format:
 
