@@ -38,7 +38,7 @@ make demo
 
 Expected output:
 
-```
+```text
 === Shardlake demo ===
 Ingested 10 vectors (dims=2) → dataset_version=ds-v1
 Index built → index_version=idx-v1 (2 shards, 10 vectors)
@@ -96,6 +96,29 @@ artifacts plus a `manifest.json` under `./data/indexes/idx-v1/`.
 This creates `./data/aliases/latest.json` pointing to `idx-v1`. The server reads this
 alias at startup; updating it to a new version is how you roll out index upgrades without
 restarting with a hard-coded version string.
+
+### 3a. (Optional) Validate manifests
+
+After building and before serving, you can verify that the on-disk artifacts are
+consistent with the manifests.  This is useful in CI or after copying data between
+storage locations:
+
+```bash
+./target/release/shardlake validate-manifest \
+  --index-version idx-v1 \
+  --dataset-version ds-v1
+```
+
+A successful run prints:
+
+```
+index manifest 'idx-v1': OK
+dataset manifest 'ds-v1': OK
+```
+
+The command exits non-zero and prints details to stderr if any artifact is missing or
+has a mismatched fingerprint.  See [`shardlake validate-manifest`](cli-reference.md#shardlake-validate-manifest)
+in the CLI reference for the full list of checks.
 
 ### 4. Serve
 
@@ -182,3 +205,10 @@ cargo test
 
 All unit and integration tests live alongside the code they test (unit tests in `#[cfg(test)]`
 blocks; integration tests in `crates/*/tests/`).
+
+## Repository automation
+
+If you are operating the repository's autonomous GitHub workflow rather than the Rust CLI itself,
+see [autonomous-development-loop.md](autonomous-development-loop.md). That guide documents the
+loop driver, stage ordering, label state machine, control markers, logs, and operator
+intervention points.
