@@ -84,11 +84,13 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards. Must be greater than 0. |
 | `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
 | `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for K-means centroid initialisation. Use the same seed with identical inputs to reproduce shard layout and manifest fingerprints. |
+| `--kmeans-sample-size <N>` | u32 | use all vectors | Maximum number of vectors to use for K-means centroid training. When set, `build-index` draws a reproducible random sample using `--kmeans-seed` before training centroids, then still assigns every vector to its nearest centroid. |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
 
 ### Validation
 
 - `--num-shards` must be greater than 0.
+- `--kmeans-sample-size`, when provided, is capped to the dataset size before sampling.
 - The stored dataset must contain vectors whose dimensions match the dataset metadata written during `ingest`; index building fails if any record is inconsistent.
 
 ### Output
@@ -109,6 +111,7 @@ shardlake build-index \
   --num-shards 8 \
   --kmeans-iters 30 \
   --kmeans-seed 3735928559 \
+  --kmeans-sample-size 50000 \
   --metric cosine \
   --nprobe 3
 ```
