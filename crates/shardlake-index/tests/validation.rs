@@ -399,6 +399,28 @@ fn test_validate_index_detects_vector_count_mismatch() {
     );
 }
 
+/// A manifest centroid that diverges from shard bytes must produce a
+/// `ShardCentroidMismatch` failure.
+#[test]
+fn test_validate_index_detects_centroid_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, mut manifest) = build_index(tmp.path());
+    store_dataset_artifacts(store.as_ref(), "ds-v1");
+
+    manifest.shards[0].centroid[0] += 1.0;
+
+    let report = validate_index(&manifest, store.as_ref());
+    assert!(!report.is_valid());
+    assert!(
+        report.failures.iter().any(|f| matches!(
+            f,
+            ValidationFailure::ShardCentroidMismatch { shard_id, .. } if *shard_id == manifest.shards[0].shard_id
+        )),
+        "expected ShardCentroidMismatch, got: {:?}",
+        report.failures
+    );
+}
+
 /// A structurally invalid manifest (empty shards list) must produce a
 /// `ManifestInvalid` failure even without artifact checks.
 #[test]
