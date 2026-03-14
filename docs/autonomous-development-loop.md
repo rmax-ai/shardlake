@@ -24,13 +24,16 @@ The loop is split into three layers.
 `loop_iteration.sh` is the outer control loop. It is responsible for:
 
 - selecting the orchestrator prompt
+- ensuring each iteration starts from the primary checkout on `main` after pulling from `origin/main`
 - running one iteration through the Copilot CLI
 - storing iteration logs under `tmp/loop_iterations/`
-- running a second control-synthesis prompt over the iteration log
+- extracting the final numbered report and control block from the iteration log into a JSON sidecar
 - extracting the machine-readable control markers
 - deciding whether to sleep before the next pass
 
 The shell driver is the source of truth for runtime behavior such as iteration count, sleep timing, log naming, and failure handling.
+
+The primary checkout is operational state, not a PR workspace. It should start each iteration on `main`, sync from `origin/main` with pull only, and must not be used to push commits.
 
 ### 2. Orchestrator prompt
 
@@ -44,9 +47,9 @@ This prompt is the behavioral contract for the loop. It defines:
 - safety constraints around ambiguous items
 - the requirement to report carry-forward state for the next pass
 
-### 3. Control-synthesis prompt
+### 3. Final control block
 
-`.github/prompts/loop_control.prompt.md` reads a completed iteration log and emits only a small machine-readable block:
+The orchestrator prompt emits a small machine-readable block at the end of each completed iteration log:
 
 ```text
 BEGIN_LOOP_CONTROL
@@ -56,7 +59,7 @@ SLEEP_NEXT_ITERATION: <yes|no>
 END_LOOP_CONTROL
 ```
 
-The shell script parses that block and decides whether the loop should sleep before continuing.
+The shell script parses that block, stores the final report as JSON, and decides whether the loop should sleep before continuing.
 
 ## Design Principles
 
@@ -117,6 +120,7 @@ The script requires these commands to exist:
 - `tee`
 - `awk`
 - `sleep`
+- `python3`
 
 It also sets stable CLI output defaults before running the loop:
 
@@ -154,9 +158,8 @@ For each iteration, the shell driver does the following:
 
 1. Streams that output to the main iteration log.
 1. If the Copilot command fails, exits immediately with the same status.
-1. Runs the control-synthesis prompt against the completed log.
-1. Appends the control block output to the main iteration log.
-1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the control log.
+1. Extracts the final numbered report and control block from the completed log into a JSON sidecar.
+1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the final control block in the main log.
 1. Normalizes boolean values so only `yes` and `no` are used operationally.
 1. Applies one safety fallback: if `SLEEP_NEXT_ITERATION=no`, `PRS_PROCESSED=0`, and `ALL_WAITING_ON_OTHER_AGENTS=yes`, the shell overrides `SLEEP_NEXT_ITERATION` to `yes`.
 1. Sleeps for `WAIT_SECONDS` before the next pass when the current iteration is not the last allowed iteration and the final sleep decision is `yes`.
@@ -218,7 +221,7 @@ Its review criteria include:
 - docs coverage is present for user-visible changes
 - obvious implementation gaps are absent
 
-The checked-in prompt closest to this responsibility is `.github/prompts/check-draft-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-draft-pr.prompt.md`.
 
 ### 6. Open PR review
 
@@ -234,7 +237,7 @@ Its review criteria include:
 - docs completeness
 - must-fix versus safe-to-defer follow-up work
 
-The checked-in prompt for this responsibility is `.github/prompts/review-open-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-open-pr.prompt.md`.
 
 ### 7. Merge pass
 
@@ -246,13 +249,14 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 ## Dedicated Worktree Rule
 
-The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
+The orchestrator requires any draft-PR review, open-PR review, or merge pass that touches a PR branch to use a dedicated git worktree rather than the repository's main checkout.
 
-This rule exists for three reasons:
+This rule exists for four reasons:
 
 1. it reduces the chance of trampling the operator's main checkout
 2. it isolates per-PR validation runs
 3. it makes cleanup explicit when switching between multiple PRs in one loop cycle
+4. it preserves the invariant that the repository's primary checkout stays on `main` and only pulls from the remote default branch
 
 Human operators should expect review stages to fail or stop early if the local checkout is dirty enough to make branch switching unsafe.
 
@@ -269,7 +273,7 @@ This is important because the next operator, or the next loop pass, needs a conc
 
 ## Loop Control Semantics
 
-The final report contains human-readable loop control, but the shell relies on the separate machine-readable block synthesized by `.github/prompts/loop_control.prompt.md`.
+The final report contains human-readable loop control, and the shell relies on the machine-readable block synthesized by `.github/prompts/loop_control.prompt.md` from inside the main loop iteration session.
 
 The meanings are:
 
@@ -285,6 +289,8 @@ The control prompt is deliberately conservative. If a log is incomplete or ambig
 - `ALL_WAITING_ON_OTHER_AGENTS: no`
 
 That prevents the shell from assuming the loop is safely idle when it is not.
+
+To avoid spending an extra premium request on a second top-level Copilot run, the main loop iteration prompt delegates this synthesis to the loop-control prompt as a subagent and appends the returned block to the same iteration log.
 
 ## How To Run The Loop
 
@@ -340,15 +346,22 @@ Operators should treat prompt-name drift as an operational risk. Keep the orches
 
 ## Logs and Auditability
 
-Each iteration writes two timestamped files under `tmp/loop_iterations/`:
+Each iteration writes timestamped artifacts under `tmp/loop_iterations/`:
 
 - `iteration_<n>_<timestamp>.log`
-- `iteration_<n>_<timestamp>.control.log`
+- `iteration_<n>_<timestamp>.json`
 
 The main log contains:
 
 - the full orchestrator output
-- the appended loop-control block
+- the final loop-control block
+
+The JSON sidecar contains:
+
+- the full final numbered report as text
+- structured sections for each report heading
+- parsed carry-forward and loop-control fields
+- parsed machine-readable control values
 
 These logs are the primary audit trail for:
 
@@ -362,7 +375,7 @@ These logs are the primary audit trail for:
 The shell driver exits immediately when:
 
 - the Copilot iteration command exits non-zero
-- the control-synthesis prompt exits non-zero
+- JSON sidecar extraction fails
 - required control markers are missing
 - `PRS_PROCESSED` is not numeric
 - a required local command is missing

@@ -103,4 +103,62 @@ mod tests {
         assert_eq!(nearest_centroid(&[1.0, 1.0], &centroids), 0);
         assert_eq!(nearest_centroid(&[9.0, 9.0], &centroids), 1);
     }
+
+    /// Verify that training on a sample still produces the correct cluster
+    /// structure when the data has two well-separated groups.
+    #[test]
+    fn test_kmeans_on_sample_finds_correct_clusters() {
+        // 40 vectors near (0,0) and 40 near (100,100).  Use a hand-crafted
+        // sample that includes vectors from both groups so the test is
+        // deterministic without relying on a lucky random draw.
+        let mut vecs: Vec<Vec<f32>> = (0..40).map(|_| vec![0.0f32, 0.0]).collect();
+        vecs.extend((0..40).map(|_| vec![100.0f32, 100.0]));
+
+        // Build a sample with 5 vectors from each group.
+        let sample: Vec<Vec<f32>> = (0..5)
+            .map(|_| vec![0.0f32, 0.0])
+            .chain((0..5).map(|_| vec![100.0f32, 100.0]))
+            .collect();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let centroids = kmeans(&sample, 2, 30, &mut rng);
+        assert_eq!(centroids.len(), 2);
+
+        // After training on the sample, assign ALL vectors to the nearest centroid.
+        let groups: Vec<usize> = vecs
+            .iter()
+            .map(|v| nearest_centroid(v, &centroids))
+            .collect();
+        // The 40 vectors at (0,0) should all map to the same centroid.
+        let first_group = groups[0];
+        assert!(
+            groups[..40].iter().all(|&g| g == first_group),
+            "vectors near (0,0) should all share one centroid"
+        );
+        // The 40 vectors at (100,100) should all map to the other centroid.
+        let second_group = groups[40];
+        assert_ne!(
+            first_group, second_group,
+            "the two clusters must map to different centroids"
+        );
+        assert!(
+            groups[40..].iter().all(|&g| g == second_group),
+            "vectors near (100,100) should all share one centroid"
+        );
+    }
+
+    /// Two calls to `kmeans` with the same seed must return identical centroids.
+    #[test]
+    fn test_kmeans_is_deterministic() {
+        let vecs: Vec<Vec<f32>> = (0..60).map(|i| vec![i as f32, (i * 2) as f32]).collect();
+
+        let run = || {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
+            kmeans(&vecs, 3, 20, &mut rng)
+        };
+
+        let c1 = run();
+        let c2 = run();
+        assert_eq!(c1, c2, "kmeans must be deterministic for the same seed");
+    }
 }
