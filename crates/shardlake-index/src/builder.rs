@@ -238,6 +238,7 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            ..SystemConfig::default()
         };
 
         let err = IndexBuilder::new(&store, &config)
@@ -258,6 +259,7 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            ..SystemConfig::default()
         };
 
         let err = IndexBuilder::new(&store, &config)

@@ -3,3 +3,5 @@ num_shards = 4
 kmeans_iters = 20
 nprobe = 2
 kmeans_seed = 3735928559
+candidate_shards = 0
+max_vectors_per_shard = 0

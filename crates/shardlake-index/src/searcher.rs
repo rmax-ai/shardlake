@@ -8,6 +8,7 @@ use std::{
 use tracing::{debug, info};
 
 use shardlake_core::{
+    config::FanOutPolicy,
     error::CoreError,
     types::{DistanceMetric, SearchResult, ShardId},
 };
@@ -48,8 +49,21 @@ impl IndexSearcher {
         &self.manifest
     }
 
-    /// Perform approximate top-k search using nprobe shard probing.
-    pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+    /// Perform approximate top-k search using the provided [`FanOutPolicy`].
+    ///
+    /// The policy controls:
+    /// - how many IVF centroids are selected for routing
+    ///   ([`FanOutPolicy::candidate_centroids`]),
+    /// - the maximum number of shards probed after deduplication
+    ///   ([`FanOutPolicy::candidate_shards`], `0` = no cap), and
+    /// - the maximum number of vectors evaluated per shard
+    ///   ([`FanOutPolicy::max_vectors_per_shard`], `0` = no limit).
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        policy: &FanOutPolicy,
+    ) -> Result<Vec<SearchResult>> {
         let expected_dims = self.manifest.dims as usize;
         if query.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
@@ -93,7 +107,12 @@ impl IndexSearcher {
             return Ok(Vec::new());
         }
 
-        let probe_indices = top_n_centroids(query, &all_centroids, nprobe.min(all_centroids.len()));
+        // ===== ROUTING STEP =====
+        // Select the top `candidate_centroids` nearest IVF centroids.
+        let n_centroids = (policy.candidate_centroids as usize).min(all_centroids.len());
+        let probe_indices = top_n_centroids(query, &all_centroids, n_centroids);
+
+        // Map centroid indices to shard ids and deduplicate.
         let mut probe_shards: Vec<ShardId> = probe_indices
             .into_iter()
             .filter_map(|i| centroid_to_shard.get(i).copied())
@@ -101,12 +120,33 @@ impl IndexSearcher {
         probe_shards.sort();
         probe_shards.dedup();
 
-        debug!(n_shards = probe_shards.len(), "Probing shards");
+        // Apply candidate_shards cap (0 = no cap).
+        if policy.candidate_shards > 0 {
+            probe_shards.truncate(policy.candidate_shards as usize);
+        }
 
+        debug!(
+            n_shards = probe_shards.len(),
+            candidate_centroids = policy.candidate_centroids,
+            candidate_shards = policy.candidate_shards,
+            max_vectors_per_shard = policy.max_vectors_per_shard,
+            "Probing shards"
+        );
+
+        // ===== FAN-OUT STEP =====
         let mut all_results = Vec::new();
         for shard_id in probe_shards {
             let shard = self.load_shard(shard_id)?;
-            let results = exact_search(query, &shard.records, metric, k);
+
+            // Apply max_vectors_per_shard limit (0 = no limit).
+            let records = if policy.max_vectors_per_shard > 0 {
+                let limit = (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                &shard.records[..limit]
+            } else {
+                &shard.records
+            };
+
+            let results = exact_search(query, records, metric, k);
             all_results.extend(results);
         }
 
@@ -153,10 +193,58 @@ mod tests {
     use super::*;
     use crate::builder::{BuildParams, IndexBuilder};
     use shardlake_core::{
-        config::SystemConfig,
+        config::{FanOutPolicy, SystemConfig},
         types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId, VectorRecord},
     };
     use shardlake_storage::LocalObjectStore;
+
+    fn build_test_searcher(tmp: &tempfile::TempDir) -> IndexSearcher {
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 2,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![1.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(4),
+                data: vec![0.5, 0.5],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-test".into()),
+                embedding_version: EmbeddingVersion("emb-test".into()),
+                index_version: IndexVersion("idx-test".into()),
+                metric: DistanceMetric::Cosine,
+                dims: 2,
+                vectors_key: "datasets/ds-test/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-test/metadata.json".into(),
+            })
+            .unwrap();
+        IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
+    }
 
     #[test]
     fn search_rejects_query_dimension_mismatch() {
@@ -168,6 +256,8 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
         };
         let records = vec![VectorRecord {
             id: VectorId(1),
@@ -189,10 +279,46 @@ mod tests {
             .unwrap();
 
         let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
-        let err = searcher.search(&[1.0, 2.0, 3.0], 1, 1).unwrap_err();
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let err = searcher.search(&[1.0, 2.0, 3.0], 1, &policy).unwrap_err();
         assert_eq!(
             err.to_string(),
             "core error: dimension mismatch: expected 2, got 3"
         );
+    }
+
+    #[test]
+    fn candidate_shards_cap_limits_probed_shards() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        // With candidate_shards=1, only one shard is probed; results are still returned.
+        let policy = FanOutPolicy {
+            candidate_centroids: 4,
+            candidate_shards: 1,
+            max_vectors_per_shard: 0,
+        };
+        let results = searcher.search(&[1.0, 0.0], 2, &policy).unwrap();
+        assert!(!results.is_empty(), "expected at least one result");
+    }
+
+    #[test]
+    fn max_vectors_per_shard_limits_candidates() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        // Limit to 1 vector per shard; we still get results (just fewer candidates).
+        let policy = FanOutPolicy {
+            candidate_centroids: 4,
+            candidate_shards: 0,
+            max_vectors_per_shard: 1,
+        };
+        let results = searcher.search(&[1.0, 0.0], 4, &policy).unwrap();
+        // With 2 shards and 1 vector/shard, we can get at most 2 results.
+        assert!(results.len() <= 2);
     }
 }
