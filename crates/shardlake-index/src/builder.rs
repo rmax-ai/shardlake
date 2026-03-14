@@ -164,6 +164,9 @@ impl<'a> IndexBuilder<'a> {
             "num_clusters".into(),
             serde_json::json!(quantizer.num_clusters()),
         );
+        // `num_shards` equals `num_clusters` for ivf-flat: each cluster maps to exactly one
+        // posting-list shard.  It is kept for backward compatibility with readers that
+        // expect this param from the former "kmeans-flat" builds.
         algo_params.insert(
             "num_shards".into(),
             serde_json::json!(quantizer.num_clusters()),
