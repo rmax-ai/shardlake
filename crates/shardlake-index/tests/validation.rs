@@ -269,6 +269,10 @@ fn test_validate_index_detects_fingerprint_mismatch() {
         f,
         ValidationFailure::FingerprintMismatch { key, .. } if key == &shard_key
     )));
+    assert!(report.failures.iter().any(|f| matches!(
+        f,
+        ValidationFailure::ShardParseError { key, .. } if key == &shard_key
+    )));
 }
 
 /// A manifest with an incorrect fingerprint field (not matching stored bytes)
@@ -547,6 +551,23 @@ fn test_validate_dataset_detects_missing_metadata_artifact() {
     assert!(report.failures.iter().any(|f| matches!(
         f,
         ValidationFailure::ArtifactMissing { key } if key == &paths::dataset_metadata_key("ds-v1")
+    )));
+}
+
+/// Invalid storage keys must surface as `StorageError` failures.
+#[test]
+fn test_validate_dataset_reports_storage_error_for_invalid_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+    let mut dm = sample_dataset_manifest();
+    dm.metadata_key = "../escape".into();
+    store.put(&dm.vectors_key, b"placeholder".to_vec()).unwrap();
+
+    let report = validate_dataset(&dm, &store);
+    assert!(!report.is_valid());
+    assert!(report.failures.iter().any(|f| matches!(
+        f,
+        ValidationFailure::StorageError { key, .. } if key == "../escape"
     )));
 }
 
