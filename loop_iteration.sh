@@ -10,6 +10,8 @@ COPILOT_BIN="${COPILOT_BIN:-copilot}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
 LOG_DIR="$REPO_ROOT/tmp/loop_iterations"
+PRIMARY_REMOTE="${PRIMARY_REMOTE:-origin}"
+PRIMARY_BRANCH="${PRIMARY_BRANCH:-main}"
 GH_PAGER_VALUE="${GH_PAGER:-cat}"
 NO_COLOR_VALUE="${NO_COLOR:-1}"
 CLICOLOR_VALUE="${CLICOLOR:-0}"
@@ -101,6 +103,67 @@ run_prompt() {
   set -e
 
   return "$command_status"
+}
+
+current_branch() {
+  git rev-parse --abbrev-ref HEAD
+}
+
+current_head() {
+  git rev-parse HEAD
+}
+
+ensure_clean_primary_checkout() {
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "[loop_iteration] primary checkout is dirty; refusing to continue" >&2
+    exit 1
+  fi
+}
+
+sync_primary_checkout() {
+  local branch
+  local local_head
+  local remote_head
+
+  branch="$(current_branch)"
+  if [[ "$branch" != "$PRIMARY_BRANCH" ]]; then
+    echo "[loop_iteration] primary checkout must start on ${PRIMARY_BRANCH}; found ${branch}" >&2
+    exit 1
+  fi
+
+  ensure_clean_primary_checkout
+
+  git fetch "$PRIMARY_REMOTE" "$PRIMARY_BRANCH"
+  git pull --ff-only "$PRIMARY_REMOTE" "$PRIMARY_BRANCH"
+
+  local_head="$(current_head)"
+  remote_head="$(git rev-parse "${PRIMARY_REMOTE}/${PRIMARY_BRANCH}")"
+  if [[ "$local_head" != "$remote_head" ]]; then
+    echo "[loop_iteration] primary checkout is not synchronized with ${PRIMARY_REMOTE}/${PRIMARY_BRANCH}" >&2
+    exit 1
+  fi
+}
+
+assert_primary_checkout_unchanged() {
+  local expected_branch="$1"
+  local expected_head="$2"
+  local branch
+  local head
+
+  branch="$(current_branch)"
+  head="$(current_head)"
+
+  if [[ "$branch" != "$expected_branch" ]]; then
+    echo "[loop_iteration] primary checkout moved to ${branch}; expected ${expected_branch}" >&2
+    exit 1
+  fi
+
+  if [[ "$head" != "$expected_head" ]]; then
+    echo "[loop_iteration] primary checkout HEAD changed from ${expected_head} to ${head}" >&2
+    exit 1
+  fi
+
+  ensure_clean_primary_checkout
 }
 
 write_iteration_json() {
@@ -219,6 +282,7 @@ PY
 }
 
 require_command "$COPILOT_BIN"
+require_command git
 require_command tee
 require_command awk
 require_command sleep
@@ -233,6 +297,9 @@ export NO_COLOR="$NO_COLOR_VALUE"
 export CLICOLOR="$CLICOLOR_VALUE"
 
 for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
+  sync_primary_checkout
+  primary_branch_before="$(current_branch)"
+  primary_head_before="$(current_head)"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log_file="$LOG_DIR/iteration_${iteration}_${timestamp}.log"
   json_file="$LOG_DIR/iteration_${iteration}_${timestamp}.json"
@@ -291,6 +358,8 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   fi
 
   write_iteration_json "$iteration" "$timestamp" "$log_file" "$json_file"
+
+  assert_primary_checkout_unchanged "$primary_branch_before" "$primary_head_before"
 
   echo "[loop_iteration] prs_processed=$prs_processed waiting_on_other_agents=$waiting sleep_next=$sleep_next"
   echo "[loop_iteration] json: $json_file"
