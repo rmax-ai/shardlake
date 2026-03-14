@@ -249,7 +249,7 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 ## Dedicated Worktree Rule
 
-The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
+The orchestrator requires any draft-PR review, open-PR review, or merge pass that touches a PR branch to use a dedicated git worktree rather than the repository's main checkout.
 
 This rule exists for four reasons:
 

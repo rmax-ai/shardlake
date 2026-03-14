@@ -72,7 +72,7 @@ Execution guidance:
 - Collect and summarize the outputs from each stage prompt.
 - If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
 - Treat the repository's primary checkout as read-only operational state on `main`: it may pull from `origin/main` at the start of an iteration, but must not be left on another branch or used for PR branch commits.
-- Any run of `review-ready-draft-pr.prompt.md` or `review-ready-open-pr.prompt.md` must perform branch edits in a dedicated git worktree, not in the repository's primary checkout.
+- Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
 Required final report:
