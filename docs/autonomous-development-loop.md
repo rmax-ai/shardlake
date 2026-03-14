@@ -24,6 +24,7 @@ The loop is split into three layers.
 `loop_iteration.sh` is the outer control loop. It is responsible for:
 
 - selecting the orchestrator prompt
+- ensuring each iteration starts from the primary checkout on `main` after pulling from `origin/main`
 - running one iteration through the Copilot CLI
 - storing iteration logs under `tmp/loop_iterations/`
 - extracting the final numbered report and control block from the iteration log into a JSON sidecar
@@ -31,6 +32,8 @@ The loop is split into three layers.
 - deciding whether to sleep before the next pass
 
 The shell driver is the source of truth for runtime behavior such as iteration count, sleep timing, log naming, and failure handling.
+
+The primary checkout is operational state, not a PR workspace. It should start each iteration on `main`, sync from `origin/main` with pull only, and must not be used to push commits.
 
 ### 2. Orchestrator prompt
 
@@ -248,11 +251,12 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
 
-This rule exists for three reasons:
+This rule exists for four reasons:
 
 1. it reduces the chance of trampling the operator's main checkout
 2. it isolates per-PR validation runs
 3. it makes cleanup explicit when switching between multiple PRs in one loop cycle
+4. it preserves the invariant that the repository's primary checkout stays on `main` and only pulls from the remote default branch
 
 Human operators should expect review stages to fail or stop early if the local checkout is dirty enough to make branch switching unsafe.
 

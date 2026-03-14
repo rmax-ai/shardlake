@@ -9,6 +9,8 @@ This prompt is the orchestrator. It should call the stage-specific prompts in or
 Execution constraints:
 
 - Export `GH_PAGER=cat`, `NO_COLOR=1`, and `CLICOLOR=0` before any `gh` command.
+- Start each iteration from the repository's primary checkout on `main`, synced with `origin/main` via pull only.
+- Never push commits from the repository's primary checkout on `main`.
 - Do not inspect `gh --help`, GraphQL schema metadata, or unrelated prompts during normal loop execution.
 - Load a stage-specific prompt only when the workflow reaches that stage.
 - When a stage gathers GitHub state, fetch one machine-readable snapshot first and derive that stage's counts and report from it unless a write operation requires a refresh.
@@ -69,6 +71,7 @@ Execution guidance:
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
 - If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
+- Treat the repository's primary checkout as read-only operational state on `main`: it may pull from `origin/main` at the start of an iteration, but must not be left on another branch or used for PR branch commits.
 - Any run of `review-ready-draft-pr.prompt.md` or `review-ready-open-pr.prompt.md` must perform branch edits in a dedicated git worktree, not in the repository's primary checkout.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
