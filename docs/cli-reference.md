@@ -220,3 +220,81 @@ Printed to stdout:
 # Full precision benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
 ```
+
+---
+
+## `shardlake validate-manifest`
+
+Validates the integrity of dataset and/or index manifests against their stored
+artifacts.  At least one of `--index-version` or `--dataset-version` must be
+provided; both may be supplied to validate them together in a single run.
+
+Exits with a **non-zero status code** when any validation failure is found,
+making it safe to use as a CI gate.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] validate-manifest [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(optional)* | Index version to validate; checks the index manifest and every referenced shard artifact |
+| `--dataset-version <STRING>` | string | *(optional)* | Dataset version to validate; checks the dataset manifest and its referenced artifact files |
+
+At least one of `--index-version` or `--dataset-version` is required.
+
+### Checks performed
+
+**Index manifest** (`--index-version`):
+
+1. Structural validation of the manifest document.
+2. Existence of `vectors_key` and `metadata_key` artifacts.
+3. Per-shard: artifact existence, FNV-1a fingerprint match, dimension consistency, vector-count consistency, and centroid consistency.
+
+**Dataset manifest** (`--dataset-version`):
+
+1. Structural validation of the manifest document.
+2. Existence of `vectors_key` and `metadata_key` artifacts.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All requested manifests are valid |
+| non-zero | One or more validation failures were detected (details printed to stderr) |
+
+### Output
+
+On success:
+
+```
+index manifest 'idx-v1': OK
+dataset manifest 'ds-v1': OK
+```
+
+On failure (stderr):
+
+```
+index manifest 'idx-v1': 2 failure(s)
+  - artifact missing: indexes/idx-v1/shards/shard-0000.sidx
+  - fingerprint mismatch for indexes/idx-v1/shards/shard-0001.sidx: expected abc123, actual deadbeef
+```
+
+### Example
+
+```bash
+# Validate only the index
+shardlake validate-manifest --index-version idx-v1
+
+# Validate only the dataset
+shardlake validate-manifest --dataset-version ds-v1
+
+# Validate both together (e.g. in a CI pipeline)
+shardlake --storage /mnt/data validate-manifest \
+  --index-version idx-v1 \
+  --dataset-version ds-v1
+```
