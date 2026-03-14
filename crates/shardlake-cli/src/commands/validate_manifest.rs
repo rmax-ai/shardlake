@@ -54,7 +54,10 @@ pub async fn run(storage: PathBuf, args: ValidateManifestArgs) -> Result<()> {
         if report.is_valid() {
             println!("index manifest '{iv}': OK");
         } else {
-            eprintln!("index manifest '{iv}': {} failure(s)", report.failures.len());
+            eprintln!(
+                "index manifest '{iv}': {} failure(s)",
+                report.failures.len()
+            );
             for failure in &report.failures {
                 eprintln!("  - {failure}");
             }
