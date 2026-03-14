@@ -65,6 +65,18 @@ pub enum ValidationFailure {
         actual: u64,
     },
 
+    /// The shard centroid embedded in the manifest does not match the shard
+    /// binary centroid used for routing.
+    #[error(
+        "shard {shard_id} centroid mismatch: expected dims {expected_dims}, actual dims {actual_dims} ({reason})"
+    )]
+    ShardCentroidMismatch {
+        shard_id: ShardId,
+        expected_dims: usize,
+        actual_dims: usize,
+        reason: String,
+    },
+
     /// A storage access error prevented a key from being checked.
     #[error("storage error for {key}: {message}")]
     StorageError { key: String, message: String },
@@ -121,7 +133,8 @@ impl ValidationReport {
 ///    - the artifact's FNV-1a fingerprint matches the `fingerprint` field in the
 ///      shard definition;
 ///    - the shard binary's embedded `dims` matches `manifest.dims`;
-///    - the shard binary's embedded vector count matches `shard.vector_count`.
+///    - the shard binary's embedded vector count matches `shard.vector_count`;
+///    - when `shard.centroid` is present, it matches the shard binary centroid.
 ///
 /// Returns a [`ValidationReport`] whose [`ValidationReport::is_valid`] method
 /// returns `true` only when all checks pass.
@@ -204,6 +217,36 @@ pub fn validate_index(manifest: &Manifest, store: &dyn ObjectStore) -> Validatio
                                     expected: shard.vector_count,
                                     actual: actual_count,
                                 });
+                        }
+
+                        if !shard.centroid.is_empty() {
+                            let actual = shard_index.centroids.first();
+                            let (actual_dims, reason) = match actual {
+                                None => (0, "shard has no centroids".to_string()),
+                                Some(centroid) if centroid.len() != shard.centroid.len() => (
+                                    centroid.len(),
+                                    "centroid dimensionality mismatch".to_string(),
+                                ),
+                                Some(centroid)
+                                    if !centroid
+                                        .iter()
+                                        .zip(shard.centroid.iter())
+                                        .all(|(a, b)| a.to_bits() == b.to_bits()) =>
+                                {
+                                    (centroid.len(), "centroid values differ".to_string())
+                                }
+                                Some(_) => (shard.centroid.len(), String::new()),
+                            };
+                            if !reason.is_empty() {
+                                report
+                                    .failures
+                                    .push(ValidationFailure::ShardCentroidMismatch {
+                                        shard_id: shard.shard_id,
+                                        expected_dims: shard.centroid.len(),
+                                        actual_dims,
+                                        reason,
+                                    });
+                            }
                         }
                     }
                 }

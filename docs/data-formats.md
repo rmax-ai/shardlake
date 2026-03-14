@@ -310,6 +310,7 @@ use in code that treats validation failure as an error.
 | 5 | Shard bytes FNV-1a fingerprint matches `shard.fingerprint` | `FingerprintMismatch` |
 | 6 | Shard binary `dims` matches `manifest.dims` | `ShardDimensionMismatch` |
 | 7 | Shard binary vector count matches `shard.vector_count` | `ShardVectorCountMismatch` |
+| 8 | When present, `shard.centroid` matches the shard binary centroid | `ShardCentroidMismatch` |
 
 ### `validate_dataset` checks
 
@@ -328,6 +329,7 @@ use in code that treats validation failure as an error.
 | `FingerprintMismatch { key, expected, actual }` | A shard artifact's FNV-1a fingerprint does not match the value recorded in the manifest. |
 | `ShardDimensionMismatch { shard_id, expected, actual }` | A shard's embedded vector dimension is inconsistent with `manifest.dims`. |
 | `ShardVectorCountMismatch { shard_id, expected, actual }` | A shard's embedded vector count differs from `shard.vector_count` in the manifest. |
+| `ShardCentroidMismatch { shard_id, expected_dims, actual_dims, reason }` | Manifest centroid metadata diverges from centroid data embedded in shard bytes. |
 | `StorageError { key, message }` | A storage access error prevented a key from being checked. |
 | `ShardParseError { key, message }` | A shard artifact's binary data could not be parsed (e.g. wrong magic bytes, unsupported format version). |
 
