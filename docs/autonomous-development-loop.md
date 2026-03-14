@@ -218,7 +218,7 @@ Its review criteria include:
 - docs coverage is present for user-visible changes
 - obvious implementation gaps are absent
 
-The checked-in prompt closest to this responsibility is `.github/prompts/check-draft-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-draft-pr.prompt.md`.
 
 ### 6. Open PR review
 
@@ -234,7 +234,7 @@ Its review criteria include:
 - docs completeness
 - must-fix versus safe-to-defer follow-up work
 
-The checked-in prompt for this responsibility is `.github/prompts/review-open-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-open-pr.prompt.md`.
 
 ### 7. Merge pass
 
