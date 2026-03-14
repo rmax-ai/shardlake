@@ -90,16 +90,6 @@ Required final report:
    - PRs processed: `<number>`
    - all waiting on other agents: `yes` or `no`
    - sleep next iteration: `yes` if and only if `PRs processed` is `0` and `all waiting on other agents` is `yes`; otherwise `no`
-10. Machine-readable control block
-   - emit this block as the final lines of output with no bullets, backticks, or markdown decoration:
-
-```text
-BEGIN_LOOP_CONTROL
-PRS_PROCESSED: <number>
-ALL_WAITING_ON_OTHER_AGENTS: <yes|no>
-SLEEP_NEXT_ITERATION: <yes|no>
-END_LOOP_CONTROL
-```
 
 Completion condition:
 

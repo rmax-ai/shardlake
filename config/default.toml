@@ -3,3 +3,7 @@ num_shards = 4
 kmeans_iters = 20
 nprobe = 2
 kmeans_seed = 3735928559
+# kmeans_sample_size is unset (absent = None).  When absent, all vectors are
+# used for centroid training.  Set to a positive integer to train centroids
+# from a random sample of that many vectors instead (e.g. 50000).
+# kmeans_sample_size = 50000

@@ -40,6 +40,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         kmeans_iters: 5,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
     }
 }
 
