@@ -9,6 +9,8 @@ This prompt is the orchestrator. It should call the stage-specific prompts in or
 Execution constraints:
 
 - Export `GH_PAGER=cat`, `NO_COLOR=1`, and `CLICOLOR=0` before any `gh` command.
+- Start each iteration from the repository's primary checkout on `main`, synced with `origin/main` via pull only.
+- Never push commits from the repository's primary checkout on `main`.
 - Do not inspect `gh --help`, GraphQL schema metadata, or unrelated prompts during normal loop execution.
 - Load a stage-specific prompt only when the workflow reaches that stage.
 - When a stage gathers GitHub state, fetch one machine-readable snapshot first and derive that stage's counts and report from it unless a write operation requires a refresh.
@@ -68,8 +70,10 @@ Execution guidance:
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
+- After drafting the full iteration report, invoke a subagent that follows `.github/prompts/loop_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
 - If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
-- Any run of `review-ready-draft-pr.prompt.md` or `review-ready-open-pr.prompt.md` must perform branch edits in a dedicated git worktree, not in the repository's primary checkout.
+- Treat the repository's primary checkout as read-only operational state on `main`: it may pull from `origin/main` at the start of an iteration, but must not be left on another branch or used for PR branch commits.
+- Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
 Required final report:
@@ -90,16 +94,8 @@ Required final report:
    - PRs processed: `<number>`
    - all waiting on other agents: `yes` or `no`
    - sleep next iteration: `yes` if and only if `PRs processed` is `0` and `all waiting on other agents` is `yes`; otherwise `no`
-10. Machine-readable control block
-   - emit this block as the final lines of output with no bullets, backticks, or markdown decoration:
 
-```text
-BEGIN_LOOP_CONTROL
-PRS_PROCESSED: <number>
-ALL_WAITING_ON_OTHER_AGENTS: <yes|no>
-SLEEP_NEXT_ITERATION: <yes|no>
-END_LOOP_CONTROL
-```
+After section 9, append the `BEGIN_LOOP_CONTROL` / `END_LOOP_CONTROL` block returned by the loop-control subagent exactly, with no extra prose after it.
 
 Completion condition:
 

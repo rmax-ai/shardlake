@@ -19,6 +19,7 @@ individual command flags.
 | `kmeans_seed` | u64 | `3735928559` (0xdeadbeef) | RNG seed for K-means centroid initialisation. Recorded in `algorithm.params.kmeans_seed` in the manifest. Two builds with the same seed and all other inputs identical produce the same shard layout and fingerprints. Equivalent to `--kmeans-seed`. |
 | `candidate_shards` | u32 | `0` | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Equivalent to `--candidate-shards` on `serve` and `benchmark`. |
 | `max_vectors_per_shard` | u32 | `0` | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Equivalent to `--max-vectors-per-shard` on `serve` and `benchmark`. |
+| `kmeans_sample_size` | u32 or absent | absent (`None`) | Maximum number of vectors used to train K-means centroids. When absent, all vectors are used. When set to a positive `n` smaller than the dataset size, a reproducible random sample of up to `n` vectors is drawn (using `kmeans_seed`) before running K-means. All vectors—including those not in the sample—are still assigned to the nearest centroid after training, so no data is lost. Recorded in `algorithm.params.kmeans_sample_size` in the manifest only when bounded sampling actually occurs. Equivalent to `--kmeans-sample-size`. |
 
 ### `config/default.toml` (reference)
 
@@ -30,6 +31,9 @@ nprobe = 2
 kmeans_seed = 3735928559
 candidate_shards = 0
 max_vectors_per_shard = 0
+# kmeans_sample_size is absent by default (all vectors used for training).
+# Set to a positive integer to limit centroid training to a sample:
+# kmeans_sample_size = 50000
 ```
 
 ## Fan-out policy

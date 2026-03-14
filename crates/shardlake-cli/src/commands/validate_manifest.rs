@@ -348,6 +348,7 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+            kmeans_sample_size: None,
         };
         let builder = IndexBuilder::new(&store, &config);
         builder

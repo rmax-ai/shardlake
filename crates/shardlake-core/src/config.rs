@@ -108,6 +108,19 @@ pub struct SystemConfig {
     /// See [`FanOutPolicy::max_vectors_per_shard`] for details.
     #[serde(default)]
     pub max_vectors_per_shard: u32,
+    /// Maximum number of vectors to use for K-means centroid training.
+    ///
+    /// When `None` (default), every vector in the dataset is used to train
+    /// centroids.  When `Some(n)`, a random sample of up to `n` vectors is
+    /// drawn (without replacement) using the seeded RNG before K-means runs.
+    /// All vectors—including those not in the sample—are still assigned to the
+    /// nearest centroid after training, so no data is lost.
+    ///
+    /// Sampling speeds up centroid training on large datasets while preserving
+    /// shard assignment correctness.  Two builds with the same seed and the
+    /// same `kmeans_sample_size` produce identical centroids and fingerprints.
+    #[serde(default)]
+    pub kmeans_sample_size: Option<u32>,
 }
 
 impl SystemConfig {
@@ -142,6 +155,7 @@ impl Default for SystemConfig {
             kmeans_seed: DEFAULT_KMEANS_SEED,
             candidate_shards: 0,
             max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
         }
     }
 }

@@ -258,6 +258,7 @@ mod tests {
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             candidate_shards: 0,
             max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
         };
         let records = vec![VectorRecord {
             id: VectorId(1),
