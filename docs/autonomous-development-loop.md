@@ -117,6 +117,7 @@ The script requires these commands to exist:
 - `tee`
 - `awk`
 - `sleep`
+- `python3`
 
 It also sets stable CLI output defaults before running the loop:
 
