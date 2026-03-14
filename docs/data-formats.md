@@ -147,7 +147,8 @@ and index version and describes every shard artifact.
       "num_clusters": 4,
       "num_shards": 4,
       "kmeans_iters": 20,
-      "kmeans_seed": 3735928559
+      "kmeans_seed": 3735928559,
+      "kmeans_sample_size": 50000
     }
   },
   "shard_summary": {
@@ -202,6 +203,7 @@ and index version and describes every shard artifact.
 | `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name. `"ivf-flat"` for current builds; `"kmeans-flat"` for indexes built before IVF was introduced. Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
 | `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
 | `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
 | `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
 | `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
@@ -254,6 +256,7 @@ A Shardlake index build is **reproducible** when the following inputs are held c
 | Number of shards | `algorithm.params.num_shards` |
 | K-means iterations | `algorithm.params.kmeans_iters` |
 | K-means RNG seed | `algorithm.params.kmeans_seed` |
+| K-means sample size (when bounded) | `algorithm.params.kmeans_sample_size` |
 | Builder binary version | `build_metadata.builder_version` |
 
 Given identical values for all of the above, two builds produce identical shard

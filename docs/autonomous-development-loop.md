@@ -24,6 +24,7 @@ The loop is split into three layers.
 `loop_iteration.sh` is the outer control loop. It is responsible for:
 
 - selecting the orchestrator prompt
+- ensuring each iteration starts from the primary checkout on `main` after pulling from `origin/main`
 - running one iteration through the Copilot CLI
 - storing iteration logs under `tmp/loop_iterations/`
 - extracting the final numbered report and control block from the iteration log into a JSON sidecar
@@ -31,6 +32,8 @@ The loop is split into three layers.
 - deciding whether to sleep before the next pass
 
 The shell driver is the source of truth for runtime behavior such as iteration count, sleep timing, log naming, and failure handling.
+
+The primary checkout is operational state, not a PR workspace. It should start each iteration on `main`, sync from `origin/main` with pull only, and must not be used to push commits.
 
 ### 2. Orchestrator prompt
 
@@ -218,7 +221,7 @@ Its review criteria include:
 - docs coverage is present for user-visible changes
 - obvious implementation gaps are absent
 
-The checked-in prompt closest to this responsibility is `.github/prompts/check-draft-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-draft-pr.prompt.md`.
 
 ### 6. Open PR review
 
@@ -234,7 +237,7 @@ Its review criteria include:
 - docs completeness
 - must-fix versus safe-to-defer follow-up work
 
-The checked-in prompt for this responsibility is `.github/prompts/review-open-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-open-pr.prompt.md`.
 
 ### 7. Merge pass
 
@@ -246,13 +249,14 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 ## Dedicated Worktree Rule
 
-The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
+The orchestrator requires any draft-PR review, open-PR review, or merge pass that touches a PR branch to use a dedicated git worktree rather than the repository's main checkout.
 
-This rule exists for three reasons:
+This rule exists for four reasons:
 
 1. it reduces the chance of trampling the operator's main checkout
 2. it isolates per-PR validation runs
 3. it makes cleanup explicit when switching between multiple PRs in one loop cycle
+4. it preserves the invariant that the repository's primary checkout stays on `main` and only pulls from the remote default branch
 
 Human operators should expect review stages to fail or stop early if the local checkout is dirty enough to make branch switching unsafe.
 
@@ -269,7 +273,7 @@ This is important because the next operator, or the next loop pass, needs a conc
 
 ## Loop Control Semantics
 
-The final report contains human-readable loop control, but the shell relies on the separate machine-readable block synthesized by `.github/prompts/loop_control.prompt.md`.
+The final report contains human-readable loop control, and the shell relies on the machine-readable block synthesized by `.github/prompts/loop_control.prompt.md` from inside the main loop iteration session.
 
 The meanings are:
 
@@ -285,6 +289,8 @@ The control prompt is deliberately conservative. If a log is incomplete or ambig
 - `ALL_WAITING_ON_OTHER_AGENTS: no`
 
 That prevents the shell from assuming the loop is safely idle when it is not.
+
+To avoid spending an extra premium request on a second top-level Copilot run, the main loop iteration prompt delegates this synthesis to the loop-control prompt as a subagent and appends the returned block to the same iteration log.
 
 ## How To Run The Loop
 
