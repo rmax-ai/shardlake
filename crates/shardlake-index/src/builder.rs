@@ -134,16 +134,17 @@ impl<'a> IndexBuilder<'a> {
             self.store.put(&shard_artifact_key, bytes)?;
             info!(shard = %shard_id, vectors = count, key = %shard_artifact_key, "Shard written");
             actual_total += count;
+            let file_location = shard_artifact_key.clone();
             shard_defs.push(ShardDef {
                 shard_id,
-                artifact_key: shard_artifact_key.clone(),
+                artifact_key: shard_artifact_key,
                 vector_count: count,
                 fingerprint: sha,
                 centroid: centroids[i].clone(),
                 routing: Some(RoutingMetadata {
                     centroid_id: format!("shard-{:04}", shard_id.0),
                     index_type: "flat".into(),
-                    file_location: shard_artifact_key.clone(),
+                    file_location,
                 }),
             });
         }

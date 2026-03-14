@@ -174,7 +174,7 @@ and index version and describes every shard artifact.
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
 | `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
 | `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v4 documents. |
-| `4` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). Adds `routing` object in each `ShardDef` with `centroid_id`, `index_type`, and `file_location` for partition-aware query routing. The `routing` field is absent in manifests loaded from older versions and defaults to `None`. |
+| `4` | Current schema. Adds `routing` object in each `ShardDef` with `centroid_id`, `index_type`, and `file_location` for partition-aware query routing. The `routing` field is absent in manifests loaded from older versions and defaults to `None`. |
 
 ### Fields
 
