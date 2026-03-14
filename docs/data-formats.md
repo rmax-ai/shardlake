@@ -193,7 +193,7 @@ and index version and describes every shard artifact.
 | `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
 | `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name (e.g. `"kmeans-flat"`). Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` when centroid training was run on a bounded sample instead of the full dataset. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
 | `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
 | `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
 | `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |

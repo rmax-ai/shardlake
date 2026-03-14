@@ -304,3 +304,36 @@ fn test_build_with_sample_size_assigns_all_and_is_deterministic() {
         .expect("kmeans_sample_size must be in algorithm.params when set");
     assert_eq!(param.as_u64().unwrap(), 20);
 }
+
+#[test]
+fn test_build_with_large_sample_size_uses_full_dataset_without_manifest_override() {
+    let records = make_records(12, 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 3,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: Some(100),
+    };
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-full-sample".into()),
+            embedding_version: EmbeddingVersion("emb-full-sample".into()),
+            index_version: IndexVersion("idx-full-sample".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-full-sample"),
+            metadata_key: paths::dataset_metadata_key("ds-full-sample"),
+        })
+        .unwrap();
+
+    assert!(
+        !manifest.algorithm.params.contains_key("kmeans_sample_size"),
+        "manifest should omit kmeans_sample_size when centroid training used the full dataset"
+    );
+}

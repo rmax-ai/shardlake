@@ -101,22 +101,31 @@ impl<'a> IndexBuilder<'a> {
         // Optionally sample a subset for centroid training.  All vectors are
         // still assigned to the nearest centroid after training, so no data
         // is lost when sampling is enabled.
-        let sampled: Option<Vec<Vec<f32>>> =
-            self.config.kmeans_sample_size.and_then(|max_samples| {
+        let sampled: Option<Vec<Vec<f32>>> = match self.config.kmeans_sample_size {
+            Some(0) => {
+                return Err(IndexError::Other(
+                    "kmeans_sample_size must be greater than 0".into(),
+                ))
+            }
+            Some(max_samples) => {
                 let sample_size = (max_samples as usize).min(vecs.len());
                 if sample_size >= vecs.len() {
                     // Sample covers the full set – no need to allocate.
-                    return None;
+                    None
+                } else {
+                    let mut indices: Vec<usize> = (0..vecs.len()).collect();
+                    let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
+                    Some(shuffled.iter().map(|&i| vecs[i].clone()).collect())
                 }
-                let mut indices: Vec<usize> = (0..vecs.len()).collect();
-                let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
-                Some(shuffled.iter().map(|&i| vecs[i].clone()).collect())
-            });
+            }
+            None => None,
+        };
+        let effective_sample_size = sampled.as_ref().map(std::vec::Vec::len);
         let training_vecs: &[Vec<f32>] = sampled.as_deref().unwrap_or(&vecs);
 
-        if let Some(ref s) = sampled {
+        if let Some(sample_size) = effective_sample_size {
             info!(
-                sample_size = s.len(),
+                sample_size,
                 total = n,
                 "Sampling vectors for centroid training"
             );
@@ -188,7 +197,7 @@ impl<'a> IndexBuilder<'a> {
             "kmeans_seed".into(),
             serde_json::json!(self.config.kmeans_seed),
         );
-        if let Some(sample_size) = self.config.kmeans_sample_size {
+        if let Some(sample_size) = effective_sample_size {
             algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
         }
 
@@ -356,6 +365,67 @@ mod tests {
             .get("kmeans_sample_size")
             .expect("kmeans_sample_size must be recorded in algorithm.params");
         assert_eq!(param.as_u64().unwrap(), 10);
+    }
+
+    #[test]
+    fn build_rejects_zero_kmeans_sample_size() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: Some(0),
+        };
+
+        let err = IndexBuilder::new(&store, &config)
+            .build(build_params(vec![record(1, 2), record(2, 2)], 2))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("kmeans_sample_size must be greater than 0"));
+    }
+
+    #[test]
+    fn build_omits_sample_size_when_sampling_is_not_needed() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let dims = 4usize;
+        let records: Vec<VectorRecord> = (0..8)
+            .map(|i| VectorRecord {
+                id: VectorId(i as u64),
+                data: (0..dims).map(|d| (i * dims + d) as f32).collect(),
+                metadata: None,
+            })
+            .collect();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: Some(99),
+        };
+
+        let manifest = IndexBuilder::new(&store, &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-full".into()),
+                embedding_version: EmbeddingVersion("emb-full".into()),
+                index_version: IndexVersion("idx-full".into()),
+                metric: DistanceMetric::Euclidean,
+                dims,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-full"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-full"),
+            })
+            .unwrap();
+
+        assert!(
+            !manifest.algorithm.params.contains_key("kmeans_sample_size"),
+            "kmeans_sample_size should be omitted when training uses the full dataset"
+        );
     }
 
     /// Two builds with the same `kmeans_sample_size` and seed must produce
