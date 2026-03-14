@@ -65,6 +65,8 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         kmeans_iters: args.kmeans_iters,
         nprobe: args.nprobe,
         kmeans_seed: args.kmeans_seed,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
     };
 
     let dm = match DatasetManifest::load(&store, &dataset_ver) {

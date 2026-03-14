@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use shardlake_core::{
-    config::SystemConfig,
+    config::{FanOutPolicy, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
     },
@@ -76,6 +76,7 @@ fn test_build_and_search() {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
     };
 
     let records = make_records(20, 4);
@@ -107,7 +108,12 @@ fn test_build_and_search() {
         manifest,
     );
     let query = records[0].data.clone();
-    let results = searcher.search(&query, 5, 2).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
     assert!(!results.is_empty());
     // The closest vector to itself should be id 0.
     assert_eq!(results[0].id, VectorId(0));
@@ -127,6 +133,7 @@ fn test_search_does_not_load_non_probed_shards() {
         kmeans_iters: 10,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
     };
 
     let records = make_records(40, 4);
@@ -151,15 +158,20 @@ fn test_search_does_not_load_non_probed_shards() {
 
     let searcher = IndexSearcher::new(counting_store, manifest);
 
-    // nprobe=1: only 1 of the 4 shards should be loaded.
+    // candidate_centroids=1: only 1 of the 4 shards should be loaded.
     let query = records[0].data.clone();
-    let results = searcher.search(&query, 5, 1).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 1,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
     assert!(!results.is_empty());
 
     let loads = counter.load(Ordering::Relaxed);
     assert_eq!(
         loads, 1,
-        "expected exactly 1 shard load with nprobe=1, got {loads}"
+        "expected exactly 1 shard load with candidate_centroids=1, got {loads}"
     );
 }
 
@@ -183,6 +195,7 @@ fn test_build_is_deterministic() {
             kmeans_iters: 10,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            ..SystemConfig::default()
         };
         IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {

@@ -46,7 +46,10 @@ vector ids with their scores.
 {
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
-  "nprobe": 3
+  "nprobe": 3,
+  "candidate_centroids": 3,
+  "candidate_shards": 2,
+  "max_vectors_per_shard": 500
 }
 ```
 
@@ -54,7 +57,10 @@ vector ids with their scores.
 |-------|------|----------|-------------|
 | `vector` | `float[]` | Yes | Query vector. Must have the same number of dimensions as the index. |
 | `k` | integer | Yes | Number of results to return. Must be ≥ 1. |
-| `nprobe` | integer | No | Number of shards to probe. Defaults to the value set via `--nprobe` when the server was started. Higher values improve recall at the cost of latency. |
+| `nprobe` | integer | No | Backward-compatible alias for `candidate_centroids`. Ignored when `candidate_centroids` is also provided. Defaults to the server's `--nprobe` value. |
+| `candidate_centroids` | integer | No | Number of nearest IVF centroids to select for shard routing. Must be ≥ 1 when provided. Takes precedence over `nprobe`. Defaults to the server's `--nprobe` value. |
+| `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
+| `max_vectors_per_shard` | integer | No | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Defaults to the server's `--max-vectors-per-shard` value. |
 
 ### Success response — `200 OK`
 
@@ -89,6 +95,7 @@ vector ids with their scores.
 | Status | Body | Cause |
 |--------|------|-------|
 | `400 Bad Request` | `{"error": "k must be > 0"}` | `k` field is 0 |
+| `400 Bad Request` | `{"error": "invalid fan-out policy: candidate_centroids must be ≥ 1"}` | `candidate_centroids` (or `nprobe`) is 0 |
 | `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
 | `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
