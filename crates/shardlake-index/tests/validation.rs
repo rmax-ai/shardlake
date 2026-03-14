@@ -39,6 +39,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         num_shards: 2,
         kmeans_iters: 5,
         nprobe: 2,
+        ..SystemConfig::default()
     }
 }
 
@@ -57,6 +58,7 @@ fn build_index(tmp: &std::path::Path) -> (Arc<LocalObjectStore>, shardlake_manif
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-v1"),
             metadata_key: paths::dataset_metadata_key("ds-v1"),
+            pq_params: None,
         })
         .unwrap();
     (store, manifest)

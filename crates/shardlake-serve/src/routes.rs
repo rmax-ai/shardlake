@@ -125,6 +125,7 @@ mod tests {
             kmeans_iters: 4,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            ..SystemConfig::default()
         };
         let records = vec![
             VectorRecord {
@@ -148,6 +149,7 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
+                pq_params: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
