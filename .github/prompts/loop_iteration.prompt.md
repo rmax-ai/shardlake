@@ -32,6 +32,7 @@ Workflow labels:
 - `ready-for-draft-check`: draft PR has completed agent work and can be reviewed for leaving draft
 - `ready-for-open-review`: open non-draft PR has Copilot or Codex review comments ready for handling
 - `ready-to-merge`: open PR has completed review handling and is ready for a final merge pass
+- `needs-human`: PR is blocked on manual intervention and must not be advanced automatically
 
 Deterministic operating rules:
 
@@ -40,8 +41,9 @@ Deterministic operating rules:
 3. Each stage prompt has exactly one goal. Do not merge stage responsibilities.
 4. Handle at most one draft PR review, one open PR review, and one merge candidate per iteration.
 5. Never mark a PR ready or merge it while blocking checks or unresolved blocking feedback remain.
-6. If eligibility is ambiguous, do not advance the item this iteration.
-7. The final report must end with one plain-text control block exactly matching the required format below.
+6. If any stage detects that a PR has merge conflicts, add the `needs-human` label to that PR and do not advance it automatically this iteration.
+7. If eligibility is ambiguous, do not advance the item this iteration.
+8. The final report must end with one plain-text control block exactly matching the required format below.
 
 Stage order:
 
@@ -66,6 +68,7 @@ Execution guidance:
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
+- If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
 - Any run of `review-ready-draft-pr.prompt.md` or `review-ready-open-pr.prompt.md` must perform branch edits in a dedicated git worktree, not in the repository's primary checkout.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
