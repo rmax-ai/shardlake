@@ -36,6 +36,7 @@ use crate::{
 /// Magic bytes identifying a `.cq` coarse-quantizer artifact.
 pub const CQ_MAGIC: &[u8; 8] = b"SLKIVF\0\0";
 const CQ_FORMAT_VERSION: u32 = 1;
+const CQ_HEADER_LEN: usize = 20;
 
 /// Trained IVF coarse quantizer.
 ///
@@ -166,6 +167,12 @@ impl IvfQuantizer {
     /// Returns an error if the magic bytes, format version, or data layout are
     /// not recognised.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < CQ_HEADER_LEN {
+            return Err(IndexError::Other(
+                "coarse-quantizer payload is shorter than the fixed header".into(),
+            ));
+        }
+
         let mut cur = Cursor::new(bytes);
 
         let mut magic = [0u8; 8];
@@ -185,6 +192,29 @@ impl IvfQuantizer {
 
         let dims = read_u32(&mut cur)? as usize;
         let num_clusters = read_u32(&mut cur)? as usize;
+        if dims == 0 {
+            return Err(IndexError::Other(
+                "coarse-quantizer dims must be greater than 0".into(),
+            ));
+        }
+        if num_clusters == 0 {
+            return Err(IndexError::Other(
+                "coarse-quantizer num_clusters must be greater than 0".into(),
+            ));
+        }
+        let payload_len = dims
+            .checked_mul(num_clusters)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| IndexError::Other("coarse-quantizer payload size overflow".into()))?;
+        let expected_len = CQ_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| IndexError::Other("coarse-quantizer payload size overflow".into()))?;
+        if bytes.len() != expected_len {
+            return Err(IndexError::Other(format!(
+                "coarse-quantizer payload length mismatch: expected {expected_len} bytes, got {}",
+                bytes.len()
+            )));
+        }
 
         let mut centroids = Vec::with_capacity(num_clusters);
         for _ in 0..num_clusters {
@@ -316,11 +346,54 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_wrong_magic() {
-        let bad: Vec<u8> = b"BADMAGIC".to_vec();
+        let mut bad = b"BADMAGIC".to_vec();
+        bad.extend_from_slice(&CQ_FORMAT_VERSION.to_le_bytes());
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&0.0f32.to_le_bytes());
         let err = IvfQuantizer::from_bytes(&bad).unwrap_err();
         assert!(
             err.to_string().contains("magic"),
             "expected magic-bytes error, got: {err}"
         );
+    }
+
+    #[test]
+    fn from_bytes_rejects_zero_dims() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CQ_MAGIC);
+        bytes.extend_from_slice(&CQ_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+
+        let err = IvfQuantizer::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("dims must be greater than 0"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_zero_clusters() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CQ_MAGIC);
+        bytes.extend_from_slice(&CQ_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let err = IvfQuantizer::from_bytes(&bytes).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("num_clusters must be greater than 0"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_payload_length_mismatch() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CQ_MAGIC);
+        bytes.extend_from_slice(&CQ_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let err = IvfQuantizer::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("payload length mismatch"));
     }
 }

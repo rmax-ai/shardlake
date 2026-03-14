@@ -109,12 +109,33 @@ impl<'a> IndexBuilder<'a> {
             }
         }
 
+        let mut non_empty_clusters: Vec<(usize, Vec<VectorRecord>)> = shard_records
+            .into_iter()
+            .enumerate()
+            .filter(|(_, shard_recs)| !shard_recs.is_empty())
+            .collect();
+        if non_empty_clusters.is_empty() {
+            return Err(IndexError::Other(
+                "IVF build produced no non-empty posting-list shards".into(),
+            ));
+        }
+        if non_empty_clusters.len() != quantizer.num_clusters() {
+            warn!(
+                requested_clusters = quantizer.num_clusters(),
+                retained_clusters = non_empty_clusters.len(),
+                "Compacting empty IVF clusters to preserve cluster-to-shard mapping"
+            );
+        }
+        let quantizer = IvfQuantizer::from_centroids(
+            non_empty_clusters
+                .iter()
+                .map(|(cluster_idx, _)| quantizer.centroids()[*cluster_idx].clone())
+                .collect(),
+        );
+
         let mut shard_defs = Vec::new();
         let mut actual_total: u64 = 0;
-        for (i, shard_recs) in shard_records.into_iter().enumerate() {
-            if shard_recs.is_empty() {
-                continue;
-            }
+        for (i, (_, shard_recs)) in non_empty_clusters.drain(..).enumerate() {
             let shard_id = ShardId(i as u32);
             let count = shard_recs.len() as u64;
             let idx = ShardIndex {

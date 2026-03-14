@@ -318,6 +318,18 @@ impl Manifest {
                 "compression.codec must not be empty".into(),
             ));
         }
+        if let Some(key) = &self.coarse_quantizer_key {
+            if key.trim().is_empty() {
+                return Err(ManifestError::Validation(
+                    "coarse_quantizer_key must not be empty when present".into(),
+                ));
+            }
+        }
+        if self.algorithm.algorithm == "ivf-flat" && self.coarse_quantizer_key.is_none() {
+            return Err(ManifestError::Validation(
+                "algorithm 'ivf-flat' requires coarse_quantizer_key".into(),
+            ));
+        }
 
         if let Some(summary) = &self.shard_summary {
             let actual_num_shards = self.shards.len() as u32;

@@ -264,6 +264,17 @@ fn test_validate_rejects_negative_build_duration() {
         .contains("build_metadata.build_duration_secs must be finite and >= 0"));
 }
 
+#[test]
+fn test_validate_rejects_ivf_flat_without_coarse_quantizer_key() {
+    let mut m = sample_manifest();
+    m.algorithm.algorithm = "ivf-flat".into();
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("algorithm 'ivf-flat' requires coarse_quantizer_key"));
+}
+
 // ── manifest v3 lifecycle fields ─────────────────────────────────────────────
 
 #[test]

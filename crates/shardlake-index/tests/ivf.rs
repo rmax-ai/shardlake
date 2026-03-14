@@ -265,3 +265,53 @@ fn coarse_quantizer_centroids_match_shard_def_centroids() {
         );
     }
 }
+
+/// Empty IVF clusters must be compacted so the persisted coarse quantizer and
+/// manifest retain a contiguous shard-id-to-centroid mapping.
+#[test]
+fn build_compacts_empty_clusters_before_persisting_quantizer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = default_config(tmp.path(), 4);
+    let records = (0..12)
+        .map(|i| VectorRecord {
+            id: VectorId(i as u64),
+            data: vec![0.0f32, 0.0],
+            metadata: None,
+        })
+        .collect();
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-empty".into()),
+            embedding_version: EmbeddingVersion("emb-empty".into()),
+            index_version: IndexVersion("idx-empty".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 2,
+            vectors_key: paths::dataset_vectors_key("ds-empty"),
+            metadata_key: paths::dataset_metadata_key("ds-empty"),
+        })
+        .unwrap();
+
+    assert_eq!(
+        manifest.shards.len(),
+        1,
+        "expected empty clusters to be removed"
+    );
+    assert_eq!(
+        manifest
+            .algorithm
+            .params
+            .get("num_clusters")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "num_clusters should reflect the persisted non-empty clusters",
+    );
+
+    let cq_key = manifest.coarse_quantizer_key.as_deref().unwrap();
+    let quantizer = IvfQuantizer::from_bytes(&store.get(cq_key).unwrap()).unwrap();
+    assert_eq!(quantizer.num_clusters(), manifest.shards.len());
+    assert_eq!(manifest.shards[0].shard_id.0, 0);
+    assert_eq!(manifest.shards[0].centroid, quantizer.centroids()[0]);
+}
