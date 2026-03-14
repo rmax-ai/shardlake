@@ -333,6 +333,7 @@ mod tests {
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             // Use a sample smaller than the full dataset.
             kmeans_sample_size: Some(10),
+            ..SystemConfig::default()
         };
 
         let records: Vec<VectorRecord> = (0..n)
@@ -387,6 +388,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: Some(0),
+            ..SystemConfig::default()
         };
 
         let err = IndexBuilder::new(&store, &config)
@@ -416,6 +418,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: Some(99),
+            ..SystemConfig::default()
         };
 
         let manifest = IndexBuilder::new(&store, &config)
@@ -461,6 +464,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: SystemConfig::default_kmeans_seed(),
                 kmeans_sample_size: Some(10),
+                ..SystemConfig::default()
             };
             IndexBuilder::new(&store, &config)
                 .build(BuildParams {

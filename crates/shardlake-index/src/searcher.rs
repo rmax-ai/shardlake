@@ -1,7 +1,7 @@
 //! Query-time shard searcher with lazy loading and in-memory cache.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -117,8 +117,8 @@ impl IndexSearcher {
             .into_iter()
             .filter_map(|i| centroid_to_shard.get(i).copied())
             .collect();
-        probe_shards.sort();
-        probe_shards.dedup();
+        let mut seen = HashSet::new();
+        probe_shards.retain(|shard_id| seen.insert(*shard_id));
 
         // Apply candidate_shards cap (0 = no cap).
         if policy.candidate_shards > 0 {
@@ -208,6 +208,7 @@ mod tests {
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             candidate_shards: 0,
             max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
         };
         let records = vec![
             VectorRecord {
