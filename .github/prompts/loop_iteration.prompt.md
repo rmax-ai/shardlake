@@ -70,6 +70,7 @@ Execution guidance:
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
+- After drafting the full iteration report, invoke a subagent that follows `.github/prompts/loop_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
 - If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
 - Treat the repository's primary checkout as read-only operational state on `main`: it may pull from `origin/main` at the start of an iteration, but must not be left on another branch or used for PR branch commits.
 - Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout.
@@ -93,6 +94,8 @@ Required final report:
    - PRs processed: `<number>`
    - all waiting on other agents: `yes` or `no`
    - sleep next iteration: `yes` if and only if `PRs processed` is `0` and `all waiting on other agents` is `yes`; otherwise `no`
+
+After section 9, append the `BEGIN_LOOP_CONTROL` / `END_LOOP_CONTROL` block returned by the loop-control subagent exactly, with no extra prose after it.
 
 Completion condition:
 

@@ -5,6 +5,7 @@ description: Derive the machine-readable loop control block from a completed loo
 Primary goal: read the completed loop iteration log passed in the invoking prompt and emit only the machine-readable loop control block.
 
 This prompt is responsible only for loop control synthesis. It must not inspect repository state, call GitHub, or propose workflow changes.
+It is intended to run as a final subagent step inside the main loop iteration session so the orchestrator does not need a second top-level Copilot invocation.
 
 Inputs:
 

@@ -273,7 +273,7 @@ This is important because the next operator, or the next loop pass, needs a conc
 
 ## Loop Control Semantics
 
-The final report contains human-readable loop control, but the shell relies on the separate machine-readable block synthesized by `.github/prompts/loop_control.prompt.md`.
+The final report contains human-readable loop control, and the shell relies on the machine-readable block synthesized by `.github/prompts/loop_control.prompt.md` from inside the main loop iteration session.
 
 The meanings are:
 
@@ -289,6 +289,8 @@ The control prompt is deliberately conservative. If a log is incomplete or ambig
 - `ALL_WAITING_ON_OTHER_AGENTS: no`
 
 That prevents the shell from assuming the loop is safely idle when it is not.
+
+To avoid spending an extra premium request on a second top-level Copilot run, the main loop iteration prompt delegates this synthesis to the loop-control prompt as a subagent and appends the returned block to the same iteration log.
 
 ## How To Run The Loop
 
