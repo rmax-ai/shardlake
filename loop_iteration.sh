@@ -90,6 +90,19 @@ normalize_bool() {
   fi
 }
 
+run_prompt() {
+  local prompt_text="$1"
+  local output_file="$2"
+  local command_status=0
+
+  set +e
+  "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "$prompt_text" | tee "$output_file"
+  command_status=${PIPESTATUS[0]}
+  set -e
+
+  return "$command_status"
+}
+
 write_iteration_json() {
   local iteration="$1"
   local timestamp="$2"
@@ -223,14 +236,15 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log_file="$LOG_DIR/iteration_${iteration}_${timestamp}.log"
   json_file="$LOG_DIR/iteration_${iteration}_${timestamp}.json"
+  control_file="$LOG_DIR/iteration_${iteration}_${timestamp}.control"
 
   echo "[loop_iteration] starting iteration ${iteration}/${MAX_ITERATIONS}"
   echo "[loop_iteration] log: $log_file"
 
-  if ! run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file"; then
-    command_status=$?
-  else
+  if run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file"; then
     command_status=0
+  else
+    command_status=$?
   fi
 
   if [[ $command_status -ne 0 ]]; then
@@ -240,10 +254,10 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
 
   echo "[loop_iteration] synthesizing loop control from $log_file"
 
-  if ! run_prompt "follow instructions in ${CONTROL_PROMPT_PATH} for log file ${log_file}" "$control_file"; then
-    command_status=$?
-  else
+  if run_prompt "follow instructions in ${CONTROL_PROMPT_PATH} for log file ${log_file}" "$control_file"; then
     command_status=0
+  else
+    command_status=$?
   fi
 
   if [[ $command_status -ne 0 ]]; then
