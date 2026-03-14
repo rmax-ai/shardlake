@@ -110,7 +110,7 @@ and index version and describes every shard artifact.
 
 ```json
 {
-  "manifest_version": 3,
+  "manifest_version": 4,
   "dataset_version": "ds-v1",
   "embedding_version": "emb-v1",
   "index_version": "idx-v1",
@@ -126,7 +126,12 @@ and index version and describes every shard artifact.
       "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
       "vector_count": 2504,
       "sha256": "a1b2c3d4e5f60708",
-      "centroid": [0.12, 0.34, 0.56, ...]
+      "centroid": [0.12, 0.34, 0.56, ...],
+      "routing": {
+        "centroid_id": "shard-0000",
+        "index_type": "flat",
+        "file_location": "indexes/idx-v1/shards/shard-0000.sidx"
+      }
     }
   ],
   "build_metadata": {
@@ -171,13 +176,14 @@ and index version and describes every shard artifact.
 |--------------------|-------------|
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
 | `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
-| `3` | Current schema (produced by `shardlake build-index` ≥ 0.1.0). Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The v3 reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v3 documents. |
+| `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v4 documents. |
+| `4` | Current schema. Adds an optional `routing` object to `ShardDef` with `centroid_id`, `index_type`, and `file_location` for partition-aware query routing. Fresh v4 builds populate it for every non-empty shard. Manifests loaded from older versions may still omit `routing` after being re-saved, in which case the field defaults to `None`. |
 
 ### Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `manifest_version` | integer | Schema version. `1` (legacy), `2`, or `3` (current). |
+| `manifest_version` | integer | Schema version. `1` (legacy), `2`, `3`, or `4` (current). |
 | `dataset_version` | string | Version tag of the source dataset. |
 | `embedding_version` | string | Version tag of the embedding generation run. |
 | `index_version` | string | Version tag of this index build. |
@@ -216,6 +222,10 @@ and index version and describes every shard artifact.
 | `vector_count` | integer | Number of vectors stored in this shard. |
 | `sha256` | string | Canonical manifest v1 wire field for the shard fingerprint. Shardlake currently stores an FNV-1a fingerprint here as a prototype, not a cryptographic SHA-256 digest. The reader also accepts `fingerprint` for compatibility with previously emitted manifests. |
 | `centroid` | array of numbers | *(manifest v2+)* The K-means centroid for this shard (length equals `dims`). Used by `IndexSearcher` to route queries to the nearest shards without loading shard bodies. Absent in manifest v1; when missing the searcher falls back to loading the full shard to extract its centroid. |
+| `routing` | object \| null | *(manifest v4+)* Routing metadata for partition-aware query routing. `null` / absent in manifests loaded from manifest_version ≤ 3. |
+| `routing.centroid_id` | string | Stable identifier for this shard's centroid (e.g. `"shard-0000"`). Used as a routing key to identify the shard in routing tables and logs. |
+| `routing.index_type` | string | ANN index algorithm within this shard (e.g. `"flat"` for linear scan). Consumed by the serving path to select the correct search method when loading this shard. |
+| `routing.file_location` | string | Canonical storage key to load this shard when routing a query. Equals `artifact_key` for local storage backends; may differ in multi-storage deployments that resolve a URL or filesystem path separately. |
 
 ### Compatibility checks
 

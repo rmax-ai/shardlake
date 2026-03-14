@@ -39,7 +39,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         num_shards: 2,
         kmeans_iters: 5,
         nprobe: 2,
-        kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
     }
 }
 
@@ -97,7 +97,7 @@ fn sample_dataset_manifest() -> DatasetManifest {
 
 fn sample_manifest() -> Manifest {
     Manifest {
-        manifest_version: 3,
+        manifest_version: 4,
         dataset_version: DatasetVersion("ds-v1".into()),
         embedding_version: EmbeddingVersion("emb-v1".into()),
         index_version: IndexVersion("idx-v1".into()),
@@ -113,6 +113,7 @@ fn sample_manifest() -> Manifest {
             vector_count: 5,
             fingerprint: "abc123".into(),
             centroid: vec![0.1, 0.2, 0.3, 0.4],
+            routing: None,
         }],
         build_metadata: BuildMetadata {
             built_at: Utc::now(),

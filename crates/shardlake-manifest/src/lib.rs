@@ -29,6 +29,34 @@ pub enum ManifestError {
 
 pub type Result<T> = std::result::Result<T, ManifestError>;
 
+/// Routing metadata for partition-aware query routing (manifest v4+).
+///
+/// Persisted in each [`ShardDef`] so that the serving path can route queries
+/// to the correct shard without loading any shard body.  `None` in manifests
+/// produced by older builders (manifest_version ≤ 3); callers should fall
+/// back to deriving routing information from [`ShardDef::artifact_key`] and
+/// [`ShardDef::centroid`] in that case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingMetadata {
+    /// Stable identifier for this shard's centroid, used as a routing key.
+    ///
+    /// Populated by the builder as `"shard-NNNN"` (zero-padded 4-digit shard
+    /// number), matching the shard artifact filename.
+    pub centroid_id: String,
+    /// ANN index algorithm within this shard (e.g. `"flat"`).
+    ///
+    /// Consumed by the serving path to select the correct search method when
+    /// loading this shard.  Always `"flat"` (linear scan) in the current
+    /// prototype.
+    pub index_type: String,
+    /// Canonical location to load this shard when routing a query.
+    ///
+    /// Equals [`ShardDef::artifact_key`] for local storage backends.
+    /// Stored separately so that multi-storage deployments can record a
+    /// resolved URL or filesystem path without changing the opaque storage key.
+    pub file_location: String,
+}
+
 /// Describes one shard artifact inside the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardDef {
@@ -51,6 +79,12 @@ pub struct ShardDef {
     /// routing in that case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub centroid: Vec<f32>,
+    /// Routing metadata for partition-aware query routing (manifest v4+).
+    ///
+    /// `None` when loading a legacy manifest (manifest_version ≤ 3) that
+    /// predates the routing metadata schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingMetadata>,
 }
 
 /// Identifies the indexing algorithm used to build the index (manifest v3+).
@@ -231,8 +265,8 @@ impl Manifest {
     /// the stored wire format stays internally consistent.
     fn normalised_for_save(&self) -> Self {
         let mut manifest = self.clone();
-        if manifest.manifest_version < 3 {
-            manifest.manifest_version = 3;
+        if manifest.manifest_version < 4 {
+            manifest.manifest_version = 4;
         }
         manifest
     }
@@ -267,7 +301,11 @@ impl Manifest {
 
     /// Validate internal consistency.
     pub fn validate(&self) -> Result<()> {
-        if self.manifest_version != 1 && self.manifest_version != 2 && self.manifest_version != 3 {
+        if self.manifest_version != 1
+            && self.manifest_version != 2
+            && self.manifest_version != 3
+            && self.manifest_version != 4
+        {
             return Err(ManifestError::Validation(format!(
                 "unsupported manifest_version {}",
                 self.manifest_version
@@ -388,6 +426,29 @@ impl Manifest {
                 return Err(ManifestError::Validation(
                     "recall_estimate.recall_at_k must be finite and within [0, 1]".into(),
                 ));
+            }
+        }
+
+        for shard in &self.shards {
+            if let Some(routing) = &shard.routing {
+                if routing.centroid_id.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.centroid_id must not be empty",
+                        shard.shard_id
+                    )));
+                }
+                if routing.index_type.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.index_type must not be empty",
+                        shard.shard_id
+                    )));
+                }
+                if routing.file_location.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.file_location must not be empty",
+                        shard.shard_id
+                    )));
+                }
             }
         }
 

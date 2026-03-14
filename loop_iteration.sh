@@ -25,7 +25,7 @@ extract_marker() {
   local marker="$1"
   local file="$2"
 
-  awk -v key="$marker" '
+  LC_ALL=C LANG=C awk -v key="$marker" '
     function trim(value) {
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+$/, "", value)
@@ -90,10 +90,126 @@ normalize_bool() {
   fi
 }
 
+write_iteration_json() {
+  local iteration="$1"
+  local timestamp="$2"
+  local log_file="$3"
+  local json_file="$4"
+
+  python3 - "$iteration" "$timestamp" "$log_file" "$json_file" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def slugify(value: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def parse_named_lines(body: str) -> dict[str, str]:
+  parsed: dict[str, str] = {}
+  for raw_line in body.splitlines():
+    line = raw_line.strip()
+    if not line or ":" not in line:
+      continue
+    name, value = line.split(":", 1)
+    parsed[slugify(name)] = value.strip()
+  return parsed
+
+
+iteration = int(sys.argv[1])
+timestamp = sys.argv[2]
+log_path = Path(sys.argv[3])
+json_path = Path(sys.argv[4])
+
+log_text = log_path.read_bytes().decode("utf-8", errors="replace")
+
+report_start_matches = list(
+  re.finditer(r"(?m)^1\. Ready-to-implement triage summary\s*$", log_text)
+)
+report_text = log_text[report_start_matches[-1].start():].strip() if report_start_matches else ""
+
+section_titles = {
+  "Ready-to-implement triage summary": "ready_to_implement_triage_summary",
+  "Copilot assignment summary": "copilot_assignment_summary",
+  "Draft PR triage summary": "draft_pr_triage_summary",
+  "Open PR triage summary": "open_pr_triage_summary",
+  "Draft PR review summary": "draft_pr_review_summary",
+  "Open PR review summary": "open_pr_review_summary",
+  "Merge summary": "merge_summary",
+  "Carry-forward state": "carry_forward_state",
+  "Loop control": "loop_control",
+  "Machine-readable control block": "machine_readable_control_block",
+}
+
+section_matches = list(
+  re.finditer(r"(?m)^(?P<number>10|[1-9])\. (?P<title>[^\n]+)\s*$", report_text)
+)
+
+sections: dict[str, dict[str, str]] = {}
+for index, match in enumerate(section_matches):
+  title = match.group("title").strip()
+  key = section_titles.get(title, slugify(title))
+  body_start = match.end()
+  body_end = section_matches[index + 1].start() if index + 1 < len(section_matches) else len(report_text)
+  body = report_text[body_start:body_end].strip()
+  sections[key] = {
+    "title": title,
+    "body": body,
+  }
+
+control_match = re.search(
+  r"(?ms)^BEGIN_LOOP_CONTROL\s*\n"
+  r"PRS_PROCESSED:\s*(?P<prs_processed>\d+)\s*\n"
+  r"ALL_WAITING_ON_OTHER_AGENTS:\s*(?P<all_waiting_on_other_agents>[^\n]+)\n"
+  r"SLEEP_NEXT_ITERATION:\s*(?P<sleep_next_iteration>[^\n]+)\n"
+  r"END_LOOP_CONTROL\s*$",
+  report_text,
+)
+
+control = {
+  "prs_processed": None,
+  "all_waiting_on_other_agents": None,
+  "sleep_next_iteration": None,
+}
+if control_match:
+  control = {
+    "prs_processed": int(control_match.group("prs_processed")),
+    "all_waiting_on_other_agents": control_match.group("all_waiting_on_other_agents").strip(),
+    "sleep_next_iteration": control_match.group("sleep_next_iteration").strip(),
+  }
+
+carry_forward = {}
+if "carry_forward_state" in sections:
+  carry_forward = parse_named_lines(sections["carry_forward_state"]["body"])
+
+loop_control_summary = {}
+if "loop_control" in sections:
+  loop_control_summary = parse_named_lines(sections["loop_control"]["body"])
+
+payload = {
+  "json_version": 1,
+  "iteration": iteration,
+  "timestamp_utc": timestamp,
+  "log_file": str(log_path),
+  "report_found": bool(report_text),
+  "report_text": report_text,
+  "sections": sections,
+  "carry_forward": carry_forward,
+  "loop_control_summary": loop_control_summary,
+  "control": control,
+}
+
+json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 require_command "$COPILOT_BIN"
 require_command tee
 require_command awk
 require_command sleep
+require_command python3
 
 mkdir -p "$LOG_DIR"
 
@@ -106,6 +222,7 @@ export CLICOLOR="$CLICOLOR_VALUE"
 for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log_file="$LOG_DIR/iteration_${iteration}_${timestamp}.log"
+  json_file="$LOG_DIR/iteration_${iteration}_${timestamp}.json"
 
   echo "[loop_iteration] starting iteration ${iteration}/${MAX_ITERATIONS}"
   echo "[loop_iteration] log: $log_file"
@@ -143,7 +260,10 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
     sleep_next="yes"
   fi
 
+  write_iteration_json "$iteration" "$timestamp" "$log_file" "$json_file"
+
   echo "[loop_iteration] prs_processed=$prs_processed waiting_on_other_agents=$waiting sleep_next=$sleep_next"
+  echo "[loop_iteration] json: $json_file"
 
   if [[ $iteration -lt MAX_ITERATIONS && "$sleep_next" == "yes" ]]; then
     echo "[loop_iteration] sleeping for $WAIT_SECONDS seconds before next iteration"
