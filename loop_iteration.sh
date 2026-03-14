@@ -22,7 +22,28 @@ extract_marker() {
   local marker="$1"
   local file="$2"
 
-  awk -F': *' -v key="$marker" '$1 == key { value = $2 } END { print value }' "$file"
+  awk -v key="$marker" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    {
+      line = trim($0)
+      gsub(/\r/, "", line)
+      gsub(/^[`*]+/, "", line)
+      gsub(/[`*]+$/, "", line)
+
+      if (index(line, key ":") == 1) {
+        value = trim(substr(line, length(key) + 2))
+        gsub(/^[`*]+/, "", value)
+        gsub(/[`*]+$/, "", value)
+      }
+    }
+
+    END { print value }
+  ' "$file"
 }
 
 normalize_bool() {
