@@ -5,11 +5,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 PROMPT_PATH=".github/prompts/loop_iteration.prompt.md"
+CONTROL_PROMPT_PATH=".github/prompts/loop_control.prompt.md"
 COPILOT_BIN="${COPILOT_BIN:-copilot}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
 LOG_DIR="$REPO_ROOT/tmp/loop_iterations"
-PROMPT_TEXT="follow instructions in ${PROMPT_PATH}"
 GH_PAGER_VALUE="${GH_PAGER:-cat}"
 NO_COLOR_VALUE="${NO_COLOR:-1}"
 CLICOLOR_VALUE="${CLICOLOR:-0}"
@@ -90,6 +90,18 @@ normalize_bool() {
   fi
 }
 
+run_prompt() {
+  local prompt_text="$1"
+  local output_file="$2"
+
+  set +e
+  "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "$prompt_text" | tee "$output_file"
+  local command_status=${PIPESTATUS[0]}
+  set -e
+
+  return "$command_status"
+}
+
 require_command "$COPILOT_BIN"
 require_command tee
 require_command awk
@@ -106,26 +118,43 @@ export CLICOLOR="$CLICOLOR_VALUE"
 for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log_file="$LOG_DIR/iteration_${iteration}_${timestamp}.log"
+  control_file="$LOG_DIR/iteration_${iteration}_${timestamp}.control.log"
 
   echo "[loop_iteration] starting iteration ${iteration}/${MAX_ITERATIONS}"
   echo "[loop_iteration] log: $log_file"
 
-  set +e
-  "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "$PROMPT_TEXT" | tee "$log_file"
-  command_status=${PIPESTATUS[0]}
-  set -e
+  if ! run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file"; then
+    command_status=$?
+  else
+    command_status=0
+  fi
 
   if [[ $command_status -ne 0 ]]; then
     echo "[loop_iteration] copilot command failed with status $command_status" >&2
     exit "$command_status"
   fi
 
-  prs_processed_raw="$(extract_marker "PRS_PROCESSED" "$log_file")"
-  waiting_raw="$(extract_marker "ALL_WAITING_ON_OTHER_AGENTS" "$log_file")"
-  sleep_next_raw="$(extract_marker "SLEEP_NEXT_ITERATION" "$log_file")"
+  echo "[loop_iteration] synthesizing loop control from $log_file"
+
+  if ! run_prompt "follow instructions in ${CONTROL_PROMPT_PATH} for log file ${log_file}" "$control_file"; then
+    command_status=$?
+  else
+    command_status=0
+  fi
+
+  if [[ $command_status -ne 0 ]]; then
+    echo "[loop_iteration] loop control synthesis failed with status $command_status" >&2
+    exit "$command_status"
+  fi
+
+  cat "$control_file" >> "$log_file"
+
+  prs_processed_raw="$(extract_marker "PRS_PROCESSED" "$control_file")"
+  waiting_raw="$(extract_marker "ALL_WAITING_ON_OTHER_AGENTS" "$control_file")"
+  sleep_next_raw="$(extract_marker "SLEEP_NEXT_ITERATION" "$control_file")"
 
   if [[ -z "$prs_processed_raw" || -z "$waiting_raw" || -z "$sleep_next_raw" ]]; then
-    echo "[loop_iteration] missing control markers in $log_file" >&2
+    echo "[loop_iteration] missing control markers in $control_file" >&2
     echo "[loop_iteration] expected BEGIN_LOOP_CONTROL/END_LOOP_CONTROL with PRS_PROCESSED, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
     exit 1
   fi

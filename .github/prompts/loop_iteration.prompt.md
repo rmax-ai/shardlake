@@ -41,7 +41,7 @@ Deterministic operating rules:
 4. Handle at most one draft PR review, one open PR review, and one merge candidate per iteration.
 5. Never mark a PR ready or merge it while blocking checks or unresolved blocking feedback remain.
 6. If eligibility is ambiguous, do not advance the item this iteration.
-7. The final report must end with one plain-text control block exactly matching the required format below.
+7. The shell driver synthesizes the machine-readable control block separately after this report; do not emit a second standalone control block here.
 
 Stage order:
 
@@ -87,16 +87,6 @@ Required final report:
    - PRs processed: `<number>`
    - all waiting on other agents: `yes` or `no`
    - sleep next iteration: `yes` if and only if `PRs processed` is `0` and `all waiting on other agents` is `yes`; otherwise `no`
-10. Machine-readable control block
-   - emit this block as the final lines of output with no bullets, backticks, or markdown decoration:
-
-```text
-BEGIN_LOOP_CONTROL
-PRS_PROCESSED: <number>
-ALL_WAITING_ON_OTHER_AGENTS: <yes|no>
-SLEEP_NEXT_ITERATION: <yes|no>
-END_LOOP_CONTROL
-```
 
 Completion condition:
 
