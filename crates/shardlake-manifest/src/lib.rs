@@ -197,6 +197,13 @@ pub struct Manifest {
     /// `None` when not computed (e.g. prototype builds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_estimate: Option<RecallEstimate>,
+    /// Storage key of the IVF coarse-quantizer artifact (`coarse_quantizer.cq`).
+    ///
+    /// Present for indexes built with algorithm `"ivf-flat"`.  `None` for
+    /// older `"kmeans-flat"` indexes that pre-date IVF coarse-quantizer
+    /// persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse_quantizer_key: Option<String>,
 }
 
 impl Manifest {

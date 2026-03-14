@@ -12,17 +12,18 @@
 //! <storage-root>/
 //! ├── datasets/
 //! │   └── <dataset-version>/
-//! │       ├── vectors.jsonl      ← dataset_vectors_key
-//! │       ├── metadata.json      ← dataset_metadata_key
-//! │       └── info.json          ← dataset_info_key
+//! │       ├── vectors.jsonl           ← dataset_vectors_key
+//! │       ├── metadata.json           ← dataset_metadata_key
+//! │       └── info.json               ← dataset_info_key
 //! ├── indexes/
 //! │   └── <index-version>/
-//! │       ├── manifest.json      ← index_manifest_key
+//! │       ├── manifest.json           ← index_manifest_key
+//! │       ├── coarse_quantizer.cq     ← index_coarse_quantizer_key
 //! │       └── shards/
-//! │           ├── shard-0000.sidx  ← index_shard_key(…, 0)
-//! │           └── shard-0001.sidx  ← index_shard_key(…, 1)
+//! │           ├── shard-0000.sidx     ← index_shard_key(…, 0)
+//! │           └── shard-0001.sidx     ← index_shard_key(…, 1)
 //! └── aliases/
-//!     └── <alias-name>.json      ← alias_key
+//!     └── <alias-name>.json           ← alias_key
 //! ```
 
 /// Storage key for a dataset's re-serialised vector JSONL file.
@@ -58,6 +59,16 @@ pub fn indexes_prefix() -> &'static str {
 /// naturally (`shard-10000.sidx`) without truncation.
 pub fn index_shard_key(index_version: &str, shard_number: u32) -> String {
     format!("indexes/{index_version}/shards/shard-{shard_number:04}.sidx")
+}
+
+/// Storage key for the IVF coarse-quantizer artifact of a given index version.
+///
+/// The `.cq` file stores the trained centroids that constitute the IVF coarse
+/// quantizer.  It is written alongside `manifest.json` during `build-index`
+/// and is used at query time to route vectors to the nearest cluster shards
+/// without loading any `.sidx` file.
+pub fn index_coarse_quantizer_key(index_version: &str) -> String {
+    format!("indexes/{index_version}/coarse_quantizer.cq")
 }
 
 /// Storage key for an alias pointer JSON file.

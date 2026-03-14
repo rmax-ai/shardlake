@@ -64,6 +64,7 @@ fn sample_manifest() -> Manifest {
         }),
         compression: CompressionConfig::default(),
         recall_estimate: None,
+        coarse_quantizer_key: None,
     }
 }
 
