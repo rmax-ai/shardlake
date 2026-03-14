@@ -10,6 +10,9 @@ MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
 LOG_DIR="$REPO_ROOT/tmp/loop_iterations"
 PROMPT_TEXT="follow instructions in ${PROMPT_PATH}"
+GH_PAGER_VALUE="${GH_PAGER:-cat}"
+NO_COLOR_VALUE="${NO_COLOR:-1}"
+CLICOLOR_VALUE="${CLICOLOR:-0}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -29,20 +32,51 @@ extract_marker() {
       return value
     }
 
+    BEGIN {
+      in_block = 0
+      block_seen = 0
+      value = ""
+      legacy_value = ""
+    }
+
     {
       line = trim($0)
       gsub(/\r/, "", line)
+      gsub(/^[[:space:]]*[-*]?[[:space:]]*/, "", line)
       gsub(/^[`*]+/, "", line)
       gsub(/[`*]+$/, "", line)
 
+      if (line == "BEGIN_LOOP_CONTROL") {
+        in_block = 1
+        block_seen = 1
+        next
+      }
+
+      if (line == "END_LOOP_CONTROL") {
+        in_block = 0
+        next
+      }
+
       if (index(line, key ":") == 1) {
-        value = trim(substr(line, length(key) + 2))
-        gsub(/^[`*]+/, "", value)
-        gsub(/[`*]+$/, "", value)
+        parsed_value = trim(substr(line, length(key) + 2))
+        gsub(/^[`*]+/, "", parsed_value)
+        gsub(/[`*]+$/, "", parsed_value)
+
+        if (in_block) {
+          value = parsed_value
+        } else if (legacy_value == "") {
+          legacy_value = parsed_value
+        }
       }
     }
 
-    END { print value }
+    END {
+      if (value != "") {
+        print value
+      } else if (!block_seen && legacy_value != "") {
+        print legacy_value
+      }
+    }
   ' "$file"
 }
 
@@ -64,6 +98,10 @@ require_command sleep
 mkdir -p "$LOG_DIR"
 
 cd "$REPO_ROOT"
+
+export GH_PAGER="$GH_PAGER_VALUE"
+export NO_COLOR="$NO_COLOR_VALUE"
+export CLICOLOR="$CLICOLOR_VALUE"
 
 for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -88,7 +126,7 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
 
   if [[ -z "$prs_processed_raw" || -z "$waiting_raw" || -z "$sleep_next_raw" ]]; then
     echo "[loop_iteration] missing control markers in $log_file" >&2
-    echo "[loop_iteration] expected PRS_PROCESSED, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
+    echo "[loop_iteration] expected BEGIN_LOOP_CONTROL/END_LOOP_CONTROL with PRS_PROCESSED, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
     exit 1
   fi
 

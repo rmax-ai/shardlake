@@ -6,6 +6,14 @@ Primary goal: run one autonomous workflow iteration that advances issues and pul
 
 This prompt is the orchestrator. It should call the stage-specific prompts in order, collect their outputs, and produce one combined report.
 
+Execution constraints:
+
+- Export `GH_PAGER=cat`, `NO_COLOR=1`, and `CLICOLOR=0` before any `gh` command.
+- Do not inspect `gh --help`, GraphQL schema metadata, or unrelated prompts during normal loop execution.
+- Load a stage-specific prompt only when the workflow reaches that stage.
+- When a stage gathers GitHub state, fetch one machine-readable snapshot first and derive that stage's counts and report from it unless a write operation requires a refresh.
+- If a stage is not eligible to act, summarize the skip reason from the available snapshot instead of collecting deeper metadata.
+
 Required repository context:
 
 Before doing any write operation, consult:
@@ -33,6 +41,7 @@ Deterministic operating rules:
 4. Handle at most one draft PR review, one open PR review, and one merge candidate per iteration.
 5. Never mark a PR ready or merge it while blocking checks or unresolved blocking feedback remain.
 6. If eligibility is ambiguous, do not advance the item this iteration.
+7. The final report must end with one plain-text control block exactly matching the required format below.
 
 Stage order:
 
@@ -78,9 +87,15 @@ Required final report:
    - all waiting on other agents: `yes` or `no`
    - sleep next iteration: `yes` if and only if `PRs processed` is `0` and `all waiting on other agents` is `yes`; otherwise `no`
 10. Machine-readable control block
-   - `PRS_PROCESSED: <number>`
-   - `ALL_WAITING_ON_OTHER_AGENTS: <yes|no>`
-   - `SLEEP_NEXT_ITERATION: <yes|no>` using the same rule as above
+   - emit this block as the final lines of output with no bullets, backticks, or markdown decoration:
+
+```text
+BEGIN_LOOP_CONTROL
+PRS_PROCESSED: <number>
+ALL_WAITING_ON_OTHER_AGENTS: <yes|no>
+SLEEP_NEXT_ITERATION: <yes|no>
+END_LOOP_CONTROL
+```
 
 Completion condition:
 
