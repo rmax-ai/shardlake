@@ -97,6 +97,29 @@ This creates `./data/aliases/latest.json` pointing to `idx-v1`. The server reads
 alias at startup; updating it to a new version is how you roll out index upgrades without
 restarting with a hard-coded version string.
 
+### 3a. (Optional) Validate manifests
+
+After building and before serving, you can verify that the on-disk artifacts are
+consistent with the manifests.  This is useful in CI or after copying data between
+storage locations:
+
+```bash
+./target/release/shardlake validate-manifest \
+  --index-version idx-v1 \
+  --dataset-version ds-v1
+```
+
+A successful run prints:
+
+```
+index manifest 'idx-v1': OK
+dataset manifest 'ds-v1': OK
+```
+
+The command exits non-zero and prints details to stderr if any artifact is missing or
+has a mismatched fingerprint.  See [`shardlake validate-manifest`](cli-reference.md#shardlake-validate-manifest)
+in the CLI reference for the full list of checks.
+
 ### 4. Serve
 
 ```bash
