@@ -168,6 +168,7 @@ mod tests {
             kmeans_iters: 2,
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
         };
         let records = vec![VectorRecord {
             id: VectorId(1),
