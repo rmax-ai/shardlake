@@ -267,6 +267,11 @@ pub fn evaluate_partitioning(
     let mut routing_correct = 0usize;
     let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
     let mut probe_counts = vec![0usize; num_shards];
+    let fan_out_policy = FanOutPolicy {
+        candidate_centroids: nprobe as u32,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
 
     for query in queries {
         // Exact top-k ground truth for recall@k.
@@ -276,12 +281,12 @@ pub fn evaluate_partitioning(
         // Approximate search for recall impact. This works for both modern and
         // legacy manifests because `IndexSearcher` falls back to loading shard
         // centroids from artifact bytes when the manifest does not embed them.
-        let approx = searcher.search(&query.data, k, nprobe).map_err(|source| {
-            PartitioningError::ApproximateSearch {
+        let approx = searcher
+            .search(&query.data, k, &fan_out_policy)
+            .map_err(|source| PartitioningError::ApproximateSearch {
                 query_id: query.id.0,
                 source,
-            }
-        })?;
+            })?;
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
         recalls.push(recall_at_k(&gt_ids, &approx_ids));
 
