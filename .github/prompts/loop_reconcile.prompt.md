@@ -106,7 +106,7 @@ Required final report:
    - `conflict-resolve queue: <ordered PR list or none>`
 6. Carry-forward state
    - draft PRs still waiting on agent completion
-   - open PRs waiting on Copilot or Codex review comments
+   - open PRs still awaiting an initial Copilot or Codex review (no review comment posted yet)
    - PRs needing reviewer discussion or manual decisions
    - merge candidates blocked by checks, conflicts, or policy
 7. Scheduler guidance
