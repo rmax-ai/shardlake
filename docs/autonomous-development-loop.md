@@ -88,8 +88,8 @@ Current labels defined by the orchestrator:
 | `ready-for-draft-check` | A draft PR appears ready for a readiness review |
 | `ready-for-open-review` | An open non-draft PR is ready for review handling |
 | `ready-to-merge` | An open PR has completed review handling and is ready for a final merge pass |
-| `has-merge-conflicts` | The PR currently has merge conflicts and should not be advanced until the conflicts are resolved |
-| `needs-human` | An issue or PR is blocked on a needed human decision or manual intervention and must not be advanced automatically |
+| `has-merge-conflicts` | The PR currently has merge conflicts, is blocked from review or merge lanes, and remains eligible for bounded automated reconciliation unless it also carries `needs-human` |
+| `needs-human` | An issue or PR is blocked on a needed human decision or manual intervention, is terminally escalated for automation, and must not be advanced automatically |
 
 This gives operators a visible state machine in GitHub instead of hidden in local process memory.
 
@@ -196,10 +196,11 @@ The repository now has a prompt split for concurrent local execution without Git
 - assigns currently ready issues and transitions them to `implementation-in-progress`
 - reconciles draft-PR labels
 - reconciles open-PR labels
-- publishes the draft-review, open-review, and merge queues
+- publishes the draft-review, open-review, merge, and conflict-resolve queues
 - emits scheduler guidance for an external local scheduler
 
 The reconciler must not claim a PR or issue, must not check out PR branches, and must not merge.
+Its conflict contract is narrower than the old human-only flow: ensure `has-merge-conflicts` is present when GitHub reports a real conflict, remove conflicted PRs from `ready-for-open-review` and `ready-to-merge`, publish whether conflict-resolution work exists, and preserve `needs-human` only when a previous worker already escalated or the repository state proves the PR is not safely automatable.
 
 ### Worker prompts
 
@@ -208,10 +209,11 @@ The concurrent worker prompts are:
 - `.github/prompts/worker-review-draft-pr.prompt.md`
 - `.github/prompts/worker-review-open-pr.prompt.md`
 - `.github/prompts/worker-merge-pr.prompt.md`
+- `.github/prompts/worker-conflict-resolve-pr.prompt.md`
 
 The checked-in worker launcher is `loop_worker.sh`. It resolves the next eligible PR for a single lane with `gh`, acquires a lease, revalidates the claimed PR's current state and head SHA with `gh`, runs the matching worker prompt with explicit inputs, and then releases the lease.
 
-The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles. When started with `--skip-reconcile`, it bypasses that reconcile pass and dispatches the worker lanes directly on every cycle instead.
+The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane, and finally runs the `conflict-resolve` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles. When started with `--skip-reconcile`, it bypasses that reconcile pass and dispatches the worker lanes directly on every cycle instead.
 
 Each worker prompt assumes a target item has already been claimed. It must:
 
@@ -220,6 +222,8 @@ Each worker prompt assumes a target item has already been claimed. It must:
 - revalidate label, state, and head SHA after claim
 - use a dedicated PR worktree
 - stop cleanly if the lease is missing, expired, or no longer owned by that worker
+
+The `conflict-resolve` lane is deliberately single-lane like `merge`. It is the bounded recovery path for PRs labeled `has-merge-conflicts` but not `needs-human`. Its worker operates in a dedicated PR worktree, attempts a conservative local merge of the current base branch into the PR branch, gathers PR intent plus base-side intent plus exact conflict hunks plus repository validation commands before proposing edits, and lets the repository harness decide viability. On success, it pushes normally, renews the lease with the new head SHA, removes `has-merge-conflicts`, and exits. On failure, ambiguity, or repeated failure for the same PR-head/base pair, it adds `needs-human`, leaves a concise PR comment, and exits.
 
 The checked-in lease helper is `tools/loop_claim.sh`. It uses one remote ref per claimed PR lane at `refs/heads/loop-claims/<lane>/pr-<number>`. The tip commit of that ref contains a `lease.json` payload with owner id, lane, target PR number, expected head SHA, and UTC acquisition and expiry timestamps.
 
@@ -232,6 +236,36 @@ Protocol rules:
 - acquire and renew are compare-and-swap updates because they only succeed when the observed ref tip is still current at push time
 
 When a worker pushes a commit to the claimed PR branch, it must immediately refresh the PR head SHA from GitHub with an exact `headRefOid` read, verify that SHA matches `git rev-parse HEAD` in the dedicated PR worktree, and renew the lease with that same SHA before any later durable GitHub write such as labels, comments, PR state changes, or merge attempts.
+
+### Conflict-resolution stage
+
+After the merge lane, the concurrent loop may run one `conflict-resolve` worker. This worker receives four required inputs before it proposes any resolution:
+
+- current PR description and linked issue context
+- base-side intent summary, preferably from an identifiable merged PR and otherwise from the current base commit range summary
+- exact conflict hunks or conflicting diff produced by the attempted merge
+- local repository context plus the trusted validation commands
+
+The first implementation is intentionally conservative:
+
+- start from the PR branch in the dedicated PR worktree
+- fetch the current PR branch and current base branch
+- attempt to merge the current base branch into the PR branch locally
+- let the worker edit files only when Git leaves conflicts
+- never force-push and never merge the PR from this lane
+- stop immediately if the lease is lost or the PR head SHA changes underneath the worker
+
+The worker must not decide whether its proposal is acceptable. The repository harness decides. The minimum viability gate is:
+
+- no conflict markers remain
+- the git working tree is clean after the proposed resolution is committed locally
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes
+- `cargo doc --no-deps` passes
+- the resolved branch still merges cleanly against the current base branch after the fix
+
+If any gate fails, if intent is semantically unclear, or if the same pair of PR head SHA and base SHA already failed once before, the worker must escalate to `needs-human` instead of retrying in a loop. The retry record should be stored in a concise PR comment marker so later runs can inspect the exact failed head/base pair.
 
 ### Control blocks
 
@@ -254,7 +288,7 @@ The concurrent loop now has a thin checked-in shell scheduler in `loop_scheduler
 The loop now uses two separate layers of transient worktrees:
 
 1. an iteration worktree created fresh from `origin/main` for every orchestrator run
-2. per-PR worktrees created under `tmp/pr_worktrees/` for draft review, open review, and merge stages
+2. per-PR worktrees created under `tmp/pr_worktrees/` for draft review, open review, merge, and conflict-resolution stages
 
 This separation means the operator checkout is never the execution context for either the main loop or PR branch operations.
 
@@ -347,7 +381,24 @@ The loop attempts at most one merge candidate per iteration: the lowest-numbered
 
 The merge pass must not advance a PR while blocking checks, unresolved blocking feedback, merge conflicts, or policy blockers remain.
 
-If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. If the conflict or any other blocker requires a human decision or manual intervention, the loop should also add `needs-human` and leave a concise comment on the affected issue or PR describing the decision needed and the next action.
+If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. That label is recoverable state: it should route the PR out of `ready-for-open-review` and `ready-to-merge` and into the bounded `conflict-resolve` lane unless the PR is already labeled `needs-human`.
+
+### 8. Conflict-resolution pass
+
+The loop attempts at most one conflict-resolution candidate per concurrent scheduler cycle: the lowest-numbered open non-draft PR labeled `has-merge-conflicts` and not labeled `needs-human`.
+
+This stage is intended to answer one question: can the current PR branch absorb the current base branch cleanly and still pass the repository harness without human judgment?
+
+Its worker must gather:
+
+- PR-side intent from the PR body, linked issue, and current discussion
+- base-side intent from the merged PR that introduced the conflicting base change when identifiable, or otherwise from the base commit range summary
+- exact conflict hunks from a local merge attempt
+- repository validation commands and current code context from the dedicated PR worktree
+
+If the resulting local resolution passes the harness, the worker may push the resolved branch normally, renew the lease with the new PR head SHA, remove `has-merge-conflicts`, and stop. It must not automatically continue the PR into review or merge during the same run; the next reconcile pass decides that.
+
+If the resolution is ambiguous, fails validation, or already failed once for the same PR-head/base pair, the worker must add `needs-human`, leave a concise PR comment that explains why automation stopped, and stop.
 
 ## Dedicated Worktree Rule
 
@@ -429,7 +480,7 @@ For one bounded scheduler cycle:
 To disable selected lanes during supervised operation:
 
 ```bash
-./loop_scheduler.sh --skip-draft-review --skip-merge
+./loop_scheduler.sh --skip-draft-review --skip-merge --skip-conflict-resolution
 ```
 
 To bypass the reconcile pass and force direct worker dispatch for each cycle:
@@ -480,7 +531,7 @@ At the time of writing:
 - `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
 - `tools/loop_claim.sh` now implements the lease protocol expected by the worker prompts
 - `loop_worker.sh` now implements a lane-aware worker launcher that resolves queue entries, acquires leases, revalidates claimed PRs, and invokes the matching worker prompt with explicit inputs
-- `loop_scheduler.sh` now implements the thin local scheduler that polls via reconcile cycles and dispatches the per-lane workers
+- `loop_scheduler.sh` now implements the thin local scheduler that polls via reconcile cycles and dispatches the per-lane workers, including the single-lane `conflict-resolve` worker after `merge`
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
 
@@ -528,8 +579,8 @@ This is intentional. Silent continuation after malformed control data would make
 
 The loop is not meant to replace all operator judgment. Human intervention is still required when:
 
-- a PR has merge conflicts
-- when merge conflicts are detected, the loop should label the PR `needs-human`
+- a PR has merge conflicts that the bounded conflict-resolution lane already failed to reconcile for the current PR-head/base pair
+- a PR has merge conflicts and the worker cannot determine intent safely from the PR plus repository context
 - a PR needs product or architecture decisions rather than mechanical review
 - GitHub permissions, token scopes, or branch protections block automation
 - prompt files drift out of sync with the orchestrator contract

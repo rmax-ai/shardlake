@@ -51,8 +51,8 @@ Workflow labels:
 - `ready-for-draft-check`: draft PR has completed agent work and can be reviewed for leaving draft
 - `ready-for-open-review`: open non-draft PR has Copilot or Codex review comments ready for handling
 - `ready-to-merge`: open PR has completed review handling and is ready for a final merge pass
-- `has-merge-conflicts`: PR currently has merge conflicts and should not be advanced until resolved
-- `needs-human`: issue or PR is blocked on a needed human decision or manual intervention and must not be advanced automatically
+- `has-merge-conflicts`: PR currently has merge conflicts, is blocked from review and merge progression, and is recoverable unless it also carries `needs-human`
+- `needs-human`: issue or PR is blocked on a needed human decision or manual intervention, is terminally escalated for automation, and must not be advanced automatically
 
 Deterministic operating rules:
 
@@ -61,7 +61,7 @@ Deterministic operating rules:
 3. Each stage prompt has exactly one goal. Do not merge stage responsibilities.
 4. Handle at most one draft PR review, one open PR review, and one merge candidate per iteration.
 5. Never mark a PR ready or merge it while blocking checks or unresolved blocking feedback remain.
-6. If any stage detects that a PR has merge conflicts, add the `has-merge-conflicts` label to that PR, add `needs-human` when human resolution or judgment is required, leave a concise PR comment describing the blocker, and do not advance it automatically this iteration.
+6. If any stage detects that a PR has merge conflicts, add the `has-merge-conflicts` label to that PR, add `needs-human` only when human resolution or judgment is clearly required or already proven by prior failed automation, leave a concise PR comment describing the blocker, and do not advance it automatically this iteration.
 7. If eligibility is ambiguous, do not advance the item this iteration.
 8. Apply the workflow actor guard rail before assigning, labeling, reviewing, or merging any issue or PR.
 9. For draft PR triage, the only positive readiness signal is `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; do not substitute weaker heuristics such as “no visible pending state” or “same pattern as another draft.”
@@ -93,7 +93,8 @@ Execution guidance:
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full iteration report, invoke a subagent that follows `.github/prompts/loop_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
-- If a merge-conflicted PR needs `has-merge-conflicts` or `needs-human`, ensure those labels exist before adding them.
+- If a merge-conflicted PR needs `has-merge-conflicts`, ensure that label exists before adding it.
+- Add `needs-human` for a merge-conflicted PR only when the conflict is clearly non-automatable, a prior bounded conflict-resolution attempt already failed for the current head/base pair, or another required human decision blocks safe automation.
 - If a stage determines that an issue or PR is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the relevant issue or PR, and leave a concise evidence-based comment describing the decision needed and the minimum next action.
 - Treat the repository's primary checkout as read-only operational state on `main`: it may be fetched for updated refs, but it must not be used for the iteration run itself or for PR branch commands.
 - Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout or the iteration worktree.

@@ -10,20 +10,21 @@ WAIT_SECONDS="${WAIT_SECONDS:-300}"
 RUN_DRAFT_REVIEW="${RUN_DRAFT_REVIEW:-yes}"
 RUN_OPEN_REVIEW="${RUN_OPEN_REVIEW:-yes}"
 RUN_MERGE="${RUN_MERGE:-yes}"
+RUN_CONFLICT_RESOLUTION="${RUN_CONFLICT_RESOLUTION:-yes}"
 RUN_RECONCILE="${RUN_RECONCILE:-yes}"
 COPILOT_BIN="${COPILOT_BIN:-copilot}"
 LOG_DIR="${LOOP_SCHEDULER_LOG_DIR:-$REPO_ROOT/tmp/loop_scheduler}"
 
 usage() {
   cat >&2 <<'EOF'
-usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--skip-reconcile] [--skip-draft-review] [--skip-open-review] [--skip-merge]
+usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--skip-reconcile] [--skip-draft-review] [--skip-open-review] [--skip-merge] [--skip-conflict-resolution]
 
 Runs the concurrent local loop as:
   1. one reconcile pass unless --skip-reconcile is set
   2. zero or more worker lanes
   3. optional sleep and repeat
 
-Draft-review and open-review lanes may run concurrently. Merge remains single-lane.
+Draft-review and open-review lanes may run concurrently. Merge and conflict-resolve remain single-lane.
 EOF
   exit 64
 }
@@ -78,12 +79,58 @@ else:
 PY
 }
 
+queue_has_work() {
+  local file_path="$1"
+  local queue_name="$2"
+
+  python3 - "$file_path" "$queue_name" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+queue_name = sys.argv[2]
+body = (((payload.get("sections") or {}).get("worker_queues") or {}).get("body") or "")
+pattern = re.compile(rf"^\s*(?:[-*]\s*)?{re.escape(queue_name)} queue:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+match = pattern.search(body)
+
+if not match:
+    print("unknown")
+    raise SystemExit(0)
+
+value = match.group(1).strip().lower()
+if value in {"", "none", "(none)", "[]", "empty", "no", "no claimable prs", "no claimable pr"}:
+    print("no")
+else:
+    print("yes")
+PY
+}
+
+normalize_queue_flag() {
+  local value="$1"
+  local fallback="$2"
+
+  case "$value" in
+    yes|no)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s\n' "$fallback"
+      ;;
+  esac
+}
+
 skip_reconcile_cycle() {
   local cycle="$1"
 
   CLAIMABLE_WORK_EXISTS="yes"
   ALL_WAITING_ON_OTHER_AGENTS="no"
   SLEEP_NEXT_ITERATION="yes"
+  DRAFT_REVIEW_QUEUE_EXISTS="yes"
+  OPEN_REVIEW_QUEUE_EXISTS="yes"
+  MERGE_QUEUE_EXISTS="yes"
+  CONFLICT_RESOLVE_QUEUE_EXISTS="yes"
 
   echo "[loop_scheduler] skipping reconcile cycle ${cycle}/${MAX_CYCLES}; dispatching workers directly"
 }
@@ -119,8 +166,21 @@ run_reconcile_cycle() {
   ALL_WAITING_ON_OTHER_AGENTS="$(normalize_bool "$(json_field "$json_file" control.all_waiting_on_other_agents)")"
   SLEEP_NEXT_ITERATION="$(normalize_bool "$(json_field "$json_file" control.sleep_next_iteration)")"
 
+  if [[ "$CLAIMABLE_WORK_EXISTS" == "yes" ]]; then
+    DRAFT_REVIEW_QUEUE_EXISTS="$(normalize_queue_flag "$(queue_has_work "$json_file" draft-review)" yes)"
+    OPEN_REVIEW_QUEUE_EXISTS="$(normalize_queue_flag "$(queue_has_work "$json_file" open-review)" yes)"
+    MERGE_QUEUE_EXISTS="$(normalize_queue_flag "$(queue_has_work "$json_file" merge)" yes)"
+    CONFLICT_RESOLVE_QUEUE_EXISTS="$(normalize_queue_flag "$(queue_has_work "$json_file" conflict-resolve)" yes)"
+  else
+    DRAFT_REVIEW_QUEUE_EXISTS="no"
+    OPEN_REVIEW_QUEUE_EXISTS="no"
+    MERGE_QUEUE_EXISTS="no"
+    CONFLICT_RESOLVE_QUEUE_EXISTS="no"
+  fi
+
   echo "[loop_scheduler] reconcile json: $json_file"
   echo "[loop_scheduler] reconcile control: claimable_work_exists=$CLAIMABLE_WORK_EXISTS all_waiting_on_other_agents=$ALL_WAITING_ON_OTHER_AGENTS sleep_next_iteration=$SLEEP_NEXT_ITERATION"
+  echo "[loop_scheduler] queue availability: draft-review=$DRAFT_REVIEW_QUEUE_EXISTS open-review=$OPEN_REVIEW_QUEUE_EXISTS merge=$MERGE_QUEUE_EXISTS conflict-resolve=$CONFLICT_RESOLVE_QUEUE_EXISTS"
 }
 
 launch_worker() {
@@ -163,6 +223,7 @@ dispatch_workers() {
   local open_pid=""
   local open_log=""
   local merge_log=""
+  local conflict_log=""
 
   if [[ "$CLAIMABLE_WORK_EXISTS" != "yes" ]]; then
     echo "[loop_scheduler] skipping worker dispatch because no claimable work exists"
@@ -171,16 +232,20 @@ dispatch_workers() {
 
   mkdir -p "$LOG_DIR"
 
-  if [[ "$RUN_DRAFT_REVIEW" == "yes" ]]; then
+  if [[ "$RUN_DRAFT_REVIEW" == "yes" && "$DRAFT_REVIEW_QUEUE_EXISTS" == "yes" ]]; then
     draft_log="$LOG_DIR/cycle_${cycle}_draft-review.log"
     launch_worker draft-review "$draft_log"
     draft_pid="$LAUNCHED_WORKER_PID"
+  elif [[ "$RUN_DRAFT_REVIEW" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=draft-review because the reconciler reported no queued work"
   fi
 
-  if [[ "$RUN_OPEN_REVIEW" == "yes" ]]; then
+  if [[ "$RUN_OPEN_REVIEW" == "yes" && "$OPEN_REVIEW_QUEUE_EXISTS" == "yes" ]]; then
     open_log="$LOG_DIR/cycle_${cycle}_open-review.log"
     launch_worker open-review "$open_log"
     open_pid="$LAUNCHED_WORKER_PID"
+  elif [[ "$RUN_OPEN_REVIEW" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=open-review because the reconciler reported no queued work"
   fi
 
   if [[ -n "$draft_pid" ]]; then
@@ -191,7 +256,7 @@ dispatch_workers() {
     wait_for_worker open-review "$open_pid" "$open_log"
   fi
 
-  if [[ "$RUN_MERGE" == "yes" ]]; then
+  if [[ "$RUN_MERGE" == "yes" && "$MERGE_QUEUE_EXISTS" == "yes" ]]; then
     local merge_status
 
     merge_log="$LOG_DIR/cycle_${cycle}_merge.log"
@@ -211,6 +276,32 @@ dispatch_workers() {
     fi
 
     echo "[loop_scheduler] worker lane=merge completed successfully"
+  elif [[ "$RUN_MERGE" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=merge because the reconciler reported no queued work"
+  fi
+
+  if [[ "$RUN_CONFLICT_RESOLUTION" == "yes" && "$CONFLICT_RESOLVE_QUEUE_EXISTS" == "yes" ]]; then
+    local conflict_status
+
+    conflict_log="$LOG_DIR/cycle_${cycle}_conflict-resolve.log"
+    echo "[loop_scheduler] launching worker lane=conflict-resolve"
+    set +e
+    (
+      cd "$REPO_ROOT"
+      COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane conflict-resolve
+    ) >"$conflict_log" 2>&1
+    conflict_status=$?
+    set -e
+
+    if [[ "$conflict_status" -ne 0 ]]; then
+      echo "[loop_scheduler] worker lane=conflict-resolve failed with status ${conflict_status}; log=${conflict_log}" >&2
+      sed -n '1,200p' "$conflict_log" >&2 || true
+      exit "$conflict_status"
+    fi
+
+    echo "[loop_scheduler] worker lane=conflict-resolve completed successfully"
+  elif [[ "$RUN_CONFLICT_RESOLUTION" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=conflict-resolve because the reconciler reported no queued work"
   fi
 }
 
@@ -247,6 +338,10 @@ while [[ $# -gt 0 ]]; do
       RUN_MERGE="no"
       shift
       ;;
+    --skip-conflict-resolution)
+      RUN_CONFLICT_RESOLUTION="no"
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -267,9 +362,10 @@ fi
 RUN_DRAFT_REVIEW="$(normalize_bool "$RUN_DRAFT_REVIEW")"
 RUN_OPEN_REVIEW="$(normalize_bool "$RUN_OPEN_REVIEW")"
 RUN_MERGE="$(normalize_bool "$RUN_MERGE")"
+RUN_CONFLICT_RESOLUTION="$(normalize_bool "$RUN_CONFLICT_RESOLUTION")"
 RUN_RECONCILE="$(normalize_bool "$RUN_RECONCILE")"
 
-if [[ "$RUN_RECONCILE" == "yes" || "$RUN_DRAFT_REVIEW" == "yes" || "$RUN_OPEN_REVIEW" == "yes" || "$RUN_MERGE" == "yes" ]]; then
+if [[ "$RUN_RECONCILE" == "yes" || "$RUN_DRAFT_REVIEW" == "yes" || "$RUN_OPEN_REVIEW" == "yes" || "$RUN_MERGE" == "yes" || "$RUN_CONFLICT_RESOLUTION" == "yes" ]]; then
   require_command "$COPILOT_BIN"
   require_command git
   require_command gh
@@ -294,6 +390,7 @@ echo "[loop_scheduler] run_reconcile: $RUN_RECONCILE"
 echo "[loop_scheduler] run_draft_review: $RUN_DRAFT_REVIEW"
 echo "[loop_scheduler] run_open_review: $RUN_OPEN_REVIEW"
 echo "[loop_scheduler] run_merge: $RUN_MERGE"
+echo "[loop_scheduler] run_conflict_resolution: $RUN_CONFLICT_RESOLUTION"
 
 for ((cycle = 1; cycle <= MAX_CYCLES; cycle++)); do
   if [[ "$RUN_RECONCILE" == "yes" ]]; then

@@ -17,7 +17,7 @@ GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-rmax-ai/shardlake}"
 
 usage() {
   cat >&2 <<'EOF'
-usage: loop_worker.sh --lane <draft-review|open-review|merge> [--pr <number>] [--owner <owner-id>] [--ttl-seconds <seconds>]
+usage: loop_worker.sh --lane <draft-review|open-review|merge|conflict-resolve> [--pr <number>] [--owner <owner-id>] [--ttl-seconds <seconds>]
 
 Resolves one queue item for the selected lane with `gh`, acquires a lease with
 `tools/loop_claim.sh`, revalidates the target PR, runs the matching worker prompt,
@@ -144,6 +144,9 @@ prompt_path_for_lane() {
     merge)
       printf '.github/prompts/worker-merge-pr.prompt.md\n'
       ;;
+  conflict-resolve)
+    printf '.github/prompts/worker-conflict-resolve-pr.prompt.md\n'
+    ;;
     *)
       die "unsupported lane: $1"
       ;;
@@ -155,71 +158,75 @@ resolve_candidates() {
   local target_pr="${2:-}"
   local payload_file
 
+  payload_file="$(mktemp)"
   if [[ -n "$target_pr" ]]; then
-    payload_file="$(mktemp)"
-    gh pr view "$target_pr" --repo "$GITHUB_REPOSITORY" --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url >"$payload_file"
-    python3 - "$lane" "$target_pr" "$payload_file" <<'PY'
-import json
-import sys
-
-lane = sys.argv[1]
-target_pr = int(sys.argv[2])
-payload_file = sys.argv[3]
-with open(payload_file, encoding="utf-8") as handle:
-    pr = json.load(handle)
-labels = {label["name"] for label in pr.get("labels", [])}
-
-def eligible(item: dict) -> bool:
-  if "needs-human" in labels or "has-merge-conflicts" in labels:
-    return False
-    if item.get("state") != "OPEN":
-        return False
-    if lane == "draft-review":
-        return item.get("isDraft") and "ready-for-draft-check" in labels
-    if lane == "open-review":
-        return (not item.get("isDraft")) and "ready-for-open-review" in labels and "ready-to-merge" not in labels
-    if lane == "merge":
-        return (not item.get("isDraft")) and "ready-to-merge" in labels
-    raise SystemExit(f"unsupported lane: {lane}")
-
-if pr.get("number") != target_pr:
-    raise SystemExit(f"target PR mismatch: expected {target_pr}, got {pr.get('number')}")
-
-if eligible(pr):
-    print(json.dumps(pr, sort_keys=True))
-PY
-    rm -f "$payload_file"
-    return
+  gh pr view "$target_pr" --repo "$GITHUB_REPOSITORY" --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url >"$payload_file"
+  else
+  gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url >"$payload_file"
   fi
 
-  payload_file="$(mktemp)"
-  gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url >"$payload_file"
-  python3 - "$lane" "$payload_file" <<'PY'
+  python3 - "$lane" "$payload_file" "$target_pr" <<'PY'
 import json
 import sys
 
 lane = sys.argv[1]
 payload_file = sys.argv[2]
+target_pr = int(sys.argv[3]) if sys.argv[3] else None
+allowed_logins = {"copilot-swe-agent", "copilot-swe-agent[bot]", "app/copilot-swe-agent", "rmax"}
+
 with open(payload_file, encoding="utf-8") as handle:
-    prs = json.load(handle)
+  payload = json.load(handle)
+
 
 def eligible(item: dict) -> bool:
-    labels = {label["name"] for label in item.get("labels", [])}
-  if "needs-human" in labels or "has-merge-conflicts" in labels:
-    return False
-    if item.get("state") != "OPEN":
-        return False
-    if lane == "draft-review":
-        return item.get("isDraft") and "ready-for-draft-check" in labels
-    if lane == "open-review":
-        return (not item.get("isDraft")) and "ready-for-open-review" in labels and "ready-to-merge" not in labels
-    if lane == "merge":
-        return (not item.get("isDraft")) and "ready-to-merge" in labels
-    raise SystemExit(f"unsupported lane: {lane}")
+  labels = {label["name"] for label in item.get("labels", [])}
+  author = item.get("author") or {}
+  author_login = author.get("login")
 
-for pr in sorted(prs, key=lambda item: item["number"]):
-    if eligible(pr):
-        print(json.dumps(pr, sort_keys=True))
+  if item.get("state") != "OPEN":
+    return False
+  if author_login not in allowed_logins:
+    return False
+
+  if lane == "draft-review":
+    return (
+      item.get("isDraft")
+      and "ready-for-draft-check" in labels
+      and "needs-human" not in labels
+      and "has-merge-conflicts" not in labels
+    )
+  if lane == "open-review":
+    return (
+      (not item.get("isDraft"))
+      and "ready-for-open-review" in labels
+      and "ready-to-merge" not in labels
+      and "needs-human" not in labels
+      and "has-merge-conflicts" not in labels
+    )
+  if lane == "merge":
+    return (
+      (not item.get("isDraft"))
+      and "ready-to-merge" in labels
+      and "needs-human" not in labels
+      and "has-merge-conflicts" not in labels
+    )
+  if lane == "conflict-resolve":
+    return (
+      (not item.get("isDraft"))
+      and "has-merge-conflicts" in labels
+      and "needs-human" not in labels
+    )
+  raise SystemExit(f"unsupported lane: {lane}")
+
+
+items = [payload] if isinstance(payload, dict) else sorted(payload, key=lambda item: item["number"])
+
+if target_pr is not None and items and items[0].get("number") != target_pr:
+  raise SystemExit(f"target PR mismatch: expected {target_pr}, got {items[0].get('number')}")
+
+for pr in items:
+  if eligible(pr):
+    print(json.dumps(pr, sort_keys=True))
 PY
   rm -f "$payload_file"
 }
@@ -274,16 +281,15 @@ if author_login not in allowed_logins:
     errors.append(f"author login {author_login!r} fails the workflow actor guard rail")
 
 if "needs-human" in labels:
-  errors.append("PR is labeled needs-human")
-
-if "has-merge-conflicts" in labels:
-  errors.append("PR is labeled has-merge-conflicts")
+    errors.append("PR is labeled needs-human")
 
 if lane == "draft-review":
     if not payload.get("isDraft"):
         errors.append("PR is no longer draft")
     if "ready-for-draft-check" not in labels:
         errors.append("PR no longer has ready-for-draft-check")
+    if "has-merge-conflicts" in labels:
+        errors.append("PR is labeled has-merge-conflicts")
 elif lane == "open-review":
     if payload.get("isDraft"):
         errors.append("PR reverted to draft")
@@ -291,11 +297,20 @@ elif lane == "open-review":
         errors.append("PR no longer has ready-for-open-review")
     if "ready-to-merge" in labels:
         errors.append("PR is already labeled ready-to-merge")
+    if "has-merge-conflicts" in labels:
+        errors.append("PR is labeled has-merge-conflicts")
 elif lane == "merge":
     if payload.get("isDraft"):
         errors.append("PR reverted to draft")
     if "ready-to-merge" not in labels:
         errors.append("PR no longer has ready-to-merge")
+    if "has-merge-conflicts" in labels:
+        errors.append("PR is labeled has-merge-conflicts")
+elif lane == "conflict-resolve":
+    if payload.get("isDraft"):
+        errors.append("PR reverted to draft")
+    if "has-merge-conflicts" not in labels:
+        errors.append("PR no longer has has-merge-conflicts")
 else:
     errors.append(f"unsupported lane: {lane}")
 
@@ -337,7 +352,14 @@ Worker inputs:
 - target PR number: ${CLAIMED_PR_NUMBER}
 - lease owner id: ${WORKER_OWNER_ID}
 - lease ref name: ${LEASE_REF_NAME}
-- expected PR head SHA: ${EXPECTED_HEAD_SHA}"
+- expected PR head SHA: ${EXPECTED_HEAD_SHA}
+- primary repository root: ${REPO_ROOT}
+- iteration worktree: ${iteration_worktree}
+- standard validation commands:
+  - cargo fmt --check
+  - cargo clippy -- -D warnings
+  - cargo test
+  - cargo doc --no-deps"
 
   set +e
   (
@@ -434,7 +456,7 @@ done
 
 [[ -n "$LANE" ]] || usage
 case "$LANE" in
-  draft-review|open-review|merge)
+  draft-review|open-review|merge|conflict-resolve)
     ;;
   *)
     die "unsupported lane: $LANE"

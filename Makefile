@@ -18,6 +18,7 @@ test:
 
 test-shell:
 	./tools/test_loop_scheduler.sh
+	./tools/test_loop_worker.sh
 
 lint:
 	cargo fmt --check

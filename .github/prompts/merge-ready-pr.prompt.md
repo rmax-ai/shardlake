@@ -46,7 +46,7 @@ Requirements:
 12. If the merge fails, report the exact failure clearly and do not guess.
 13. Do not process any other PR.
 
-If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, leave a concise evidence-based PR comment describing the conflict and the required human resolution, do not attempt the merge in this run, and report the conflict clearly as the blocker.
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` label exists and add it to the PR. Add `needs-human` only if the conflict is clearly non-automatable, a prior conflict-resolution attempt for the current head/base pair already failed, or another required human decision blocks safe automation. Leave a concise evidence-based PR comment describing whether the PR is being routed to the conflict-resolution lane or escalated to `needs-human`, do not attempt the merge in this run, and report the conflict clearly as the blocker.
 
 If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
@@ -66,8 +66,11 @@ Merge-conflict and human-decision handling:
 
 - When you need to verify whether the PR is merge-conflicted, use `gh pr view <pr-number> --json mergeable` or another `gh` read that exposes the same state.
 - Treat `mergeable` values that indicate conflicts as authoritative for applying `has-merge-conflicts`.
-- Ensure the `has-merge-conflicts` and `needs-human` labels exist before adding them.
-- Use `gh pr edit <pr-number> --add-label has-merge-conflicts --add-label needs-human` to record a merge-conflict blocker.
+- Ensure the `has-merge-conflicts` label exists before adding it.
+- Treat conflicted PRs without `needs-human` as candidates for the dedicated `conflict-resolve` lane.
+- Add `needs-human` only when the conflict is clearly non-automatable, a prior bounded conflict-resolution attempt already failed for the current head/base pair, or another required human decision blocks safe automation.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts` to record a recoverable merge-conflict blocker.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts --add-label needs-human` only when escalating the conflict to terminal human handling.
 - Use `gh pr edit <pr-number> --add-label needs-human` and `gh pr comment <pr-number> --body-file <file>` when a human decision is required.
 
 Output format:
