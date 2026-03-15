@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
-PROMPT_PATH=".github/prompts/loop_iteration.prompt.md"
+PROMPT_PATH="${LOOP_PROMPT_PATH:-.github/prompts/loop_iteration.prompt.md}"
 COPILOT_BIN="${COPILOT_BIN:-copilot}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
@@ -48,13 +48,13 @@ extract_marker() {
       gsub(/^[`*]+/, "", line)
       gsub(/[`*]+$/, "", line)
 
-      if (line == "BEGIN_LOOP_CONTROL") {
+      if (line == "BEGIN_LOOP_CONTROL" || line == "BEGIN_RECONCILE_CONTROL") {
         in_block = 1
         block_seen = 1
         next
       }
 
-      if (line == "END_LOOP_CONTROL") {
+      if (line == "END_LOOP_CONTROL" || line == "END_RECONCILE_CONTROL") {
         in_block = 0
         next
       }
@@ -80,6 +80,18 @@ extract_marker() {
       }
     }
   ' "$file"
+}
+
+detect_control_mode() {
+  local file="$1"
+
+  if grep -q '^BEGIN_RECONCILE_CONTROL$' "$file"; then
+    printf 'reconcile\n'
+  elif grep -q '^BEGIN_LOOP_CONTROL$' "$file"; then
+    printf 'serialized\n'
+  else
+    printf 'unknown\n'
+  fi
 }
 
 normalize_bool() {
@@ -212,8 +224,9 @@ write_iteration_json() {
   local timestamp="$2"
   local log_file="$3"
   local json_file="$4"
+  local control_mode="$5"
 
-  python3 - "$iteration" "$timestamp" "$log_file" "$json_file" <<'PY'
+  python3 - "$iteration" "$timestamp" "$log_file" "$json_file" "$control_mode" <<'PY'
 import json
 import re
 import sys
@@ -239,6 +252,7 @@ iteration = int(sys.argv[1])
 timestamp = sys.argv[2]
 log_path = Path(sys.argv[3])
 json_path = Path(sys.argv[4])
+control_mode = sys.argv[5]
 
 log_text = log_path.read_bytes().decode("utf-8", errors="replace")
 
@@ -276,7 +290,7 @@ for index, match in enumerate(section_matches):
     "body": body,
   }
 
-control_match = re.search(
+serialized_control_match = re.search(
   r"(?ms)^BEGIN_LOOP_CONTROL\s*\n"
   r"PRS_PROCESSED:\s*(?P<prs_processed>\d+)\s*\n"
   r"ALL_WAITING_ON_OTHER_AGENTS:\s*(?P<all_waiting_on_other_agents>[^\n]+)\n"
@@ -284,18 +298,49 @@ control_match = re.search(
   r"END_LOOP_CONTROL\s*$",
   report_text,
 )
+reconcile_control_match = re.search(
+  r"(?ms)^BEGIN_RECONCILE_CONTROL\s*\n"
+  r"CLAIMABLE_WORK_EXISTS:\s*(?P<claimable_work_exists>[^\n]+)\n"
+  r"ALL_WAITING_ON_OTHER_AGENTS:\s*(?P<all_waiting_on_other_agents>[^\n]+)\n"
+  r"SLEEP_NEXT_ITERATION:\s*(?P<sleep_next_iteration>[^\n]+)\n"
+  r"END_RECONCILE_CONTROL\s*$",
+  report_text,
+)
 
-control = {
-  "prs_processed": None,
-  "all_waiting_on_other_agents": None,
-  "sleep_next_iteration": None,
-}
-if control_match:
-  control = {
-    "prs_processed": int(control_match.group("prs_processed")),
-    "all_waiting_on_other_agents": control_match.group("all_waiting_on_other_agents").strip(),
-    "sleep_next_iteration": control_match.group("sleep_next_iteration").strip(),
-  }
+control = {"mode": control_mode}
+if serialized_control_match:
+  control.update(
+    {
+      "prs_processed": int(serialized_control_match.group("prs_processed")),
+      "all_waiting_on_other_agents": serialized_control_match.group("all_waiting_on_other_agents").strip(),
+      "sleep_next_iteration": serialized_control_match.group("sleep_next_iteration").strip(),
+    }
+  )
+elif reconcile_control_match:
+  control.update(
+    {
+      "claimable_work_exists": reconcile_control_match.group("claimable_work_exists").strip(),
+      "all_waiting_on_other_agents": reconcile_control_match.group("all_waiting_on_other_agents").strip(),
+      "sleep_next_iteration": reconcile_control_match.group("sleep_next_iteration").strip(),
+    }
+  )
+else:
+  if control_mode == "serialized":
+    control.update(
+      {
+        "prs_processed": None,
+        "all_waiting_on_other_agents": None,
+        "sleep_next_iteration": None,
+      }
+    )
+  elif control_mode == "reconcile":
+    control.update(
+      {
+        "claimable_work_exists": None,
+        "all_waiting_on_other_agents": None,
+        "sleep_next_iteration": None,
+      }
+    )
 
 carry_forward = {}
 if "carry_forward_state" in sections:
@@ -310,6 +355,7 @@ payload = {
   "iteration": iteration,
   "timestamp_utc": timestamp,
   "log_file": str(log_path),
+  "control_mode": control_mode,
   "report_found": bool(report_text),
   "report_text": report_text,
   "sections": sections,
@@ -326,8 +372,14 @@ require_command "$COPILOT_BIN"
 require_command git
 require_command tee
 require_command awk
+require_command grep
 require_command sleep
 require_command python3
+
+if [[ ! -f "$REPO_ROOT/$PROMPT_PATH" ]]; then
+  echo "[loop_iteration] prompt file not found: $PROMPT_PATH" >&2
+  exit 1
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -348,6 +400,7 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
 
   echo "[loop_iteration] starting iteration ${iteration}/${MAX_ITERATIONS}"
   echo "[loop_iteration] log: $log_file"
+  echo "[loop_iteration] prompt: $PROMPT_PATH"
   echo "[loop_iteration] iteration worktree: $iteration_worktree"
 
   if run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file" "$iteration_worktree"; then
@@ -362,35 +415,65 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
     exit "$command_status"
   fi
 
-  prs_processed_raw="$(extract_marker "PRS_PROCESSED" "$log_file")"
-  waiting_raw="$(extract_marker "ALL_WAITING_ON_OTHER_AGENTS" "$log_file")"
-  sleep_next_raw="$(extract_marker "SLEEP_NEXT_ITERATION" "$log_file")"
+  control_mode="$(detect_control_mode "$log_file")"
 
-  if [[ -z "$prs_processed_raw" || -z "$waiting_raw" || -z "$sleep_next_raw" ]]; then
-    echo "[loop_iteration] missing control markers in $log_file" >&2
-    echo "[loop_iteration] expected BEGIN_LOOP_CONTROL/END_LOOP_CONTROL with PRS_PROCESSED, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
+  if [[ "$control_mode" == "serialized" ]]; then
+    prs_processed_raw="$(extract_marker "PRS_PROCESSED" "$log_file")"
+    waiting_raw="$(extract_marker "ALL_WAITING_ON_OTHER_AGENTS" "$log_file")"
+    sleep_next_raw="$(extract_marker "SLEEP_NEXT_ITERATION" "$log_file")"
+
+    if [[ -z "$prs_processed_raw" || -z "$waiting_raw" || -z "$sleep_next_raw" ]]; then
+      echo "[loop_iteration] missing serialized control markers in $log_file" >&2
+      echo "[loop_iteration] expected BEGIN_LOOP_CONTROL/END_LOOP_CONTROL with PRS_PROCESSED, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
+      exit 1
+    fi
+
+    if ! [[ "$prs_processed_raw" =~ ^[0-9]+$ ]]; then
+      echo "[loop_iteration] invalid PRS_PROCESSED value: $prs_processed_raw" >&2
+      exit 1
+    fi
+
+    prs_processed="$prs_processed_raw"
+    waiting="$(normalize_bool "$waiting_raw")"
+    sleep_next="$(normalize_bool "$sleep_next_raw")"
+
+    if [[ "$sleep_next" == "no" && "$prs_processed" == "0" && "$waiting" == "yes" ]]; then
+      sleep_next="yes"
+    fi
+  elif [[ "$control_mode" == "reconcile" ]]; then
+    claimable_work_exists_raw="$(extract_marker "CLAIMABLE_WORK_EXISTS" "$log_file")"
+    waiting_raw="$(extract_marker "ALL_WAITING_ON_OTHER_AGENTS" "$log_file")"
+    sleep_next_raw="$(extract_marker "SLEEP_NEXT_ITERATION" "$log_file")"
+
+    if [[ -z "$claimable_work_exists_raw" || -z "$waiting_raw" || -z "$sleep_next_raw" ]]; then
+      echo "[loop_iteration] missing reconcile control markers in $log_file" >&2
+      echo "[loop_iteration] expected BEGIN_RECONCILE_CONTROL/END_RECONCILE_CONTROL with CLAIMABLE_WORK_EXISTS, ALL_WAITING_ON_OTHER_AGENTS, and SLEEP_NEXT_ITERATION" >&2
+      exit 1
+    fi
+
+    claimable_work_exists="$(normalize_bool "$claimable_work_exists_raw")"
+    waiting="$(normalize_bool "$waiting_raw")"
+    sleep_next="$(normalize_bool "$sleep_next_raw")"
+
+    if [[ "$sleep_next" == "no" && "$claimable_work_exists" == "no" && "$waiting" == "yes" ]]; then
+      sleep_next="yes"
+    fi
+  else
+    echo "[loop_iteration] missing supported control block in $log_file" >&2
+    echo "[loop_iteration] expected either BEGIN_LOOP_CONTROL or BEGIN_RECONCILE_CONTROL" >&2
     exit 1
   fi
 
-  if ! [[ "$prs_processed_raw" =~ ^[0-9]+$ ]]; then
-    echo "[loop_iteration] invalid PRS_PROCESSED value: $prs_processed_raw" >&2
-    exit 1
-  fi
-
-  prs_processed="$prs_processed_raw"
-  waiting="$(normalize_bool "$waiting_raw")"
-  sleep_next="$(normalize_bool "$sleep_next_raw")"
-
-  if [[ "$sleep_next" == "no" && "$prs_processed" == "0" && "$waiting" == "yes" ]]; then
-    sleep_next="yes"
-  fi
-
-  write_iteration_json "$iteration" "$timestamp" "$log_file" "$json_file"
+  write_iteration_json "$iteration" "$timestamp" "$log_file" "$json_file" "$control_mode"
 
   assert_primary_checkout_unchanged "$primary_branch_before" "$primary_head_before"
   cleanup_iteration_worktree "$iteration_worktree"
 
-  echo "[loop_iteration] prs_processed=$prs_processed waiting_on_other_agents=$waiting sleep_next=$sleep_next"
+  if [[ "$control_mode" == "serialized" ]]; then
+    echo "[loop_iteration] control_mode=serialized prs_processed=$prs_processed waiting_on_other_agents=$waiting sleep_next=$sleep_next"
+  else
+    echo "[loop_iteration] control_mode=reconcile claimable_work_exists=$claimable_work_exists waiting_on_other_agents=$waiting sleep_next=$sleep_next"
+  fi
   echo "[loop_iteration] json: $json_file"
 
   if [[ $iteration -lt MAX_ITERATIONS && "$sleep_next" == "yes" ]]; then

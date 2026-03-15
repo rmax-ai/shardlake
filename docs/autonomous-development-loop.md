@@ -17,7 +17,7 @@ The goal is not "full automation at any cost". The goal is deterministic, restar
 
 ## Main Components
 
-The loop is split into three layers.
+The loop is split into three layers in serialized mode.
 
 ### 1. Shell driver
 
@@ -37,7 +37,7 @@ The primary checkout is operational state, not an execution workspace. It must s
 
 ### 2. Orchestrator prompt
 
-`.github/prompts/loop_iteration.prompt.md` defines the intended workflow for a single iteration. It tells the agent what stages to run, in what order, how much work to do per stage, and what the final human-readable report must contain.
+`.github/prompts/loop_iteration.prompt.md` defines the intended workflow for a single serialized iteration. It tells the agent what stages to run, in what order, how much work to do per stage, and what the final human-readable report must contain.
 
 This prompt is the behavioral contract for the loop. It defines:
 
@@ -46,6 +46,8 @@ This prompt is the behavioral contract for the loop. It defines:
 - deterministic ordering rules
 - safety constraints around ambiguous items
 - the requirement to report carry-forward state for the next pass
+
+For concurrent local execution, use `.github/prompts/loop_reconcile.prompt.md` as the repository-wide reconciler prompt and the `worker-*.prompt.md` prompts for claimed per-item execution. The serialized orchestrator remains useful as a single-process mode and as the default entrypoint for `loop_iteration.sh`.
 
 ### 3. Final control block
 
@@ -89,6 +91,8 @@ Current labels defined by the orchestrator:
 
 This gives operators a visible state machine in GitHub instead of hidden in local process memory.
 
+In concurrent local mode, labels remain the state machine but not the locking mechanism. Eligibility still lives on GitHub labels; worker ownership must be tracked separately through a lease or claim protocol so multiple loops do not race on the same item.
+
 ### Actor guard rail
 
 - The loop only processes issues and pull requests whose author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`.
@@ -116,7 +120,7 @@ Every iteration produces a narrative report for operators and a separate machine
 
 ## Detailed Control Flow
 
-This section describes the exact logic in `loop_iteration.sh`.
+This section describes the exact logic in `loop_iteration.sh` when run in serialized mode.
 
 ### Environment and prerequisites
 
@@ -145,6 +149,7 @@ The driver reads these variables:
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | `COPILOT_BIN` | `copilot` | Copilot CLI executable to run |
+| `LOOP_PROMPT_PATH` | `.github/prompts/loop_iteration.prompt.md` | Prompt entrypoint executed inside the iteration worktree |
 | `MAX_ITERATIONS` | `100` | Maximum number of loop iterations before the script exits |
 | `WAIT_SECONDS` | `300` | Sleep duration between iterations when the control block says to wait |
 | `GH_PAGER` | `cat` | Pager override exported into the loop environment |
@@ -160,7 +165,7 @@ For each iteration, the shell driver does the following:
 1. Runs the orchestrator prompt with:
 
    ```bash
-   "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "follow instructions in .github/prompts/loop_iteration.prompt.md"
+   "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "follow instructions in ${LOOP_PROMPT_PATH}"
    ```
 
    from inside the fresh iteration worktree, with `SHARDLAKE_PRIMARY_ROOT` exported so PR-review stages can create their own dedicated worktrees under the primary repository root.
@@ -175,6 +180,55 @@ For each iteration, the shell driver does the following:
 1. Sleeps for `WAIT_SECONDS` before the next pass when the current iteration is not the last allowed iteration and the final sleep decision is `yes`.
 
 The loop does not stop early just because no work was found. It is a polling loop that either runs immediately again or sleeps and tries later, until `MAX_ITERATIONS` is reached or a command fails.
+
+## Concurrent Local Loop Model
+
+The repository now has a prompt split for concurrent local execution without GitHub Actions.
+
+### Reconciler prompt
+
+`.github/prompts/loop_reconcile.prompt.md` performs repository-wide reconciliation only. It:
+
+- triages the `ready-to-implement` issue queue
+- assigns currently ready issues
+- reconciles draft-PR labels
+- reconciles open-PR labels
+- publishes the draft-review, open-review, and merge queues
+- emits scheduler guidance for an external local scheduler
+
+The reconciler must not claim a PR or issue, must not check out PR branches, and must not merge.
+
+### Worker prompts
+
+The concurrent worker prompts are:
+
+- `.github/prompts/worker-review-draft-pr.prompt.md`
+- `.github/prompts/worker-review-open-pr.prompt.md`
+- `.github/prompts/worker-merge-pr.prompt.md`
+
+Each worker prompt assumes a target item has already been claimed. It must:
+
+- operate on exactly one claimed PR
+- verify the lease owner before any destructive or durable write
+- revalidate label, state, and head SHA after claim
+- use a dedicated PR worktree
+- stop cleanly if the lease is missing, expired, or no longer owned by that worker
+
+### Control blocks
+
+Serialized mode still uses `.github/prompts/loop_control.prompt.md` and its `BEGIN_LOOP_CONTROL` block.
+
+Concurrent reconciler mode uses `.github/prompts/loop_reconcile_control.prompt.md` and a different machine-readable block:
+
+```text
+BEGIN_RECONCILE_CONTROL
+CLAIMABLE_WORK_EXISTS: <yes|no>
+ALL_WAITING_ON_OTHER_AGENTS: <yes|no>
+SLEEP_NEXT_ITERATION: <yes|no>
+END_RECONCILE_CONTROL
+```
+
+The current checked-in shell driver does not yet orchestrate concurrent workers. It can, however, be pointed at the reconciler prompt via `LOOP_PROMPT_PATH` for supervised experiments while keeping the serialized prompt as the default.
 
 ## Worktree Isolation Model
 
@@ -245,7 +299,7 @@ Its review criteria include:
 - docs coverage is present for user-visible changes
 - obvious implementation gaps are absent
 
-The checked-in prompt for this responsibility is `.github/prompts/review-ready-draft-pr.prompt.md`.
+The checked-in prompt for this responsibility in serialized mode is `.github/prompts/review-ready-draft-pr.prompt.md`.
 
 ### 6. Open PR review
 
@@ -261,7 +315,7 @@ Its review criteria include:
 - docs completeness
 - must-fix versus safe-to-defer follow-up work
 
-The checked-in prompt for this responsibility is `.github/prompts/review-ready-open-pr.prompt.md`.
+The checked-in prompt for this responsibility in serialized mode is `.github/prompts/review-ready-open-pr.prompt.md`.
 
 ### 7. Merge pass
 
@@ -273,7 +327,7 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 ## Dedicated Worktree Rule
 
-The orchestrator requires any draft-PR review, open-PR review, or merge pass that touches a PR branch to use a dedicated git worktree rather than the repository's main checkout.
+Any serialized review or merge prompt, and all concurrent worker prompts, require a dedicated git worktree rather than the repository's main checkout.
 
 This rule exists for four reasons:
 
@@ -326,6 +380,14 @@ Run the loop from the repository root:
 ./loop_iteration.sh
 ```
 
+### Reconciler-only usage
+
+For a single repository-wide reconciliation pass without PR execution stages:
+
+```bash
+LOOP_PROMPT_PATH=.github/prompts/loop_reconcile.prompt.md MAX_ITERATIONS=1 ./loop_iteration.sh
+```
+
 ### Single-pass usage
 
 For one explicit operator-driven pass without a polling wait cycle:
@@ -361,10 +423,11 @@ The last point matters because the checked-in orchestrator currently describes s
 At the time of writing:
 
 - `issue-triage.prompt.md` exists and matches the issue-triage responsibility
-- `assign-open-non-blocked-epic-issues.prompt.md` exists for assignment behavior
-- `check-draft-pr.prompt.md` exists for draft-PR readiness checks
-- `review-open-pr.prompt.md` exists for open-PR review handling
-- the orchestrator also refers to stage prompt names such as `assign-ready-issues.prompt.md`, `triage-draft-prs.prompt.md`, `triage-open-prs.prompt.md`, `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, and `merge-ready-pr.prompt.md`
+- `assign-ready-issues.prompt.md` exists for serialized and concurrent assignment behavior
+- `triage-draft-prs.prompt.md` exists for draft-PR queue reconciliation
+- `triage-open-prs.prompt.md` exists for open-PR queue reconciliation
+- `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, and `merge-ready-pr.prompt.md` remain the serialized single-process execution prompts
+- `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
 

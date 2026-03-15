@@ -1,8 +1,11 @@
 ---
 name: loop-iteration
-description: Run one autonomous label-driven workflow iteration using the repository's single-goal issue and PR prompts.
+description: Run one serialized autonomous label-driven workflow iteration using the repository's single-goal issue and PR prompts.
 ---
-Primary goal: run one autonomous workflow iteration that advances issues and pull requests using dedicated single-goal prompts and consistent labels.
+Primary goal: run one serialized workflow iteration that advances issues and pull requests using dedicated single-goal prompts and consistent labels.
+
+This prompt is the serialized loop entrypoint.
+For concurrent local execution, use `loop_reconcile.prompt.md` together with the `worker-*.prompt.md` prompts instead of extending this prompt.
 
 This prompt is the orchestrator. It should call the stage-specific prompts in order, collect their outputs, and produce one combined report.
 
