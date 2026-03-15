@@ -255,7 +255,7 @@ else:
 PY
 }
 
-validate_claimed_pr() {
+validate_claimed_pr_legacy_unused() {
   local lane="$1"
   local expected_head_sha="$2"
   local payload="$3"
@@ -342,6 +342,78 @@ if payload.get("ready_for_draft_check"):
 
 reason = payload.get("reason") or payload.get("state") or "unknown draft readiness state"
 raise SystemExit(f"draft PR lacks a current copilot_work_finished signal: {reason}")
+PY
+}
+
+validate_claimed_pr() {
+  local lane="$1"
+  local expected_head_sha="$2"
+  local payload="$3"
+
+  python3 - "$lane" "$expected_head_sha" "$payload" <<'PY'
+import json
+import sys
+
+lane = sys.argv[1]
+expected_head_sha = sys.argv[2]
+payload = json.loads(sys.argv[3])
+labels = {label["name"] for label in payload.get("labels", [])}
+author = payload.get("author") or {}
+author_login = author.get("login")
+allowed_logins = {"copilot-swe-agent", "copilot-swe-agent[bot]", "app/copilot-swe-agent", "rmax"}
+route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+present_route_labels = route_labels & labels
+errors = []
+
+if payload.get("state") != "OPEN":
+  errors.append("PR is no longer open")
+
+if payload.get("headRefOid") != expected_head_sha:
+  errors.append(f"PR head SHA changed to {payload.get('headRefOid')}")
+
+if author_login not in allowed_logins:
+  errors.append(f"author login {author_login!r} fails the workflow actor guard rail")
+
+if "needs-human" in labels:
+  errors.append("PR is labeled needs-human")
+
+if lane == "draft-review":
+  if not payload.get("isDraft"):
+    errors.append("PR is no longer draft")
+  if "ready-for-draft-check" not in labels:
+    errors.append("PR no longer has ready-for-draft-check")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "open-review":
+  if payload.get("isDraft"):
+    errors.append("PR reverted to draft")
+  if "ready-for-open-review" not in labels:
+    errors.append("PR no longer has ready-for-open-review")
+  if "ready-to-merge" in labels:
+    errors.append("PR is already labeled ready-to-merge")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "merge":
+  if payload.get("isDraft"):
+    errors.append("PR reverted to draft")
+  if "ready-to-merge" not in labels:
+    errors.append("PR no longer has ready-to-merge")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "conflict-resolve":
+  if "has-merge-conflicts" not in labels:
+    errors.append("PR no longer has has-merge-conflicts")
+  if payload.get("isDraft"):
+    if present_route_labels != {"ready-for-draft-check"}:
+      errors.append("draft conflict-resolve PR must keep exactly ready-for-draft-check as its routing label")
+  else:
+    if present_route_labels not in ({"ready-for-open-review"}, {"ready-to-merge"}):
+      errors.append("open conflict-resolve PR must keep exactly one routing label: ready-for-open-review or ready-to-merge")
+else:
+  errors.append(f"unsupported lane: {lane}")
+
+if errors:
+  raise SystemExit("; ".join(errors))
 PY
 }
 
