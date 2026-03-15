@@ -14,6 +14,20 @@ use shardlake_index::{
 };
 use shardlake_storage::{paths, ObjectStore};
 
+/// Errors that can arise while evaluating partition quality.
+#[derive(Debug, thiserror::Error)]
+pub enum PartitioningError {
+    /// Approximate search failed for one of the evaluated queries.
+    #[error("approximate search failed for query {query_id}: {source}")]
+    ApproximateSearch {
+        /// The record id of the query being evaluated.
+        query_id: u64,
+        /// The underlying search failure.
+        #[source]
+        source: shardlake_index::IndexError,
+    },
+}
+
 /// Summary statistics for one benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
@@ -173,7 +187,7 @@ pub fn evaluate_partitioning(
     k: usize,
     nprobe: usize,
     metric: DistanceMetric,
-) -> PartitioningReport {
+) -> Result<PartitioningReport, PartitioningError> {
     let manifest = searcher.manifest();
 
     // ── 1. Shard size distribution ─────────────────────────────────────────
@@ -222,7 +236,7 @@ pub fn evaluate_partitioning(
     let has_centroids = !centroids.is_empty() && centroids.iter().all(|c| !c.is_empty());
 
     if queries.is_empty() {
-        return PartitioningReport {
+        return Ok(PartitioningReport {
             index_version: manifest.index_version.0.clone(),
             total_vectors,
             num_shards,
@@ -238,7 +252,7 @@ pub fn evaluate_partitioning(
             routing_accuracy: None,
             recall_at_k: None,
             shard_hotness: Vec::new(),
-        };
+        });
     }
 
     // Fast lookup: VectorId → vector data for GT neighbour assignment.
@@ -257,7 +271,12 @@ pub fn evaluate_partitioning(
         // Approximate search for recall impact. This works for both modern and
         // legacy manifests because `IndexSearcher` falls back to loading shard
         // centroids from artifact bytes when the manifest does not embed them.
-        let approx = searcher.search(&query.data, k, nprobe).unwrap_or_default();
+        let approx = searcher.search(&query.data, k, nprobe).map_err(|source| {
+            PartitioningError::ApproximateSearch {
+                query_id: query.id.0,
+                source,
+            }
+        })?;
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
         recalls.push(recall_at_k(&gt_ids, &approx_ids));
 
@@ -310,7 +329,7 @@ pub fn evaluate_partitioning(
         "Partition evaluation complete"
     );
 
-    PartitioningReport {
+    Ok(PartitioningReport {
         index_version: manifest.index_version.0.clone(),
         total_vectors,
         num_shards,
@@ -326,7 +345,7 @@ pub fn evaluate_partitioning(
         routing_accuracy,
         recall_at_k: Some(recall_at_k_val),
         shard_hotness,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -413,7 +432,8 @@ mod tests {
 
         let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
         let report =
-            evaluate_partitioning(&searcher, &[], &records, 5, 1, DistanceMetric::Euclidean);
+            evaluate_partitioning(&searcher, &[], &records, 5, 1, DistanceMetric::Euclidean)
+                .unwrap();
 
         assert_eq!(report.num_shards, report.per_shard_vector_counts.len());
         assert_eq!(report.total_vectors, 20);
@@ -443,7 +463,8 @@ mod tests {
             5,
             1,
             DistanceMetric::Euclidean,
-        );
+        )
+        .unwrap();
 
         assert_eq!(report.num_queries, 10);
         assert!(report.routing_accuracy.is_some());
@@ -481,7 +502,8 @@ mod tests {
             5,
             1,
             DistanceMetric::Euclidean,
-        );
+        )
+        .unwrap();
 
         assert_eq!(report.num_queries, 10);
         assert!(report.routing_accuracy.is_none());
@@ -503,10 +525,41 @@ mod tests {
 
         let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
         let report =
-            evaluate_partitioning(&searcher, &[], &records, 1, 1, DistanceMetric::Euclidean);
+            evaluate_partitioning(&searcher, &[], &records, 1, 1, DistanceMetric::Euclidean)
+                .unwrap();
 
         assert_eq!(report.num_shards, 1);
         assert!((report.std_dev_shard_size - 0.0_f64).abs() < 1e-9);
         assert!((report.imbalance_ratio - 1.0_f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_partitioning_propagates_search_errors() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(8, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let bad_query = VectorRecord {
+            id: VectorId(999),
+            data: vec![0.0, 1.0],
+            metadata: None,
+        };
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let err = evaluate_partitioning(
+            &searcher,
+            &[bad_query],
+            &records,
+            3,
+            1,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PartitioningError::ApproximateSearch { query_id: 999, .. }
+        ));
     }
 }

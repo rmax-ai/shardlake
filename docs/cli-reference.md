@@ -381,7 +381,7 @@ Shard Hotness (fraction of queries that probe each shard, nprobe=2):
 
 | Field | Description |
 |-------|-------------|
-| `shard-NNNN: F` | Fraction of evaluated queries that probed this shard. Fractions sum to `nprobe` (each query probes exactly `nprobe` shards). |
+| `shard-NNNN: F` | Fraction of evaluated queries that probed this shard. Fractions sum to `min(nprobe, number of shards)` because each query probes at most that many shards. |
 
 ### Example
 

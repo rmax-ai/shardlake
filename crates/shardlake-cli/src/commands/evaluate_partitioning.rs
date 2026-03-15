@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{ensure, Result};
 use clap::Parser;
 use tracing::info;
 
@@ -32,11 +32,11 @@ pub struct EvaluatePartitioningArgs {
     pub alias: String,
 
     /// Number of nearest neighbours to retrieve (for recall@k).  Must be ≥ 1.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub k: usize,
 
     /// Number of shards to probe per query.  Must be ≥ 1.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, value_parser = parse_positive_usize)]
     pub nprobe: usize,
 
     /// Maximum number of query vectors to use from the corpus
@@ -47,12 +47,7 @@ pub struct EvaluatePartitioningArgs {
 
 /// Entry-point called by `main`.
 pub async fn run(storage: PathBuf, args: EvaluatePartitioningArgs) -> Result<()> {
-    if args.k == 0 {
-        bail!("--k must be greater than 0");
-    }
-    if args.nprobe == 0 {
-        bail!("--nprobe must be greater than 0");
-    }
+    validate_query_args(args.k, args.nprobe)?;
 
     let store = Arc::new(LocalObjectStore::new(&storage)?);
 
@@ -94,10 +89,7 @@ pub async fn run(storage: PathBuf, args: EvaluatePartitioningArgs) -> Result<()>
         "Running partition evaluation"
     );
 
-    let searcher = IndexSearcher::new(
-        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
-        manifest,
-    );
+    let searcher = IndexSearcher::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest);
 
     let report = shardlake_bench::evaluate_partitioning(
         &searcher,
@@ -106,7 +98,7 @@ pub async fn run(storage: PathBuf, args: EvaluatePartitioningArgs) -> Result<()>
         args.k,
         args.nprobe,
         metric,
-    );
+    )?;
 
     // ── Print human-readable report ────────────────────────────────────────
     println!("=== Partition Evaluation Report ===");
@@ -165,6 +157,22 @@ pub async fn run(storage: PathBuf, args: EvaluatePartitioningArgs) -> Result<()>
     }
 
     Ok(())
+}
+
+fn validate_query_args(k: usize, nprobe: usize) -> Result<()> {
+    ensure!(k > 0, "--k must be greater than 0");
+    ensure!(nprobe > 0, "--nprobe must be greater than 0");
+    Ok(())
+}
+
+fn parse_positive_usize(raw: &str) -> std::result::Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| format!("invalid integer value `{raw}`: {err}"))?;
+    if value == 0 {
+        return Err("value must be greater than 0".into());
+    }
+    Ok(value)
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
