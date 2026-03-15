@@ -60,6 +60,14 @@ Requirements:
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
+Worktree guidance:
+
+- Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
+- After the helper returns the worktree path, `cd` into that path before any PR checkout command.
+- Do not pass `--worktree` to `gh pr checkout`; the installed GitHub CLI in this workflow does not support that flag.
+- Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
+- If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
+
 Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
 
 Output format:

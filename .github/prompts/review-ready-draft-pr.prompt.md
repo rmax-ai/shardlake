@@ -61,6 +61,8 @@ Worktree guidance:
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
 - Run `gh pr checkout <pr-number>` only after `cd` into the prepared worktree path returned by the helper.
+- Do not pass `--worktree` to `gh pr checkout`; the installed GitHub CLI in this workflow does not support that flag.
+- Use the prepared worktree as the current directory first, then run a standard checkout command there, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
 - After push and final verification, remove the worktree with `git -C "$SHARDLAKE_PRIMARY_ROOT" worktree remove --force <worktree-path>` when the tree is clean.
 
