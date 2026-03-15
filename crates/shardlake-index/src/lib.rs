@@ -1,6 +1,7 @@
 //! Index building and approximate nearest-neighbour search.
 
 pub mod builder;
+pub mod cache;
 pub mod exact;
 pub mod ivf;
 pub mod kmeans;
@@ -11,6 +12,7 @@ pub mod shard;
 pub mod validator;
 
 pub use builder::{BuildParams, IndexBuilder};
+pub use cache::ShardCache;
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
 pub use pipeline::{

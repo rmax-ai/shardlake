@@ -12,12 +12,12 @@
 //! Assemble a pipeline using [`QueryPipeline::builder`] and call
 //! [`QueryPipeline::run`] to execute a search query through all stages.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
+
+use tracing::debug;
 
 use shardlake_core::{
+    config::PrefetchPolicy,
     error::CoreError,
     types::{DistanceMetric, SearchResult, ShardId},
 };
@@ -25,6 +25,7 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
+    cache::ShardCache,
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
     shard::ShardIndex,
@@ -134,42 +135,101 @@ impl RouteStage for CentroidRouter {
     }
 }
 
-/// Shard loader that caches loaded shards in an in-memory map.
+/// Shard loader that caches loaded shards in a bounded in-memory cache.
 ///
 /// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
 /// to resolve the artifact key for each shard ID before fetching bytes from
 /// the store.
+///
+/// By default the cache is unbounded (equivalent to the previous
+/// `HashMap`-based implementation).  Call [`with_capacity`] to limit the
+/// number of cached shards; the least-frequently-used entry is evicted when
+/// the limit is reached.
+///
+/// Optionally, a [`PrefetchPolicy`] can be attached via [`with_prefetch`] to
+/// proactively warm "hot" shards into the cache whenever a cache-miss load
+/// occurs.
+///
+/// [`with_capacity`]: CachedShardLoader::with_capacity
+/// [`with_prefetch`]: CachedShardLoader::with_prefetch
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    cache: Mutex<ShardCache>,
+    policy: Option<PrefetchPolicy>,
 }
 
 impl CachedShardLoader {
     /// Create a new loader backed by `store` and `manifest`.
+    ///
+    /// The cache is unbounded and prefetching is disabled.  Use the builder
+    /// methods [`with_capacity`] and [`with_prefetch`] to customise behaviour.
+    ///
+    /// [`with_capacity`]: Self::with_capacity
+    /// [`with_prefetch`]: Self::with_prefetch
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
         Self {
             store,
             manifest,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(ShardCache::new(0)),
+            policy: None,
+        }
+    }
+
+    /// Set the maximum number of shards to hold in the cache.
+    ///
+    /// `capacity` is the upper bound on cached entries.  `0` means no limit
+    /// (the default).  When the limit is reached, the least-frequently-used
+    /// shard is evicted to make room for a new entry.
+    ///
+    /// This method consumes `self` and returns a new instance; it is designed
+    /// to be chained after [`new`](Self::new).
+    pub fn with_capacity(self, capacity: usize) -> Self {
+        CachedShardLoader {
+            store: self.store,
+            manifest: self.manifest,
+            cache: Mutex::new(ShardCache::new(capacity)),
+            policy: self.policy,
+        }
+    }
+
+    /// Enable prefetch warming with the given policy.
+    ///
+    /// When the policy is enabled and a cache-miss load occurs, any shard
+    /// whose access count has reached
+    /// [`PrefetchPolicy::min_query_count`] but is not currently in the cache
+    /// will be loaded proactively.  Warming errors are logged at `DEBUG` level
+    /// and do not propagate to the caller.
+    ///
+    /// This method consumes `self` and returns a new instance; it is designed
+    /// to be chained after [`new`](Self::new).
+    pub fn with_prefetch(self, policy: PrefetchPolicy) -> Self {
+        CachedShardLoader {
+            store: self.store,
+            manifest: self.manifest,
+            cache: self.cache,
+            policy: Some(policy),
         }
     }
 }
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        // Step 1: Record access and return early on a cache hit.
         {
-            let cache = self.cache.lock().map_err(|_| {
+            let mut cache = self.cache.lock().map_err(|_| {
                 IndexError::Other(
                     "shard loader cache lock poisoned: a panic occurred while holding the lock"
                         .into(),
                 )
             })?;
-            if let Some(idx) = cache.get(&shard_id) {
-                return Ok(Arc::clone(idx));
+            cache.record_access(shard_id);
+            if let Some(idx) = cache.get(shard_id) {
+                return Ok(idx);
             }
         }
 
+        // Step 2: Cache miss — load the requested shard from the store.
         let shard_def = self
             .manifest
             .shards
@@ -180,12 +240,57 @@ impl LoadShardStage for CachedShardLoader {
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
-        let mut cache = self.cache.lock().map_err(|_| {
-            IndexError::Other(
-                "shard loader cache lock poisoned: a panic occurred while holding the lock".into(),
-            )
-        })?;
-        cache.insert(shard_id, Arc::clone(&idx));
+        // Step 3: Insert the loaded shard and collect hot-but-uncached shards
+        //         to warm (if a prefetch policy is active).
+        let to_warm: Vec<(ShardId, String)> = {
+            let mut cache = self.cache.lock().map_err(|_| {
+                IndexError::Other(
+                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
+                        .into(),
+                )
+            })?;
+            cache.insert(shard_id, Arc::clone(&idx));
+
+            match &self.policy {
+                Some(policy) if policy.enabled => {
+                    let threshold = u64::from(policy.min_query_count);
+                    self.manifest
+                        .shards
+                        .iter()
+                        .filter(|s| {
+                            !cache.contains(s.shard_id)
+                                && cache.access_count(s.shard_id) >= threshold
+                        })
+                        .map(|s| (s.shard_id, s.artifact_key.clone()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        // Step 4: Warm hot shards outside the lock (best-effort; errors are
+        //         logged at DEBUG and do not fail the original load).
+        for (warm_id, artifact_key) in to_warm {
+            match self.store.get(&artifact_key) {
+                Ok(warm_bytes) => match ShardIndex::from_bytes(&warm_bytes) {
+                    Ok(warm_idx) => {
+                        if let Ok(mut cache) = self.cache.lock() {
+                            if !cache.contains(warm_id) {
+                                debug!(shard_id = ?warm_id, "prefetch: warming hot shard");
+                                cache.insert(warm_id, Arc::new(warm_idx));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(shard_id = ?warm_id, error = %e, "prefetch: failed to parse shard");
+                    }
+                },
+                Err(e) => {
+                    debug!(shard_id = ?warm_id, error = %e, "prefetch: failed to load shard from store");
+                }
+            }
+        }
+
         Ok(idx)
     }
 }

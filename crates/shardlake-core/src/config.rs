@@ -72,6 +72,67 @@ impl Default for FanOutPolicy {
     }
 }
 
+/// Policy controlling optional shard prefetch warming based on query frequency.
+///
+/// When enabled, shards that have been probed at least `min_query_count` times
+/// are considered "hot" and will be loaded into the cache proactively on the
+/// next cache-miss load event, reducing I/O latency for frequently accessed
+/// shards.
+///
+/// Prefetching is **disabled** by default, which preserves the existing
+/// lazy-load-on-probe semantics for all shards.
+///
+/// # Validation
+///
+/// Call [`PrefetchPolicy::validate`] before using a policy from untrusted
+/// input (e.g. a config file).  The method returns
+/// [`CoreError::InvalidPrefetchPolicy`] when `min_query_count` is `0` while
+/// `enabled` is `true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrefetchPolicy {
+    /// Whether shard prefetch warming is enabled.
+    ///
+    /// When `false` (default) the cache behaves lazily: a shard is only
+    /// loaded when a query explicitly probes it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum number of times a shard must be probed before it is treated as
+    /// "hot" and eligible for prefetch warming.
+    ///
+    /// Must be ≥ 1 when `enabled` is `true`.  Defaults to `3`.
+    #[serde(default = "PrefetchPolicy::default_min_query_count")]
+    pub min_query_count: u32,
+}
+
+impl PrefetchPolicy {
+    /// Validate the policy.
+    ///
+    /// Returns [`CoreError::InvalidPrefetchPolicy`] when `enabled` is `true`
+    /// and `min_query_count` is `0`, which would cause every shard to be
+    /// eagerly warmed on its very first access.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.enabled && self.min_query_count == 0 {
+            return Err(crate::error::CoreError::InvalidPrefetchPolicy(
+                "min_query_count must be ≥ 1 when prefetch is enabled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_min_query_count() -> u32 {
+        3
+    }
+}
+
+impl Default for PrefetchPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_query_count: Self::default_min_query_count(),
+        }
+    }
+}
+
 /// Top-level system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
@@ -138,6 +199,26 @@ pub struct SystemConfig {
     /// same `kmeans_sample_size` produce identical centroids and fingerprints.
     #[serde(default)]
     pub kmeans_sample_size: Option<u32>,
+    /// Maximum number of shards to hold in the in-memory shard cache at any
+    /// one time.
+    ///
+    /// `0` means no limit (all loaded shards are retained for the process
+    /// lifetime, which is the historical default).  When the limit is exceeded,
+    /// the least-frequently-accessed shard is evicted to make room for the new
+    /// entry (LFU eviction).
+    ///
+    /// Has no effect on the cold-path behaviour: shards that are not probed are
+    /// never loaded regardless of this setting.
+    #[serde(default)]
+    pub cache_capacity: u32,
+    /// Prefetch policy for warming hot shards into the cache proactively.
+    ///
+    /// Disabled by default (`enabled = false`), which preserves the existing
+    /// lazy-load-on-probe behaviour.  When enabled, shards whose probe count
+    /// reaches [`PrefetchPolicy::min_query_count`] are loaded into the cache
+    /// proactively on the next cache-miss event.
+    #[serde(default)]
+    pub prefetch: PrefetchPolicy,
 }
 
 impl SystemConfig {
@@ -186,6 +267,8 @@ impl Default for SystemConfig {
             pq_enabled: false,
             pq_num_subspaces: Self::default_pq_num_subspaces(),
             pq_codebook_size: Self::default_pq_codebook_size(),
+            cache_capacity: 0,
+            prefetch: PrefetchPolicy::default(),
         }
     }
 }
