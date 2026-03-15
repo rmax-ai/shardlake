@@ -10,6 +10,7 @@ PRIMARY_BRANCH="${PRIMARY_BRANCH:-main}"
 WORKER_ITERATION_DIR="${WORKER_ITERATION_DIR:-$REPO_ROOT/tmp/worker_iterations}"
 WORKER_LOG_DIR="${WORKER_LOG_DIR:-$REPO_ROOT/tmp/loop_workers}"
 CLAIM_TTL_SECONDS="${LOOP_CLAIM_TTL_SECONDS:-1800}"
+NO_CANDIDATE_EXIT_STATUS="${LOOP_WORKER_NO_CANDIDATE_EXIT_STATUS:-10}"
 GH_PAGER_VALUE="${GH_PAGER:-cat}"
 NO_COLOR_VALUE="${NO_COLOR:-1}"
 CLICOLOR_VALUE="${CLICOLOR:-0}"
@@ -182,6 +183,8 @@ def eligible(item: dict) -> bool:
   labels = {label["name"] for label in item.get("labels", [])}
   author = item.get("author") or {}
   author_login = author.get("login")
+  route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+  present_route_labels = route_labels & labels
 
   if item.get("state") != "OPEN":
     return False
@@ -211,11 +214,11 @@ def eligible(item: dict) -> bool:
       and "has-merge-conflicts" not in labels
     )
   if lane == "conflict-resolve":
-    return (
-      (not item.get("isDraft"))
-      and "has-merge-conflicts" in labels
-      and "needs-human" not in labels
-    )
+    if "has-merge-conflicts" not in labels or "needs-human" in labels:
+      return False
+    if item.get("isDraft"):
+      return present_route_labels == {"ready-for-draft-check"}
+    return present_route_labels in ({"ready-for-open-review"}, {"ready-to-merge"})
   raise SystemExit(f"unsupported lane: {lane}")
 
 
@@ -253,7 +256,7 @@ else:
 PY
 }
 
-validate_claimed_pr() {
+validate_claimed_pr_legacy_unused() {
   local lane="$1"
   local expected_head_sha="$2"
   local payload="$3"
@@ -269,6 +272,8 @@ labels = {label["name"] for label in payload.get("labels", [])}
 author = payload.get("author") or {}
 author_login = author.get("login")
 allowed_logins = {"copilot-swe-agent", "copilot-swe-agent[bot]", "app/copilot-swe-agent", "rmax"}
+route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+present_route_labels = route_labels & labels
 errors = []
 
 if payload.get("state") != "OPEN":
@@ -307,10 +312,14 @@ elif lane == "merge":
     if "has-merge-conflicts" in labels:
         errors.append("PR is labeled has-merge-conflicts")
 elif lane == "conflict-resolve":
-    if payload.get("isDraft"):
-        errors.append("PR reverted to draft")
     if "has-merge-conflicts" not in labels:
         errors.append("PR no longer has has-merge-conflicts")
+  if payload.get("isDraft"):
+    if present_route_labels != {"ready-for-draft-check"}:
+      errors.append("draft conflict-resolve PR must keep exactly ready-for-draft-check as its routing label")
+  else:
+    if present_route_labels not in ({"ready-for-open-review"}, {"ready-to-merge"}):
+      errors.append("open conflict-resolve PR must keep exactly one routing label: ready-for-open-review or ready-to-merge")
 else:
     errors.append(f"unsupported lane: {lane}")
 
@@ -334,6 +343,78 @@ if payload.get("ready_for_draft_check"):
 
 reason = payload.get("reason") or payload.get("state") or "unknown draft readiness state"
 raise SystemExit(f"draft PR lacks a current copilot_work_finished signal: {reason}")
+PY
+}
+
+validate_claimed_pr() {
+  local lane="$1"
+  local expected_head_sha="$2"
+  local payload="$3"
+
+  python3 - "$lane" "$expected_head_sha" "$payload" <<'PY'
+import json
+import sys
+
+lane = sys.argv[1]
+expected_head_sha = sys.argv[2]
+payload = json.loads(sys.argv[3])
+labels = {label["name"] for label in payload.get("labels", [])}
+author = payload.get("author") or {}
+author_login = author.get("login")
+allowed_logins = {"copilot-swe-agent", "copilot-swe-agent[bot]", "app/copilot-swe-agent", "rmax"}
+route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+present_route_labels = route_labels & labels
+errors = []
+
+if payload.get("state") != "OPEN":
+  errors.append("PR is no longer open")
+
+if payload.get("headRefOid") != expected_head_sha:
+  errors.append(f"PR head SHA changed to {payload.get('headRefOid')}")
+
+if author_login not in allowed_logins:
+  errors.append(f"author login {author_login!r} fails the workflow actor guard rail")
+
+if "needs-human" in labels:
+  errors.append("PR is labeled needs-human")
+
+if lane == "draft-review":
+  if not payload.get("isDraft"):
+    errors.append("PR is no longer draft")
+  if "ready-for-draft-check" not in labels:
+    errors.append("PR no longer has ready-for-draft-check")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "open-review":
+  if payload.get("isDraft"):
+    errors.append("PR reverted to draft")
+  if "ready-for-open-review" not in labels:
+    errors.append("PR no longer has ready-for-open-review")
+  if "ready-to-merge" in labels:
+    errors.append("PR is already labeled ready-to-merge")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "merge":
+  if payload.get("isDraft"):
+    errors.append("PR reverted to draft")
+  if "ready-to-merge" not in labels:
+    errors.append("PR no longer has ready-to-merge")
+  if "has-merge-conflicts" in labels:
+    errors.append("PR is labeled has-merge-conflicts")
+elif lane == "conflict-resolve":
+  if "has-merge-conflicts" not in labels:
+    errors.append("PR no longer has has-merge-conflicts")
+  if payload.get("isDraft"):
+    if present_route_labels != {"ready-for-draft-check"}:
+      errors.append("draft conflict-resolve PR must keep exactly ready-for-draft-check as its routing label")
+  else:
+    if present_route_labels not in ({"ready-for-open-review"}, {"ready-to-merge"}):
+      errors.append("open conflict-resolve PR must keep exactly one routing label: ready-for-open-review or ready-to-merge")
+else:
+  errors.append(f"unsupported lane: {lane}")
+
+if errors:
+  raise SystemExit("; ".join(errors))
 PY
 }
 
@@ -385,6 +466,10 @@ release_claim() {
   fi
 
   tools/loop_claim.sh release --owner "$WORKER_OWNER_ID" --ref "$LEASE_REF_NAME"
+  LEASE_ACQUIRED="no"
+  LEASE_REF_NAME=""
+  CLAIMED_PR_NUMBER=""
+  EXPECTED_HEAD_SHA=""
 }
 
 cleanup() {
@@ -546,11 +631,13 @@ while IFS= read -r candidate_json; do
   fresh_pr_json="$(gh pr view "$CLAIMED_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url)"
   if ! validate_claimed_pr "$LANE" "$EXPECTED_HEAD_SHA" "$fresh_pr_json"; then
     echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} no longer matches lane requirements; releasing claim" >&2
-    exit 0
+    release_claim
+    continue
   fi
   if [[ "$LANE" == "draft-review" ]] && ! validate_draft_completion_state "$CLAIMED_PR_NUMBER"; then
     echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} is labeled ready-for-draft-check without a current copilot_work_finished event; releasing claim" >&2
-    exit 0
+    release_claim
+    continue
   fi
 
   log_file="$WORKER_LOG_DIR/${LANE}_pr${CLAIMED_PR_NUMBER}_${timestamp}.log"
@@ -571,6 +658,10 @@ if [[ "$candidate_found" == "no" ]]; then
   else
     echo "[loop_worker] no eligible PR found for lane ${LANE}"
   fi
+elif [[ -n "$TARGET_PR" ]]; then
+  echo "[loop_worker] target PR #${TARGET_PR} was not processable for lane ${LANE}" >&2
+else
+  echo "[loop_worker] no processable PR found for lane ${LANE}"
 fi
 
-exit 0
+exit "$NO_CANDIDATE_EXIT_STATUS"

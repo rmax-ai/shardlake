@@ -29,6 +29,15 @@ assert_not_contains() {
   fi
 }
 
+assert_file_contains() {
+  local file_path="$1"
+  local needle="$2"
+  local content
+
+  content="$(<"$file_path")"
+  assert_contains "$content" "$needle"
+}
+
 setup_sandbox() {
   local sandbox_root="$1"
 
@@ -164,16 +173,17 @@ run_worker() {
   local labels_csv="$3"
   local is_draft="$4"
   local pr_number="${5:-7}"
-  local output
 
-  output="$({
+  set +e
+  RUN_WORKER_OUTPUT="$({
     cd "$sandbox_root"
     PATH="$sandbox_root/bin:$PATH" \
     FAKE_PR_JSON="$(build_pr_json "$pr_number" "$is_draft" "$labels_csv" "$(git -C "$sandbox_root" rev-parse HEAD)")" \
     WORKER_OWNER_ID="test-owner" \
     ./loop_worker.sh --lane "$lane" --pr "$pr_number"
   } 2>&1)"
-  printf '%s\n' "$output"
+  RUN_WORKER_STATUS=$?
+  set -e
 }
 
 test_conflict_pr_is_only_claimable_in_conflict_lane() (
@@ -184,15 +194,24 @@ test_conflict_pr_is_only_claimable_in_conflict_lane() (
   trap 'rm -rf "$sandbox_root"' EXIT
   setup_sandbox "$sandbox_root"
 
-  output="$(run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts' false)"
+  run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts,ready-for-open-review' false
+  output="$RUN_WORKER_OUTPUT"
   assert_contains "$output" "considering PR #7"
   assert_contains "$output" "worker completed for PR #7"
 
-  output="$(run_worker "$sandbox_root" open-review 'has-merge-conflicts,ready-for-open-review' false)"
+  run_worker "$sandbox_root" open-review 'has-merge-conflicts,ready-for-open-review' false
+  output="$RUN_WORKER_OUTPUT"
+  if [[ "$RUN_WORKER_STATUS" -ne 10 ]]; then
+    fail "expected open-review ineligible worker to exit 10, got ${RUN_WORKER_STATUS}"
+  fi
   assert_contains "$output" "target PR #7 is not currently eligible for lane open-review"
   assert_not_contains "$output" "considering PR #7"
 
-  output="$(run_worker "$sandbox_root" merge 'has-merge-conflicts,ready-to-merge' false)"
+  run_worker "$sandbox_root" merge 'has-merge-conflicts,ready-to-merge' false
+  output="$RUN_WORKER_OUTPUT"
+  if [[ "$RUN_WORKER_STATUS" -ne 10 ]]; then
+    fail "expected merge ineligible worker to exit 10, got ${RUN_WORKER_STATUS}"
+  fi
   assert_contains "$output" "target PR #7 is not currently eligible for lane merge"
   assert_not_contains "$output" "considering PR #7"
 )
@@ -205,7 +224,11 @@ test_conflict_pr_with_needs_human_is_not_eligible() (
   trap 'rm -rf "$sandbox_root"' EXIT
   setup_sandbox "$sandbox_root"
 
-  output="$(run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts,needs-human' false)"
+  run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts,needs-human' false
+  output="$RUN_WORKER_OUTPUT"
+  if [[ "$RUN_WORKER_STATUS" -ne 10 ]]; then
+    fail "expected needs-human conflict worker to exit 10, got ${RUN_WORKER_STATUS}"
+  fi
   assert_contains "$output" "target PR #7 is not currently eligible for lane conflict-resolve"
   assert_not_contains "$output" "considering PR #7"
 )
@@ -218,12 +241,16 @@ test_non_conflicted_pr_is_not_eligible_for_conflict_lane() (
   trap 'rm -rf "$sandbox_root"' EXIT
   setup_sandbox "$sandbox_root"
 
-  output="$(run_worker "$sandbox_root" conflict-resolve 'ready-to-merge' false)"
+  run_worker "$sandbox_root" conflict-resolve 'ready-to-merge' false
+  output="$RUN_WORKER_OUTPUT"
+  if [[ "$RUN_WORKER_STATUS" -ne 10 ]]; then
+    fail "expected non-conflicted worker to exit 10, got ${RUN_WORKER_STATUS}"
+  fi
   assert_contains "$output" "target PR #7 is not currently eligible for lane conflict-resolve"
   assert_not_contains "$output" "considering PR #7"
 )
 
-test_conflict_lane_rejects_draft_prs() (
+test_conflict_lane_accepts_routed_draft_prs() (
   local sandbox_root
   local output
 
@@ -231,16 +258,43 @@ test_conflict_lane_rejects_draft_prs() (
   trap 'rm -rf "$sandbox_root"' EXIT
   setup_sandbox "$sandbox_root"
 
-  output="$(run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts' true)"
+  run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts,ready-for-draft-check' true
+  output="$RUN_WORKER_OUTPUT"
+  assert_contains "$output" "considering PR #7"
+  assert_contains "$output" "worker completed for PR #7"
+)
+
+test_conflict_lane_rejects_unrouted_conflict_prs() (
+  local sandbox_root
+  local output
+
+  sandbox_root="$(mktemp -d)"
+  trap 'rm -rf "$sandbox_root"' EXIT
+  setup_sandbox "$sandbox_root"
+
+  run_worker "$sandbox_root" conflict-resolve 'has-merge-conflicts' false
+  output="$RUN_WORKER_OUTPUT"
+  if [[ "$RUN_WORKER_STATUS" -ne 10 ]]; then
+    fail "expected unrouted conflict worker to exit 10, got ${RUN_WORKER_STATUS}"
+  fi
   assert_contains "$output" "target PR #7 is not currently eligible for lane conflict-resolve"
   assert_not_contains "$output" "considering PR #7"
+)
+
+test_conflict_prompt_requires_final_pr_comment() (
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" 'restore exactly one workflow routing label based on the routing label already present on the PR before conflict resolution writes:'
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" 'if it carries `ready-for-draft-check`, keep or add `ready-for-draft-check` and do not mark the PR ready or merge-ready in this run'
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" "leave one concise PR comment that includes the final output of this prompt for the successful resolution"
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" "Post the final output block above to the PR as the durable closing comment for this run"
 )
 
 main() {
   test_conflict_pr_is_only_claimable_in_conflict_lane
   test_conflict_pr_with_needs_human_is_not_eligible
   test_non_conflicted_pr_is_not_eligible_for_conflict_lane
-  test_conflict_lane_rejects_draft_prs
+  test_conflict_lane_accepts_routed_draft_prs
+  test_conflict_lane_rejects_unrouted_conflict_prs
+  test_conflict_prompt_requires_final_pr_comment
   echo "[test_loop_worker] PASS"
 }
 
