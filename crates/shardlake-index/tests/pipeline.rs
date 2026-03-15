@@ -17,10 +17,11 @@ use shardlake_core::{
 };
 use shardlake_index::{
     pipeline::{
-        CandidateSearchStage, EmbedStage, MergeStage, QueryPipeline, RerankStage, RouteStage,
+        CandidateSearchStage, EmbedStage, MergeStage, MmapShardLoader, QueryPipeline, RerankStage,
+        RouteStage, MMAP_MIN_SIZE_BYTES,
     },
     shard::ShardIndex,
-    BuildParams, IndexBuilder, Result,
+    BuildParams, IndexBuilder, LoadShardStage, Result,
 };
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore, StorageError};
 
@@ -461,5 +462,155 @@ fn test_pipeline_exact_and_ann_paths_through_same_skeleton() {
     assert!(
         !ann_results.is_empty(),
         "ann stub pipeline must return results"
+    );
+}
+
+/// `MmapShardLoader` produces the same nearest-neighbour results as the
+/// default `CachedShardLoader` when the store is `LocalObjectStore`.
+#[test]
+fn test_mmap_loader_returns_same_results_as_cached_loader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = default_config(tmp.path(), 2);
+    let records = make_records(20, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-mmap-cmp".into()),
+            embedding_version: EmbeddingVersion("emb-mmap-cmp".into()),
+            index_version: IndexVersion("idx-mmap-cmp".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-mmap-cmp"),
+            metadata_key: paths::dataset_metadata_key("ds-mmap-cmp"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    let query = records[0].data.clone();
+
+    // Default (CachedShardLoader) path.
+    let cached_pipeline =
+        QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
+            .build();
+    let cached_results = cached_pipeline.run(&query, 5, 2).unwrap();
+
+    // MmapShardLoader path with threshold=0 so every file is memory-mapped.
+    let mmap_pipeline =
+        QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
+            .with_loader(Box::new(MmapShardLoader::with_threshold(
+                Arc::clone(&store),
+                manifest,
+                0,
+            )))
+            .build();
+    let mmap_results = mmap_pipeline.run(&query, 5, 2).unwrap();
+
+    assert!(!mmap_results.is_empty(), "mmap loader must return results");
+    assert_eq!(
+        cached_results.len(),
+        mmap_results.len(),
+        "mmap and cached loaders must return the same number of results"
+    );
+    for (c, m) in cached_results.iter().zip(mmap_results.iter()) {
+        assert_eq!(c.id, m.id, "mmap result id must match cached result id");
+    }
+}
+
+/// When the shard file is smaller than the configured threshold the
+/// `MmapShardLoader` falls back to the regular `ObjectStore::get` path
+/// and still returns correct results.
+#[test]
+fn test_mmap_loader_fallback_for_small_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = default_config(tmp.path(), 2);
+    let records = make_records(20, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-mmap-small".into()),
+            embedding_version: EmbeddingVersion("emb-mmap-small".into()),
+            index_version: IndexVersion("idx-mmap-small".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-mmap-small"),
+            metadata_key: paths::dataset_metadata_key("ds-mmap-small"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    // Use a very large threshold so that all shard files fall back to the
+    // regular read path (no file will be >= u64::MAX bytes).
+    let mmap_pipeline =
+        QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
+            .with_loader(Box::new(MmapShardLoader::with_threshold(
+                Arc::clone(&store),
+                manifest,
+                u64::MAX,
+            )))
+            .build();
+
+    let query = records[0].data.clone();
+    let results = mmap_pipeline.run(&query, 5, 2).unwrap();
+
+    assert!(
+        !results.is_empty(),
+        "fallback path must still return results"
+    );
+    assert_eq!(
+        results[0].id,
+        VectorId(0),
+        "fallback path must find the correct nearest neighbour"
+    );
+}
+
+/// `MmapShardLoader` caches shards in memory: repeated loads of the same
+/// shard ID return the same `Arc` allocation without re-reading from storage.
+#[test]
+fn test_mmap_loader_caches_shards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = default_config(tmp.path(), 2);
+    let records = make_records(20, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-mmap-cache".into()),
+            embedding_version: EmbeddingVersion("emb-mmap-cache".into()),
+            index_version: IndexVersion("idx-mmap-cache".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-mmap-cache"),
+            metadata_key: paths::dataset_metadata_key("ds-mmap-cache"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    // Collect a shard ID from the manifest.
+    let shard_id = manifest.shards[0].shard_id;
+
+    let loader = MmapShardLoader::with_threshold(Arc::clone(&store), manifest, 0);
+
+    // Two loads of the same shard ID must return the same Arc allocation,
+    // proving the result was served from cache on the second call.
+    let first = loader.load(shard_id).unwrap();
+    let second = loader.load(shard_id).unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "second load must return the cached Arc, not a new allocation"
+    );
+}
+
+/// `MMAP_MIN_SIZE_BYTES` has the documented default value of 1 MiB.
+#[test]
+fn test_mmap_min_size_bytes_constant() {
+    assert_eq!(
+        MMAP_MIN_SIZE_BYTES,
+        1024 * 1024,
+        "MMAP_MIN_SIZE_BYTES must equal 1 MiB"
     );
 }

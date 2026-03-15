@@ -22,7 +22,7 @@ use shardlake_core::{
     types::{DistanceMetric, SearchResult, ShardId},
 };
 use shardlake_manifest::Manifest;
-use shardlake_storage::ObjectStore;
+use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 use crate::{
     exact::{exact_search, merge_top_k},
@@ -183,6 +183,158 @@ impl LoadShardStage for CachedShardLoader {
         let mut cache = self.cache.lock().map_err(|_| {
             IndexError::Other(
                 "shard loader cache lock poisoned: a panic occurred while holding the lock".into(),
+            )
+        })?;
+        cache.insert(shard_id, Arc::clone(&idx));
+        Ok(idx)
+    }
+}
+
+/// Minimum shard file size (in bytes) for which [`MmapShardLoader`] will
+/// attempt memory-mapped I/O.  Files smaller than this threshold are loaded
+/// via the regular `ObjectStore::get` path instead.
+///
+/// The value (1 MiB) avoids the mmap setup overhead for tiny development
+/// shards while still benefiting large production artifacts.
+pub const MMAP_MIN_SIZE_BYTES: u64 = 1024 * 1024;
+
+/// Shard loader that uses memory-mapped I/O for large local shard files.
+///
+/// For shard artifacts stored on the local filesystem and whose on-disk size
+/// exceeds [`MMAP_MIN_SIZE_BYTES`], the file is memory-mapped before being
+/// parsed; the mapped region is released as soon as deserialization finishes.
+/// For small files, non-local stores, or any environment where memory mapping
+/// is not available, the loader transparently falls back to reading the file
+/// with the regular [`ObjectStore::get`] path.
+///
+/// Loaded shards are cached in an in-memory map, so each shard body is
+/// fetched (and memory-mapped) at most once regardless of how many queries
+/// probe it.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use shardlake_index::pipeline::{MmapShardLoader, QueryPipeline};
+/// use shardlake_manifest::Manifest;
+/// use shardlake_storage::LocalObjectStore;
+///
+/// fn run_mmap_query(store: Arc<LocalObjectStore>, manifest: Manifest) {
+///     let pipeline = QueryPipeline::builder(Arc::clone(&store) as Arc<_>, manifest.clone())
+///         .with_loader(Box::new(MmapShardLoader::new(store, manifest)))
+///         .build();
+///     let results = pipeline.run(&[1.0, 0.0], 10, 2).unwrap();
+///     println!("{} results", results.len());
+/// }
+/// ```
+pub struct MmapShardLoader {
+    store: Arc<LocalObjectStore>,
+    manifest: Manifest,
+    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    /// Files smaller than this threshold (in bytes) are loaded via the regular
+    /// `ObjectStore::get` path instead of being memory-mapped.
+    mmap_threshold: u64,
+}
+
+impl MmapShardLoader {
+    /// Create a new loader backed by `store` and `manifest` using the default
+    /// size threshold ([`MMAP_MIN_SIZE_BYTES`]).
+    pub fn new(store: Arc<LocalObjectStore>, manifest: Manifest) -> Self {
+        Self::with_threshold(store, manifest, MMAP_MIN_SIZE_BYTES)
+    }
+
+    /// Create a new loader with a custom `mmap_threshold` in bytes.
+    ///
+    /// Files whose on-disk size is strictly less than `mmap_threshold` are
+    /// always loaded via the regular `ObjectStore::get` fallback path.
+    /// Pass `0` to enable memory mapping for every file regardless of size.
+    pub fn with_threshold(
+        store: Arc<LocalObjectStore>,
+        manifest: Manifest,
+        mmap_threshold: u64,
+    ) -> Self {
+        Self {
+            store,
+            manifest,
+            cache: Mutex::new(HashMap::new()),
+            mmap_threshold,
+        }
+    }
+
+    /// Load a shard either via mmap (if the file is large enough) or the
+    /// regular byte-read fallback.  Returns the in-memory [`ShardIndex`].
+    fn load_uncached(&self, artifact_key: &str) -> Result<ShardIndex> {
+        // Attempt memory-mapped I/O first.
+        let path = self.store.path_for(artifact_key)?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() >= self.mmap_threshold {
+                match self.try_load_mmap(&path) {
+                    Ok(idx) => return Ok(idx),
+                    Err(e) => {
+                        tracing::debug!(
+                            key = artifact_key,
+                            error = %e,
+                            "mmap failed; falling back to regular read",
+                        );
+                    }
+                }
+            }
+        }
+        // Fallback: read the whole file into memory.
+        let bytes = self.store.get(artifact_key)?;
+        ShardIndex::from_bytes(&bytes)
+    }
+
+    /// Try to memory-map `path` and deserialize a [`ShardIndex`] from it.
+    ///
+    /// The file at `path` is opened read-only and memory-mapped for the
+    /// duration of deserialization only.  The map is dropped before this
+    /// function returns, so no reference to the mapped region escapes.
+    ///
+    /// Empty shard files are rejected by `ShardIndex::from_bytes` before
+    /// the unsafe mmap region is accessed; `memmap2::Mmap::map` requires a
+    /// non-empty file, and an empty file would have been rejected earlier by
+    /// the `meta.len() >= self.mmap_threshold` size check (threshold ≥ 0
+    /// means a file of size 0 never reaches this path when threshold > 0,
+    /// and when threshold == 0 the magic-byte check in `from_bytes` fails).
+    fn try_load_mmap(&self, path: &std::path::Path) -> Result<ShardIndex> {
+        let file = std::fs::File::open(path).map_err(IndexError::Io)?;
+        // SAFETY: The mapped region is released before this function returns
+        // so no reference to it can escape.  Shard files are write-once
+        // artifacts that are never truncated after creation, satisfying
+        // memmap2's requirement that the file length not change while mapped.
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(IndexError::Io)? };
+        ShardIndex::from_bytes(&mmap)
+    }
+}
+
+impl LoadShardStage for MmapShardLoader {
+    fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        {
+            let cache = self.cache.lock().map_err(|_| {
+                IndexError::Other(
+                    "mmap shard loader cache lock poisoned: a panic occurred while holding the lock"
+                        .into(),
+                )
+            })?;
+            if let Some(idx) = cache.get(&shard_id) {
+                return Ok(Arc::clone(idx));
+            }
+        }
+
+        let shard_def = self
+            .manifest
+            .shards
+            .iter()
+            .find(|s| s.shard_id == shard_id)
+            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+        let idx = Arc::new(self.load_uncached(&shard_def.artifact_key)?);
+
+        let mut cache = self.cache.lock().map_err(|_| {
+            IndexError::Other(
+                "mmap shard loader cache lock poisoned: a panic occurred while holding the lock"
+                    .into(),
             )
         })?;
         cache.insert(shard_id, Arc::clone(&idx));
