@@ -235,7 +235,12 @@ mod tests {
             kmeans_iters: 5,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
             kmeans_sample_size: None,
+            pq_enabled: false,
+            pq_num_subspaces: SystemConfig::default_pq_num_subspaces(),
+            pq_codebook_size: SystemConfig::default_pq_codebook_size(),
         };
         IndexBuilder::new(store, &config)
             .build(BuildParams {
@@ -247,6 +252,7 @@ mod tests {
                 dims,
                 vectors_key: paths::dataset_vectors_key(dataset_ver),
                 metadata_key,
+                pq_params: None,
             })
             .unwrap()
     }
