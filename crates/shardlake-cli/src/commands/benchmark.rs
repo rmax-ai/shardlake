@@ -25,7 +25,7 @@ pub struct BenchmarkArgs {
     pub k: usize,
     /// Number of nearest centroids to select per query (candidate_centroids).
     #[arg(long, default_value_t = 2)]
-    pub nprobe: usize,
+    pub nprobe: u32,
     /// Maximum number of shards to probe after centroid-to-shard deduplication.
     /// `0` means no cap.
     #[arg(long, default_value_t = 0)]
@@ -41,7 +41,7 @@ pub struct BenchmarkArgs {
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
     let policy = FanOutPolicy {
-        candidate_centroids: args.nprobe as u32,
+        candidate_centroids: args.nprobe,
         candidate_shards: args.candidate_shards,
         max_vectors_per_shard: args.max_vectors_per_shard,
     };

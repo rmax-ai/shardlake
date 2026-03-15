@@ -44,7 +44,8 @@ Together they let you tune the recall–latency trade-off without changing the i
 ### `candidate_centroids` (alias: `nprobe`)
 
 `candidate_centroids` is the number of IVF centroids ranked nearest to the query vector.
-These centroids are mapped to their shards, which are then probed in parallel.
+Those centroids determine which shards are eligible to be probed; the final shard set can
+still be reduced by `candidate_shards`.
 
 - **Higher** → more shards checked → better recall → higher latency
 - **Lower** → fewer shards → faster queries → lower recall
@@ -90,8 +91,9 @@ the benefit of partitioning; too many shards increases overhead and hurts recall
 
 ## Choosing `nprobe` / `candidate_centroids`
 
-`nprobe` is the number of shards probed per query. It controls the recall–latency
-trade-off:
+`nprobe` is the legacy name for `candidate_centroids`: the number of nearest centroids
+selected per query. In practice, the number of probed shards can be lower after
+deduplication and any `candidate_shards` cap. It controls the recall–latency trade-off:
 
 - **nprobe = 1**: fastest queries, lowest recall
 - **nprobe = num_shards**: equivalent to exact brute-force (perfect recall, maximum latency)

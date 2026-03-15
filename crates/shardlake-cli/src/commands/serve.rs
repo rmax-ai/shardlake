@@ -24,7 +24,7 @@ pub struct ServeArgs {
     /// This is the primary routing knob: higher values improve recall at the
     /// cost of probing more shards.
     #[arg(long, default_value_t = 2)]
-    pub nprobe: usize,
+    pub nprobe: u32,
     /// Maximum number of shards to probe after centroid-to-shard deduplication.
     /// `0` means no cap (all shards selected by `--nprobe` are probed).
     #[arg(long, default_value_t = 0)]
@@ -37,7 +37,7 @@ pub struct ServeArgs {
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     let fan_out = FanOutPolicy {
-        candidate_centroids: args.nprobe as u32,
+        candidate_centroids: args.nprobe,
         candidate_shards: args.candidate_shards,
         max_vectors_per_shard: args.max_vectors_per_shard,
     };

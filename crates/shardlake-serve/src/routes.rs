@@ -76,9 +76,21 @@ async fn query_handler(
 
     // Build per-request fan-out policy, falling back to server defaults.
     // `candidate_centroids` takes precedence over the legacy `nprobe` field.
+    let legacy_candidate_centroids = match req.nprobe.map(u32::try_from).transpose() {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("nprobe must be <= {}", u32::MAX)
+                })),
+            )
+                .into_response();
+        }
+    };
     let candidate_centroids = req
         .candidate_centroids
-        .or_else(|| req.nprobe.map(|n| n as u32))
+        .or(legacy_candidate_centroids)
         .unwrap_or(state.fan_out.candidate_centroids);
     let candidate_shards = req
         .candidate_shards
@@ -333,5 +345,28 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_nprobe_overflow() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"nprobe":4294967296}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"], format!("nprobe must be <= {}", u32::MAX));
     }
 }

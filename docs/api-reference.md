@@ -46,7 +46,6 @@ vector ids with their scores.
 {
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
-  "nprobe": 3,
   "candidate_centroids": 3,
   "candidate_shards": 2,
   "max_vectors_per_shard": 500
