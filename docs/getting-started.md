@@ -38,7 +38,7 @@ make demo
 
 Expected output:
 
-```
+```text
 === Shardlake demo ===
 Ingested 10 vectors (dims=2) → dataset_version=ds-v1
 Index built → index_version=idx-v1 (2 shards, 10 vectors)
@@ -205,3 +205,10 @@ cargo test
 
 All unit and integration tests live alongside the code they test (unit tests in `#[cfg(test)]`
 blocks; integration tests in `crates/*/tests/`).
+
+## Repository automation
+
+If you are operating the repository's autonomous GitHub workflow rather than the Rust CLI itself,
+see [autonomous-development-loop.md](autonomous-development-loop.md). That guide documents the
+loop driver, stage ordering, label state machine, control markers, logs, and operator
+intervention points.

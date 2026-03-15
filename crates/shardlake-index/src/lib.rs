@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod exact;
+pub mod ivf;
 pub mod kmeans;
 pub mod searcher;
 pub mod shard;
@@ -9,6 +10,7 @@ pub mod validator;
 
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
+pub use ivf::IvfQuantizer;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};

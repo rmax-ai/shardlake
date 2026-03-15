@@ -125,6 +125,7 @@ mod tests {
             kmeans_iters: 4,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
         };
         let records = vec![
             VectorRecord {

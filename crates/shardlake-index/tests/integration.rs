@@ -76,6 +76,7 @@ fn test_build_and_search() {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
     };
 
     let records = make_records(20, 4);
@@ -101,6 +102,11 @@ fn test_build_and_search() {
         .shards
         .iter()
         .all(|shard| !shard.fingerprint.is_empty()));
+    // v4 builder must populate routing metadata for every shard.
+    assert!(manifest.shards.iter().all(|shard| {
+        let r = shard.routing.as_ref().expect("routing must be populated");
+        !r.centroid_id.is_empty() && !r.index_type.is_empty() && !r.file_location.is_empty()
+    }));
 
     let searcher = IndexSearcher::new(
         Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
@@ -127,6 +133,7 @@ fn test_search_does_not_load_non_probed_shards() {
         kmeans_iters: 10,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
     };
 
     let records = make_records(40, 4);
@@ -143,8 +150,8 @@ fn test_search_does_not_load_non_probed_shards() {
         })
         .unwrap();
 
-    // Manifest v3 embeds centroids so routing requires zero shard loads.
-    assert_eq!(manifest.manifest_version, 3);
+    // Manifest v4 embeds centroids so routing requires zero shard loads.
+    assert_eq!(manifest.manifest_version, 4);
     assert!(manifest.shards.iter().all(|s| !s.centroid.is_empty()));
 
     let (counting_store, counter) = CountingStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>);
@@ -183,6 +190,7 @@ fn test_build_is_deterministic() {
             kmeans_iters: 10,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
         };
         IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
@@ -219,6 +227,21 @@ fn test_build_is_deterministic() {
             "shard {} centroid differs between builds",
             s1.shard_id
         );
+        // Routing metadata must be consistent between builds (centroid_id and
+        // index_type are deterministic; file_location varies by index_version
+        // just as index_version itself does).
+        let r1 = s1.routing.as_ref().expect("routing must be populated");
+        let r2 = s2.routing.as_ref().expect("routing must be populated");
+        assert_eq!(
+            r1.centroid_id, r2.centroid_id,
+            "shard {} routing.centroid_id differs between builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            r1.index_type, r2.index_type,
+            "shard {} routing.index_type differs between builds",
+            s1.shard_id
+        );
     }
 
     // The seed must be recorded in algorithm.params so the build can be reproduced.
@@ -230,5 +253,107 @@ fn test_build_is_deterministic() {
     assert_eq!(
         seed_param.as_u64().unwrap(),
         SystemConfig::default_kmeans_seed(),
+    );
+}
+
+/// Verify that using `kmeans_sample_size` assigns all vectors to a shard
+/// (no records are dropped) and that repeated builds with the same seed and
+/// sample size yield identical shard layouts.
+#[test]
+fn test_build_with_sample_size_assigns_all_and_is_deterministic() {
+    let records = make_records(60, 4);
+
+    let build_once = |idx_ver: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 3,
+            kmeans_iters: 10,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            // Train centroids on 20 of the 60 vectors.
+            kmeans_sample_size: Some(20),
+        };
+        IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records: records.clone(),
+                dataset_version: DatasetVersion("ds-samp".into()),
+                embedding_version: EmbeddingVersion("emb-samp".into()),
+                index_version: IndexVersion(idx_ver.into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: paths::dataset_vectors_key("ds-samp"),
+                metadata_key: paths::dataset_metadata_key("ds-samp"),
+            })
+            .unwrap()
+    };
+
+    let m1 = build_once("idx-samp-1");
+    let m2 = build_once("idx-samp-2");
+
+    // All vectors must be assigned regardless of sampling.
+    assert_eq!(
+        m1.total_vector_count,
+        records.len() as u64,
+        "all vectors must be assigned when kmeans_sample_size is set"
+    );
+    let shard_sum: u64 = m1.shards.iter().map(|s| s.vector_count).sum();
+    assert_eq!(shard_sum, records.len() as u64);
+
+    // Builds with the same seed and sample_size must be deterministic.
+    assert_eq!(m1.shards.len(), m2.shards.len());
+    for (s1, s2) in m1.shards.iter().zip(m2.shards.iter()) {
+        assert_eq!(
+            s1.fingerprint, s2.fingerprint,
+            "shard {} fingerprint differs between sample-based builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            s1.centroid, s2.centroid,
+            "shard {} centroid differs between sample-based builds",
+            s1.shard_id
+        );
+    }
+
+    // kmeans_sample_size must be recorded in algorithm.params.
+    let param = m1
+        .algorithm
+        .params
+        .get("kmeans_sample_size")
+        .expect("kmeans_sample_size must be in algorithm.params when set");
+    assert_eq!(param.as_u64().unwrap(), 20);
+}
+
+#[test]
+fn test_build_with_large_sample_size_uses_full_dataset_without_manifest_override() {
+    let records = make_records(12, 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 3,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: Some(100),
+    };
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-full-sample".into()),
+            embedding_version: EmbeddingVersion("emb-full-sample".into()),
+            index_version: IndexVersion("idx-full-sample".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-full-sample"),
+            metadata_key: paths::dataset_metadata_key("ds-full-sample"),
+        })
+        .unwrap();
+
+    assert!(
+        !manifest.algorithm.params.contains_key("kmeans_sample_size"),
+        "manifest should omit kmeans_sample_size when centroid training used the full dataset"
     );
 }
