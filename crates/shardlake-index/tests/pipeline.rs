@@ -454,7 +454,9 @@ fn exact_candidate_stage_returns_k_nearest() {
         records: records.clone(),
     };
     let query = records[0].data.clone();
-    let results = stage.search_shard(&query, &shard, 3, DistanceMetric::Euclidean);
+    let results = stage
+        .search_shard(&query, &shard, 3, DistanceMetric::Euclidean)
+        .unwrap();
 
     assert_eq!(results.len(), 3);
     assert_eq!(
@@ -479,7 +481,9 @@ fn exact_candidate_stage_handles_k_larger_than_shard() {
         records: records.clone(),
     };
     let query = records[0].data.clone();
-    let results = stage.search_shard(&query, &shard, 100, DistanceMetric::Euclidean);
+    let results = stage
+        .search_shard(&query, &shard, 100, DistanceMetric::Euclidean)
+        .unwrap();
     assert_eq!(
         results.len(),
         3,
