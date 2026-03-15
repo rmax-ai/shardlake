@@ -145,8 +145,8 @@ pub struct SystemConfig {
     /// least `nprobe` (or `candidate_shards` when it is non-zero) so that the
     /// shards probed in a single query all fit in cache simultaneously.
     ///
-    /// Defaults to `128`.  A value of `0` is not valid and will be rejected
-    /// at construction time.
+    /// Defaults to `128`.  Must be ≥ 1; passing `0` when constructing an
+    /// `IndexSearcher` or `CachedShardLoader` will panic at construction time.
     #[serde(default = "SystemConfig::default_shard_cache_capacity")]
     pub shard_cache_capacity: usize,
 }

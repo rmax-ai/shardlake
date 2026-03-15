@@ -151,9 +151,11 @@ fn shard_cache_lru_eviction() {
         .get_or_load(shardlake_core::types::ShardId(1), mk_loader(1))
         .unwrap();
     let loads_after = load_count.load(Ordering::SeqCst);
+    // loads_before captured after the first 2 inserts + 1 hit for shard 0.
+    // After loads_before: shard 2 (new insert) + shard 1 (evicted, reload) = +2 loads.
     assert!(
         loads_after > loads_before + 1,
-        "shard 1 and 2 should both have triggered a load since eviction"
+        "shard 2 (insert) and shard 1 (reloaded after eviction) should both have triggered loads"
     );
 }
 

@@ -33,6 +33,11 @@ pub const DEFAULT_SHARD_CACHE_CAPACITY: usize = 128;
 /// The `VecDeque` acts as an ordered access log: the front holds the
 /// least-recently-used key and the back holds the most-recently-used key.
 /// Both `get` and `insert` promote the accessed key to MRU position.
+///
+/// Promotion is O(n) because it scans the `VecDeque` for the key's current
+/// position.  This is acceptable for the expected cache sizes (≤ a few hundred
+/// shard entries); the simplicity is preferred over additional heap allocations
+/// or unsafe code that a doubly-linked-list approach would require.
 struct LruCache<K, V> {
     capacity: usize,
     map: HashMap<K, V>,

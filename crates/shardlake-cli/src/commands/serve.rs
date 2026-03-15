@@ -35,7 +35,8 @@ pub struct ServeArgs {
     pub max_vectors_per_shard: u32,
     /// Maximum number of shard indexes to keep in the in-memory LRU cache.
     /// Larger values improve repeat-query latency at the cost of higher memory
-    /// usage.  Should be at least as large as `--nprobe`.
+    /// usage.  Should be at least as large as `--nprobe`, or `--candidate-shards`
+    /// when that flag is non-zero and smaller than `--nprobe`.
     #[arg(long, default_value_t = DEFAULT_SHARD_CACHE_CAPACITY)]
     pub shard_cache_capacity: usize,
 }
