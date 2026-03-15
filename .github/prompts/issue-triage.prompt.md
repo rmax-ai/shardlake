@@ -35,6 +35,8 @@ Requirements:
    - any open issues missing a parent epic
    - which open issues fail the workflow actor guard rail because their author login is outside the allowed set or missing
 3. Retrieve child issues for the open epics using a fixed GraphQL query shape.
+   - the `gh api graphql` command must bind repository identity through GraphQL variables, for example `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`
+   - do not use `gh api graphql --repo ...` or `gh api --repo ...`; `gh api` in this environment does not support that flag
 4. Retrieve dependency state only for candidate child issues using the GitHub issue dependencies REST endpoints.
 5. Build the desired ready queue deterministically:
    - walk epics in ascending issue-number order
@@ -58,9 +60,10 @@ Execution guidance:
 - Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use this fixed collection pipeline:
    1. Run `gh issue list --state open --limit 200 --json number,title,labels,assignees,author` once and derive the open `ready-to-implement` set, the open `implementation-in-progress` set, the open `epic` set, open issues without a parent epic, issues already assigned to `copilot-swe-agent`, and issues whose author login is outside the allowed set from that snapshot.
-   2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`.
+   2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
    3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocking` to determine whether open blockers exist.
 - Do not grep the repository for field names, probe alternate GraphQL field names, inspect schema metadata, or fall back to ad hoc discovery during normal execution.
+- Do not use `gh api graphql --repo ...` or `gh api --repo ...`; those forms are unsupported here and must be treated as invalid command shapes.
 - Do not use `gh issue view` unless a write operation requires a targeted refresh for one specific issue.
 - Do not request `parent` from `gh issue view --json`; parent-epic structure for this workflow must come from the fixed GraphQL `subIssues` snapshot.
 - Use `gh issue edit <issue-number> --add-label ready-to-implement` and `gh issue edit <issue-number> --remove-label ready-to-implement` for reconciliation.
