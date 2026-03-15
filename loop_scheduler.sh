@@ -250,9 +250,12 @@ RUN_OPEN_REVIEW="$(normalize_bool "$RUN_OPEN_REVIEW")"
 RUN_MERGE="$(normalize_bool "$RUN_MERGE")"
 RUN_RECONCILE="$(normalize_bool "$RUN_RECONCILE")"
 
-require_command "$COPILOT_BIN"
-require_command git
-require_command gh
+if [[ "$RUN_RECONCILE" == "yes" || "$RUN_DRAFT_REVIEW" == "yes" || "$RUN_OPEN_REVIEW" == "yes" || "$RUN_MERGE" == "yes" ]]; then
+  require_command "$COPILOT_BIN"
+  require_command git
+  require_command gh
+fi
+
 if [[ "$RUN_RECONCILE" == "yes" ]]; then
   require_command python3
   require_command awk
