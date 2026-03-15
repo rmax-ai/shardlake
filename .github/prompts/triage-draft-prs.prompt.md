@@ -46,6 +46,7 @@ Requirements:
 Execution guidance:
 
 - Use `gh label list` and `gh label create` to ensure the label exists.
+- Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use `gh pr list` and `gh pr view --json author` to inspect draft PR metadata.
 - Use GitHub-visible agent state, including Copilot job status or equivalent PR metadata, to decide pending vs completed.
 - Prefer explicit Copilot job status for certainty. If the Copilot job for a PR is `completed`, treat that PR as eligible even if other PR metadata is sparse.

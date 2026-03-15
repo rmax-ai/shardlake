@@ -33,6 +33,7 @@ Requirements:
 
 Execution guidance:
 
+- Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Retrieve or refresh each candidate issue's author login before assignment when it is not already present in the initial snapshot.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.

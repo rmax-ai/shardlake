@@ -109,13 +109,18 @@ run_prompt() {
   local output_file="$2"
   local iteration_worktree="$3"
   local command_status=0
+  local gh_only_instruction
+
+  gh_only_instruction="Use only the gh CLI for GitHub reads and writes in this run. Do not use GitHub MCP tools, repository GitHub tools, or alternate GitHub access paths. If a required gh command fails, stop immediately and report the exact failure instead of falling back."
 
   set +e
   (
     cd "$iteration_worktree"
     export SHARDLAKE_PRIMARY_ROOT="$REPO_ROOT"
     export SHARDLAKE_ITERATION_WORKTREE="$iteration_worktree"
-    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp -p "$prompt_text"
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp -p "$prompt_text
+
+${gh_only_instruction}"
   ) | tee "$output_file"
   command_status=${PIPESTATUS[0]}
   set -e

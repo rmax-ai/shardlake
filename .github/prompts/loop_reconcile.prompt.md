@@ -9,6 +9,7 @@ This prompt is the concurrent-mode reconciler. It must not claim an item lease, 
 Execution constraints:
 
 - Export `GH_PAGER=cat`, `NO_COLOR=1`, and `CLICOLOR=0` before any `gh` command.
+- Use `gh` as the only supported GitHub access path for this prompt. Do not switch to GitHub MCP tools, repository GitHub tools, or any other GitHub API path mid-run.
 - The operator's current checkout is safety state only: it must stay on `main`, remain clean, and must not be used for PR branch commands.
 - Before every iteration, create a fresh dedicated iteration worktree from `origin/main` and run the reconciler from inside that worktree.
 - Never push commits from the repository's primary checkout on `main`.
@@ -73,6 +74,7 @@ Definitions:
 Execution guidance:
 
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
+- If a required `gh` read or write fails, stop using GitHub data for that stage, report the exact `gh` failure, and do not fall back to other GitHub tools.
 - Use ascending numeric order whenever reporting queue members.
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full reconciliation report, invoke a subagent that follows `.github/prompts/loop_reconcile_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.

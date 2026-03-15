@@ -207,6 +207,8 @@ The concurrent worker prompts are:
 - `.github/prompts/worker-review-open-pr.prompt.md`
 - `.github/prompts/worker-merge-pr.prompt.md`
 
+The checked-in worker launcher is `loop_worker.sh`. It resolves the next eligible PR for a single lane with `gh`, acquires a lease, revalidates the claimed PR's current state and head SHA with `gh`, runs the matching worker prompt with explicit inputs, and then releases the lease.
+
 Each worker prompt assumes a target item has already been claimed. It must:
 
 - operate on exactly one claimed PR
@@ -440,6 +442,7 @@ At the time of writing:
 - `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, and `merge-ready-pr.prompt.md` remain the serialized single-process execution prompts
 - `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
 - `tools/loop_claim.sh` now implements the lease protocol expected by the worker prompts
+- `loop_worker.sh` now implements a lane-aware worker launcher that resolves queue entries, acquires leases, revalidates claimed PRs, and invokes the matching worker prompt with explicit inputs
 - the concurrent path is prompt-complete and lease-protocol-complete, but it is still not scheduler-complete because the repo does not yet include a worker dispatcher that polls queues, claims work, and launches the per-lane workers
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.

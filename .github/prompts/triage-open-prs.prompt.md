@@ -47,6 +47,7 @@ Requirements:
 Execution guidance:
 
 - Use `gh label list` and `gh label create` to ensure the labels exist.
+- Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use `gh pr list` and `gh pr view --json author,reviews,comments,reviewDecision,labels,isDraft,state` to inspect eligibility.
 - Match Copilot or Codex actors by login when deciding whether AI review comments exist.
 - Use `gh pr edit <pr-number> --add-label ready-for-open-review`, `gh pr edit <pr-number> --remove-label ready-for-open-review`, and `gh pr edit <pr-number> --remove-label ready-to-merge` for reconciliation.

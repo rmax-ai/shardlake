@@ -52,6 +52,7 @@ Requirements:
 Execution guidance:
 
 - Use `gh label list` and `gh label create` to ensure the label exists.
+- Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use this fixed collection pipeline:
    1. Run `gh issue list --state open --limit 200 --json number,title,labels,assignees,author` once and derive the open `ready-to-implement` set, the open `epic` set, open issues without a parent epic, and issues whose author login is outside the allowed set from that snapshot.
    2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`.
