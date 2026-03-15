@@ -21,7 +21,7 @@ Definitions:
 - A draft PR is eligible for `ready-for-draft-check` only when:
   - it is open
   - it is still in draft state
-  - its author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+  - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
   - it has no GitHub-visible agent task pending
   - pending-agent state can be determined safely
 - A completed Copilot coding job for the same PR counts as safe, GitHub-visible evidence that agent work is no longer pending.
@@ -51,6 +51,7 @@ Execution guidance:
 - Prefer explicit Copilot job status for certainty. If the Copilot job for a PR is `completed`, treat that PR as eligible even if other PR metadata is sparse.
 - Treat PR UI signals such as the completed Copilot banner as corroborating context, not as a reason to override an explicit completed job state.
 - Use `gh pr edit <pr-number> --add-label ready-for-draft-check` and `gh pr edit <pr-number> --remove-label ready-for-draft-check` for reconciliation.
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, do not process the PR further in this stage.
 - If agent state cannot be determined safely, remove or avoid the label and treat the PR as not ready this iteration.
 

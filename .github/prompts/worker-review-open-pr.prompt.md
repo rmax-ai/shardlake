@@ -27,16 +27,17 @@ Requirements:
 
 1. Resolve the target PR from the provided number.
 2. Verify lease ownership before any write:
-   - fetch the current tip of the provided lease ref from the remote
-   - inspect the lease metadata
-   - confirm the lease is still owned by the provided lease owner id
+   - run `tools/loop_claim.sh inspect --ref <lease-ref-name>`
+   - confirm the returned lease status is `active`
+   - confirm the returned lease metadata is still owned by the provided lease owner id
+   - confirm the returned lease metadata still records the provided expected head SHA
    - stop immediately if the lease is missing, expired, or owned by another worker
 3. Revalidate that the PR is:
    - open
    - not in draft state
    - labeled `ready-for-open-review`
    - not already labeled `ready-to-merge`
-   - authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+   - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
@@ -52,7 +53,7 @@ Requirements:
    - `cargo doc --no-deps`
 12. If changes were made:
    - commit and push only the changes needed for this PR
-13. Before changing labels or leaving a durable summary comment, confirm lease ownership again.
+13. Before changing labels or leaving a durable summary comment, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 14. Add or update a concise PR comment when maintainers need a durable summary of what was fixed, what was deferred, and whether the PR is now merge-ready.
 15. If the PR is ready to merge:
    - add the `ready-to-merge` label
@@ -63,6 +64,8 @@ Requirements:
 19. Do not inspect or modify any other PR.
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
+
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
 
 Output format:
 

@@ -21,7 +21,7 @@ Definitions:
 - An open PR is eligible for `ready-for-open-review` only when:
   - it is open
   - it is not in draft state
-  - its author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+  - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
   - it has Copilot or Codex review comments available for inspection
   - it does not already carry `ready-to-merge`
 - A PR may keep `ready-to-merge` only when:
@@ -50,6 +50,7 @@ Execution guidance:
 - Use `gh pr list` and `gh pr view --json author,reviews,comments,reviewDecision,labels,isDraft,state` to inspect eligibility.
 - Match Copilot or Codex actors by login when deciding whether AI review comments exist.
 - Use `gh pr edit <pr-number> --add-label ready-for-open-review`, `gh pr edit <pr-number> --remove-label ready-for-open-review`, and `gh pr edit <pr-number> --remove-label ready-to-merge` for reconciliation.
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, do not process the PR further in this stage.
 
 Output format:

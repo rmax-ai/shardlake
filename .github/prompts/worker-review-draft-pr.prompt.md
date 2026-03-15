@@ -27,15 +27,16 @@ Requirements:
 
 1. Resolve the target PR from the provided number.
 2. Verify lease ownership before any write:
-   - fetch the current tip of the provided lease ref from the remote
-   - inspect the lease metadata
-   - confirm the lease is still owned by the provided lease owner id
+   - run `tools/loop_claim.sh inspect --ref <lease-ref-name>`
+   - confirm the returned lease status is `active`
+   - confirm the returned lease metadata is still owned by the provided lease owner id
+   - confirm the returned lease metadata still records the provided expected head SHA
    - stop immediately if the lease is missing, expired, or owned by another worker
 3. Revalidate that the PR is:
    - open
    - still in draft state
    - labeled `ready-for-draft-check`
-   - authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+   - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
@@ -53,7 +54,7 @@ Requirements:
 13. If changes were made:
    - rerun the affected quality gates until they pass or a hard blocker remains
    - commit and push only the changes needed for this PR
-14. Before changing PR state, confirm lease ownership again.
+14. Before changing PR state, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 15. If the PR is ready for review:
    - mark it ready with `gh pr ready <pr-number>`
    - remove the `ready-for-draft-check` label
@@ -64,6 +65,8 @@ Requirements:
 18. Do not inspect or modify any other PR.
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
+
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
 
 Output format:
 

@@ -21,7 +21,7 @@ Requirements:
 1. Retrieve all open issues labeled `ready-to-implement`.
 2. For each such issue, verify before assignment:
    - it is still open
-  - its author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+  - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
    - it still has a parent epic in this repository
    - it still has no open blockers
 3. Assign only verified ready issues that are not already assigned to `copilot-swe-agent`.
@@ -34,6 +34,7 @@ Requirements:
 Execution guidance:
 
 - Retrieve or refresh each candidate issue's author login before assignment when it is not already present in the initial snapshot.
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
 
 REST fallback payload:

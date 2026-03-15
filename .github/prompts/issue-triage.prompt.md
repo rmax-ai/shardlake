@@ -21,7 +21,7 @@ Deterministic rules:
 1. Process epics in ascending issue-number order.
 2. Process child issues in ascending issue-number order within each epic.
 3. Only issues with a parent epic are eligible for `ready-to-implement`.
-4. A child issue is eligible only when it is open, its author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`, and it has no open blockers.
+4. A child issue is eligible only when it is open, its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`), and it has no open blockers.
 5. Keep at most 5 open issues labeled `ready-to-implement` across the repository.
 6. Do not add comments, assignments, or new issues in this prompt.
 
@@ -60,6 +60,7 @@ Execution guidance:
 - Do not use `gh issue view` unless a write operation requires a targeted refresh for one specific issue.
 - Use `gh issue edit <issue-number> --add-label ready-to-implement` and `gh issue edit <issue-number> --remove-label ready-to-implement` for reconciliation.
 - Be idempotent.
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, treat the issue as not ready for this iteration.
 - If blocker state is ambiguous, treat the issue as not ready for this iteration.
 

@@ -37,6 +37,12 @@ Workflow labels:
 - `ready-to-merge`: open PR has completed review handling and is ready for a final merge pass
 - `needs-human`: PR is blocked on manual intervention and must not be advanced automatically
 
+Workflow actor guard rail:
+
+- Normalize GitHub App identities before applying the guard rail. Treat `app/copilot-swe-agent` as the GitHub App form of `copilot-swe-agent`, not as a separate ineligible actor.
+- Only process issues and PRs whose GitHub author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`.
+- If the author login cannot be determined safely, do not process the item this iteration.
+
 Deterministic operating rules:
 
 1. Process issues and PRs in ascending numeric order.

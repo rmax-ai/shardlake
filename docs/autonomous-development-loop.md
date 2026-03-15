@@ -95,7 +95,8 @@ In concurrent local mode, labels remain the state machine but not the locking me
 
 ### Actor guard rail
 
-- The loop only processes issues and pull requests whose author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`.
+- The loop only processes issues and pull requests whose author login passes a normalized actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`.
+- GitHub App actor identities must be normalized before policy checks. In practice, `app/copilot-swe-agent` is treated as the GitHub App form of `copilot-swe-agent`, not as a separate ineligible actor.
 - Author identity is treated as required eligibility metadata for triage, assignment, review, and merge stages.
 - If author identity cannot be determined safely, the item is skipped as policy-blocked instead of being advanced optimistically.
 
@@ -214,6 +215,16 @@ Each worker prompt assumes a target item has already been claimed. It must:
 - use a dedicated PR worktree
 - stop cleanly if the lease is missing, expired, or no longer owned by that worker
 
+The checked-in lease helper is `tools/loop_claim.sh`. It uses one remote ref per claimed PR lane at `refs/heads/loop-claims/<lane>/pr-<number>`. The tip commit of that ref contains a `lease.json` payload with owner id, lane, target PR number, expected head SHA, and UTC acquisition and expiry timestamps.
+
+Protocol rules:
+
+- `acquire` creates a new lease or steals an expired lease by pushing a new synthetic commit to the lane ref
+- `renew` extends an active lease owned by the same worker by pushing a child commit to the same ref
+- `release` deletes the ref with compare-and-swap semantics using the currently observed ref tip
+- `inspect` reads the remote ref and reports whether the lease is `active`, `expired`, or `missing`
+- acquire and renew are compare-and-swap updates because they only succeed when the observed ref tip is still current at push time
+
 ### Control blocks
 
 Serialized mode still uses `.github/prompts/loop_control.prompt.md` and its `BEGIN_LOOP_CONTROL` block.
@@ -281,7 +292,7 @@ At a high level this stage should:
 
 ### 4. Open PR triage
 
-Open PR triage follows the same author restriction as the other stages: only open non-draft PRs authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax` are eligible to receive loop-managed review or merge labels.
+Open PR triage follows the same normalized actor restriction as the other stages: only open non-draft PRs authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax` are eligible to receive loop-managed review or merge labels.
 
 The orchestrator then triages open non-draft PRs for active review. The goal is to identify which open PRs should carry `ready-for-open-review` and which are still waiting for review input, CI, or manual decisions.
 
@@ -428,6 +439,8 @@ At the time of writing:
 - `triage-open-prs.prompt.md` exists for open-PR queue reconciliation
 - `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, and `merge-ready-pr.prompt.md` remain the serialized single-process execution prompts
 - `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
+- `tools/loop_claim.sh` now implements the lease protocol expected by the worker prompts
+- the concurrent path is prompt-complete and lease-protocol-complete, but it is still not scheduler-complete because the repo does not yet include a worker dispatcher that polls queues, claims work, and launches the per-lane workers
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
 

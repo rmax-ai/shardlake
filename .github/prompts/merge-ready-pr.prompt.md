@@ -26,7 +26,7 @@ Requirements:
    - open
    - not in draft state
    - labeled `ready-to-merge`
-   - authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+   - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
 3. Fetch the latest PR metadata, including author identity, status checks, review state, and labels.
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
@@ -48,6 +48,7 @@ If the target PR fails the workflow actor guard rail or its author identity cann
 
 Worktree guidance:
 
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
 - Run `gh pr checkout <pr-number>` only after `cd` into the prepared worktree path returned by the helper.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
