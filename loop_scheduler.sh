@@ -132,20 +132,25 @@ launch_worker() {
     cd "$REPO_ROOT"
     COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane "$lane"
   ) >"$log_file" 2>&1 &
-  printf '%s\n' "$!"
+  LAUNCHED_WORKER_PID="$!"
 }
 
 wait_for_worker() {
   local lane="$1"
   local pid="$2"
   local log_file="$3"
+  local status
 
-  if wait "$pid"; then
+  set +e
+  wait "$pid"
+  status=$?
+  set -e
+
+  if [[ "$status" -eq 0 ]]; then
     echo "[loop_scheduler] worker lane=${lane} completed successfully"
     return 0
   fi
 
-  status=$?
   echo "[loop_scheduler] worker lane=${lane} failed with status ${status}; log=${log_file}" >&2
   sed -n '1,200p' "$log_file" >&2 || true
   exit "$status"
@@ -168,12 +173,14 @@ dispatch_workers() {
 
   if [[ "$RUN_DRAFT_REVIEW" == "yes" ]]; then
     draft_log="$LOG_DIR/cycle_${cycle}_draft-review.log"
-    draft_pid="$(launch_worker draft-review "$draft_log")"
+    launch_worker draft-review "$draft_log"
+    draft_pid="$LAUNCHED_WORKER_PID"
   fi
 
   if [[ "$RUN_OPEN_REVIEW" == "yes" ]]; then
     open_log="$LOG_DIR/cycle_${cycle}_open-review.log"
-    open_pid="$(launch_worker open-review "$open_log")"
+    launch_worker open-review "$open_log"
+    open_pid="$LAUNCHED_WORKER_PID"
   fi
 
   if [[ -n "$draft_pid" ]]; then
@@ -185,12 +192,24 @@ dispatch_workers() {
   fi
 
   if [[ "$RUN_MERGE" == "yes" ]]; then
+    local merge_status
+
     merge_log="$LOG_DIR/cycle_${cycle}_merge.log"
     echo "[loop_scheduler] launching worker lane=merge"
+    set +e
     (
       cd "$REPO_ROOT"
       COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane merge
     ) >"$merge_log" 2>&1
+    merge_status=$?
+    set -e
+
+    if [[ "$merge_status" -ne 0 ]]; then
+      echo "[loop_scheduler] worker lane=merge failed with status ${merge_status}; log=${merge_log}" >&2
+      sed -n '1,200p' "$merge_log" >&2 || true
+      exit "$merge_status"
+    fi
+
     echo "[loop_scheduler] worker lane=merge completed successfully"
   fi
 }
