@@ -1,4 +1,5 @@
-//! Offline index builder: partitions vectors into shards using K-means.
+//! Offline index builder: partitions vectors into shards using an IVF coarse
+//! quantizer trained with K-means.
 
 use chrono::Utc;
 use rand::{seq::SliceRandom, SeedableRng};
@@ -23,6 +24,7 @@ use crate::{
     shard::{PqShard, ShardIndex},
     IndexError, Result, PQ8_CODEC,
 };
+use crate::{ivf::IvfQuantizer, shard::ShardIndex, IndexError, Result};
 
 /// Parameters for an index build operation.
 pub struct BuildParams {
@@ -115,7 +117,7 @@ impl<'a> IndexBuilder<'a> {
         let k = self.config.num_shards as usize;
         let iters = self.config.kmeans_iters;
 
-        info!(n, k, iters, "Running K-means to compute shard centroids");
+        info!(n, k, iters, "Training IVF coarse quantizer");
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(self.config.kmeans_seed);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
@@ -153,18 +155,18 @@ impl<'a> IndexBuilder<'a> {
             );
         }
 
-        let centroids = kmeans(training_vecs, k, iters, &mut rng);
+        let quantizer = IvfQuantizer::train(training_vecs, k, iters, &mut rng);
 
-        info!("Assigning vectors to shards");
-        let mut shard_records: Vec<Vec<VectorRecord>> = vec![Vec::new(); k];
+        info!("Assigning vectors to IVF posting-list shards");
+        let mut shard_records: Vec<Vec<VectorRecord>> = vec![Vec::new(); quantizer.num_clusters()];
         for rec in records {
-            let shard = nearest_centroid(&rec.data, &centroids);
+            let shard = quantizer.assign(&rec.data);
             shard_records[shard].push(rec);
         }
 
         for (i, sr) in shard_records.iter().enumerate() {
             if sr.is_empty() {
-                warn!(shard = i, "shard is empty after assignment");
+                warn!(shard = i, "shard is empty after IVF assignment");
             }
         }
 
@@ -185,15 +187,43 @@ impl<'a> IndexBuilder<'a> {
         } else {
             None
         };
+        let mut non_empty_clusters: Vec<(usize, Vec<VectorRecord>)> = shard_records
+            .into_iter()
+            .enumerate()
+            .filter(|(_, shard_recs)| !shard_recs.is_empty())
+            .collect();
+        if non_empty_clusters.is_empty() {
+            return Err(IndexError::Other(
+                "IVF build produced no non-empty posting-list shards".into(),
+            ));
+        }
+        if non_empty_clusters.len() != quantizer.num_clusters() {
+            warn!(
+                requested_clusters = quantizer.num_clusters(),
+                retained_clusters = non_empty_clusters.len(),
+                "Compacting empty IVF clusters to preserve cluster-to-shard mapping"
+            );
+        }
+        let quantizer = IvfQuantizer::from_centroids(
+            non_empty_clusters
+                .iter()
+                .map(|(cluster_idx, _)| quantizer.centroids()[*cluster_idx].clone())
+                .collect(),
+        );
 
         let mut shard_defs = Vec::new();
         let mut actual_total: u64 = 0;
-        for (i, shard_recs) in shard_records.into_iter().enumerate() {
-            if shard_recs.is_empty() {
-                continue;
-            }
+        for (i, (_, shard_recs)) in non_empty_clusters.drain(..).enumerate() {
             let shard_id = ShardId(i as u32);
             let count = shard_recs.len() as u64;
+            let idx = ShardIndex {
+                shard_id,
+                dims,
+                centroids: vec![quantizer.centroids()[i].clone()],
+                records: shard_recs,
+            };
+            let bytes = idx.to_bytes()?;
+            let sha = crate::artifact_fingerprint(&bytes);
             let shard_artifact_key =
                 shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
 
@@ -233,7 +263,7 @@ impl<'a> IndexBuilder<'a> {
                 artifact_key: shard_artifact_key,
                 vector_count: count,
                 fingerprint: sha,
-                centroid: centroids[i].clone(),
+                centroid: quantizer.centroids()[i].clone(),
                 routing: Some(RoutingMetadata {
                     centroid_id: format!("shard-{:04}", shard_id.0),
                     index_type: "flat".into(),
@@ -241,6 +271,12 @@ impl<'a> IndexBuilder<'a> {
                 }),
             });
         }
+
+        // Persist the coarse quantizer as a separate artifact.
+        let cq_key = shardlake_storage::paths::index_coarse_quantizer_key(&index_version.0);
+        let cq_bytes = quantizer.to_bytes()?;
+        self.store.put(&cq_key, cq_bytes)?;
+        info!(key = %cq_key, clusters = quantizer.num_clusters(), "Coarse quantizer written");
 
         let build_duration_secs = build_start.elapsed().as_secs_f64();
 
@@ -257,7 +293,17 @@ impl<'a> IndexBuilder<'a> {
         };
 
         let mut algo_params = std::collections::BTreeMap::new();
-        algo_params.insert("num_shards".into(), serde_json::json!(k));
+        algo_params.insert(
+            "num_clusters".into(),
+            serde_json::json!(quantizer.num_clusters()),
+        );
+        // `num_shards` equals `num_clusters` for ivf-flat: each cluster maps to exactly one
+        // posting-list shard.  It is kept for backward compatibility with readers that
+        // expect this param from the former "kmeans-flat" builds.
+        algo_params.insert(
+            "num_shards".into(),
+            serde_json::json!(quantizer.num_clusters()),
+        );
         algo_params.insert("kmeans_iters".into(), serde_json::json!(iters));
         algo_params.insert(
             "kmeans_seed".into(),
@@ -300,13 +346,14 @@ impl<'a> IndexBuilder<'a> {
                 build_duration_secs,
             },
             algorithm: AlgorithmMetadata {
-                algorithm: "kmeans-flat".into(),
+                algorithm: "ivf-flat".into(),
                 variant: None,
                 params: algo_params,
             },
             shard_summary,
             compression,
             recall_estimate: None,
+            coarse_quantizer_key: Some(cq_key),
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;

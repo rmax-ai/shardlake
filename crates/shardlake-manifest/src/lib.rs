@@ -250,6 +250,13 @@ pub struct Manifest {
     /// `None` when not computed (e.g. prototype builds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_estimate: Option<RecallEstimate>,
+    /// Storage key of the IVF coarse-quantizer artifact (`coarse_quantizer.cq`).
+    ///
+    /// Present for indexes built with algorithm `"ivf-flat"`.  `None` for
+    /// older `"kmeans-flat"` indexes that pre-date IVF coarse-quantizer
+    /// persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse_quantizer_key: Option<String>,
 }
 
 impl Manifest {
@@ -366,6 +373,18 @@ impl Manifest {
         if self.compression.codec.trim().is_empty() {
             return Err(ManifestError::Validation(
                 "compression.codec must not be empty".into(),
+            ));
+        }
+        if let Some(key) = &self.coarse_quantizer_key {
+            if key.trim().is_empty() {
+                return Err(ManifestError::Validation(
+                    "coarse_quantizer_key must not be empty when present".into(),
+                ));
+            }
+        }
+        if self.algorithm.algorithm == "ivf-flat" && self.coarse_quantizer_key.is_none() {
+            return Err(ManifestError::Validation(
+                "algorithm 'ivf-flat' requires coarse_quantizer_key".into(),
             ));
         }
 

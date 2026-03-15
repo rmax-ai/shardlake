@@ -74,6 +74,7 @@ fn sample_manifest() -> Manifest {
         }),
         compression: CompressionConfig::default(),
         recall_estimate: None,
+        coarse_quantizer_key: None,
     }
 }
 
@@ -274,6 +275,17 @@ fn test_validate_rejects_negative_build_duration() {
     assert!(err
         .to_string()
         .contains("build_metadata.build_duration_secs must be finite and >= 0"));
+}
+
+#[test]
+fn test_validate_rejects_ivf_flat_without_coarse_quantizer_key() {
+    let mut m = sample_manifest();
+    m.algorithm.algorithm = "ivf-flat".into();
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("algorithm 'ivf-flat' requires coarse_quantizer_key"));
 }
 
 // ── manifest v4 routing metadata + lifecycle fields ───────────────────────────
