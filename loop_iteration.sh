@@ -103,7 +103,7 @@ run_prompt() {
     cd "$iteration_worktree"
     export SHARDLAKE_PRIMARY_ROOT="$REPO_ROOT"
     export SHARDLAKE_ITERATION_WORKTREE="$iteration_worktree"
-    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --add-dir /tmp -p "$prompt_text"
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp -p "$prompt_text"
   ) | tee "$output_file"
   command_status=${PIPESTATUS[0]}
   set -e
