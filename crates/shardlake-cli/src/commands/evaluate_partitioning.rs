@@ -171,8 +171,6 @@ pub async fn run(storage: PathBuf, args: EvaluatePartitioningArgs) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use shardlake_core::{
         config::SystemConfig,
         types::{

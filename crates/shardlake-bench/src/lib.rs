@@ -218,19 +218,17 @@ pub fn evaluate_partitioning(
     };
 
     // ── 2. Routing accuracy, recall@k, and shard hotness ──────────────────
-    // These require manifest centroid metadata (manifest_version ≥ 2) and at
-    // least one query vector.
     let centroids: Vec<Vec<f32>> = manifest.shards.iter().map(|s| s.centroid.clone()).collect();
     let has_centroids = !centroids.is_empty() && centroids.iter().all(|c| !c.is_empty());
 
-    if queries.is_empty() || !has_centroids {
+    if queries.is_empty() {
         return PartitioningReport {
             index_version: manifest.index_version.0.clone(),
             total_vectors,
             num_shards,
             k,
             nprobe,
-            num_queries: queries.len(),
+            num_queries: 0,
             min_shard_size,
             max_shard_size,
             mean_shard_size,
@@ -256,26 +254,31 @@ pub fn evaluate_partitioning(
         let gt = exact_search(&query.data, corpus, metric, k);
         let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
 
-        // Approximate search for recall impact.
+        // Approximate search for recall impact. This works for both modern and
+        // legacy manifests because `IndexSearcher` falls back to loading shard
+        // centroids from artifact bytes when the manifest does not embed them.
         let approx = searcher.search(&query.data, k, nprobe).unwrap_or_default();
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
         recalls.push(recall_at_k(&gt_ids, &approx_ids));
 
-        // Which shards are probed for this query?
-        let probe_indices = top_n_centroids(&query.data, &centroids, nprobe.min(centroids.len()));
-        for &idx in &probe_indices {
-            if idx < num_shards {
-                probe_counts[idx] += 1;
+        if has_centroids {
+            // Which shards are probed for this query?
+            let probe_indices =
+                top_n_centroids(&query.data, &centroids, nprobe.min(centroids.len()));
+            for &idx in &probe_indices {
+                if idx < num_shards {
+                    probe_counts[idx] += 1;
+                }
             }
-        }
 
-        // Routing accuracy: is the GT top-1 neighbour's assigned shard probed?
-        if let Some(&gt_top1_id) = gt_ids.first() {
-            if let Some(neighbor_data) = corpus_map.get(&gt_top1_id) {
-                let neighbor_shard = top_n_centroids(neighbor_data, &centroids, 1);
-                if let Some(&ns_idx) = neighbor_shard.first() {
-                    if probe_indices.contains(&ns_idx) {
-                        routing_correct += 1;
+            // Routing accuracy: is the GT top-1 neighbour's assigned shard probed?
+            if let Some(&gt_top1_id) = gt_ids.first() {
+                if let Some(neighbor_data) = corpus_map.get(&gt_top1_id) {
+                    let neighbor_shard = top_n_centroids(neighbor_data, &centroids, 1);
+                    if let Some(&ns_idx) = neighbor_shard.first() {
+                        if probe_indices.contains(&ns_idx) {
+                            routing_correct += 1;
+                        }
                     }
                 }
             }
@@ -283,23 +286,25 @@ pub fn evaluate_partitioning(
     }
 
     let n = queries.len();
-    // SAFETY: `queries` is non-empty here because we early-return above when
-    // `queries.is_empty()`, so `n > 0` is guaranteed.
     debug_assert!(n > 0, "queries must be non-empty at this point");
     let recall_at_k_val = recalls.iter().sum::<f64>() / n as f64;
-    let routing_accuracy_val = routing_correct as f64 / n as f64;
+    let routing_accuracy = has_centroids.then_some(routing_correct as f64 / n as f64);
 
-    let shard_hotness = per_shard_vector_counts
-        .iter()
-        .enumerate()
-        .map(|(i, &(shard_id, _))| ShardHotnessEntry {
-            shard_id,
-            probe_fraction: probe_counts[i] as f64 / n as f64,
-        })
-        .collect();
+    let shard_hotness = if has_centroids {
+        per_shard_vector_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &(shard_id, _))| ShardHotnessEntry {
+                shard_id,
+                probe_fraction: probe_counts[i] as f64 / n as f64,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     info!(
-        routing_accuracy = routing_accuracy_val,
+        routing_accuracy = ?routing_accuracy,
         recall_at_k = recall_at_k_val,
         imbalance_ratio,
         "Partition evaluation complete"
@@ -318,7 +323,7 @@ pub fn evaluate_partitioning(
         std_dev_shard_size,
         imbalance_ratio,
         per_shard_vector_counts,
-        routing_accuracy: Some(routing_accuracy_val),
+        routing_accuracy,
         recall_at_k: Some(recall_at_k_val),
         shard_hotness,
     }
@@ -453,6 +458,37 @@ mod tests {
         let hotness_sum: f64 = report.shard_hotness.iter().map(|e| e.probe_fraction).sum();
         // nprobe=1, so each query probes exactly 1 shard → sum = 1.0
         assert!((hotness_sum - 1.0_f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_partitioning_keeps_recall_for_legacy_manifests() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(40, 4);
+        let mut manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        manifest.manifest_version = 1;
+        for shard in &mut manifest.shards {
+            shard.centroid.clear();
+        }
+
+        let queries: Vec<VectorRecord> = records[..10].to_vec();
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let report = evaluate_partitioning(
+            &searcher,
+            &queries,
+            &records,
+            5,
+            1,
+            DistanceMetric::Euclidean,
+        );
+
+        assert_eq!(report.num_queries, 10);
+        assert!(report.routing_accuracy.is_none());
+        assert!(report.shard_hotness.is_empty());
+        assert!(report.recall_at_k.is_some());
+        let recall = report.recall_at_k.unwrap();
+        assert!((0.0..=1.0).contains(&recall));
     }
 
     #[test]
