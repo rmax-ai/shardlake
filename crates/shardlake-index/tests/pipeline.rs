@@ -43,6 +43,7 @@ fn default_config(root: &std::path::Path, num_shards: usize) -> SystemConfig {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
     }
 }
 
@@ -123,6 +124,7 @@ fn test_default_pipeline_search_returns_nearest_neighbour() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-pipe"),
             metadata_key: paths::dataset_metadata_key("ds-pipe"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -158,6 +160,7 @@ fn test_pipeline_stage_ordering() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-order"),
             metadata_key: paths::dataset_metadata_key("ds-order"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -219,6 +222,7 @@ fn test_pipeline_with_custom_reranker() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-rerank"),
             metadata_key: paths::dataset_metadata_key("ds-rerank"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -259,6 +263,7 @@ fn test_pipeline_rejects_dimension_mismatch() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-dim"),
             metadata_key: paths::dataset_metadata_key("ds-dim"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -298,6 +303,7 @@ fn test_pipeline_data_handoff_through_custom_embedder() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-embed"),
             metadata_key: paths::dataset_metadata_key("ds-embed"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -349,6 +355,7 @@ fn test_pipeline_cached_loader_avoids_duplicate_shard_loads() {
         kmeans_iters: 10,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
     };
     let records = make_records(40, 4);
 
@@ -362,6 +369,7 @@ fn test_pipeline_cached_loader_avoids_duplicate_shard_loads() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-cache"),
             metadata_key: paths::dataset_metadata_key("ds-cache"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -427,6 +435,7 @@ fn test_pipeline_exact_and_ann_paths_through_same_skeleton() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-ann"),
             metadata_key: paths::dataset_metadata_key("ds-ann"),
+            pq_params: None,
         })
         .unwrap();
 
