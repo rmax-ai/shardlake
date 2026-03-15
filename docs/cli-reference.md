@@ -369,3 +369,98 @@ shardlake --storage /mnt/data validate-manifest \
   --index-version idx-v1 \
   --dataset-version ds-v1
 ```
+
+---
+
+## `shardlake evaluate-partitioning`
+
+Evaluates the quality of an existing index partition.  Reports shard size
+distribution, routing accuracy, recall impact, and per-shard hotness.
+
+Requires a previously built index (created with `build-index` and optionally
+published with `publish`).
+
+### Usage
+
+```
+shardlake [--storage <PATH>] evaluate-partitioning [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(optional)* | Index version to evaluate; takes precedence over `--alias` when both are supplied |
+| `--alias <STRING>` | string | `latest` | Alias to resolve when `--index-version` is not provided |
+| `--k <N>` | usize | `10` | Number of nearest neighbours for recall@k evaluation. Must be ≥ 1. |
+| `--nprobe <N>` | usize | `2` | Number of shards to probe per query. Must be ≥ 1. |
+| `--max-queries <N>` | usize | `0` | Maximum query vectors to use from the corpus (0 = min(corpus size, 100)) |
+
+### Output
+
+Printed to stdout:
+
+```
+=== Partition Evaluation Report ===
+  Index version:       idx-v1
+  Total vectors:       10000
+  Shards:              4
+  k:                   10
+  nprobe:              2
+  Queries:             100
+
+Shard Size Distribution:
+  shard-0000:      2543 vectors  ( 25.4%)
+  shard-0001:      2501 vectors  ( 25.0%)
+  shard-0002:      2456 vectors  ( 24.6%)
+  shard-0003:      2500 vectors  ( 25.0%)
+  Min:         2456    Max: 2543
+  Mean:        2500.0  Std dev: 31.1
+  Imbalance:   1.017  (max / mean)
+
+Routing & Recall (nprobe=2):
+  Routing accuracy:    0.9800
+  Recall@10:           0.9400
+
+Shard Hotness (fraction of queries that probe each shard, nprobe=2):
+  shard-0000:  0.5100
+  shard-0001:  0.4900
+  shard-0002:  0.4800
+  shard-0003:  0.5200
+```
+
+**Shard Size Distribution** fields:
+
+| Field | Description |
+|-------|-------------|
+| `shard-NNNN: N vectors (PP.P%)` | Per-shard vector count and percentage of total |
+| `Min` / `Max` | Smallest and largest shard sizes |
+| `Mean` / `Std dev` | Population mean and standard deviation of shard sizes |
+| `Imbalance` | `max / mean`; 1.0 = perfectly balanced, higher = more skewed |
+
+**Routing & Recall** fields (only printed when query vectors are available):
+
+| Field | Description |
+|-------|-------------|
+| `Routing accuracy` | Fraction of queries where the exact top-1 neighbour's assigned shard is among the `nprobe` probed shards. Printed as `n/a` when the manifest was built without centroid metadata (manifest_version < 2). |
+| `Recall@k` | Fraction of ground-truth top-k ids returned by approximate search with the specified `nprobe` setting (recall impact of the current partition). |
+
+**Shard Hotness** (only printed when query vectors and centroid metadata are available):
+
+| Field | Description |
+|-------|-------------|
+| `shard-NNNN: F` | Fraction of evaluated queries that probed this shard. Fractions sum to `min(nprobe, number of shards)` because each query probes at most that many shards. |
+
+### Example
+
+```bash
+# Evaluate the "latest" index with default settings
+shardlake evaluate-partitioning
+
+# Evaluate a specific version with a larger query sample and more probes
+shardlake evaluate-partitioning \
+  --index-version idx-v1 \
+  --k 10 \
+  --nprobe 4 \
+  --max-queries 500
+```

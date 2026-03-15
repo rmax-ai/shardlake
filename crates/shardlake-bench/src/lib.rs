@@ -1,8 +1,9 @@
 //! Benchmark harness: recall@k vs exact baseline, latency, artifact size.
+//! Also provides partition evaluation utilities.
 
 pub mod generate;
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -13,9 +14,24 @@ use shardlake_core::{
 };
 use shardlake_index::{
     exact::{exact_search, recall_at_k},
+    kmeans::top_n_centroids,
     IndexSearcher,
 };
 use shardlake_storage::{paths, ObjectStore};
+
+/// Errors that can arise while evaluating partition quality.
+#[derive(Debug, thiserror::Error)]
+pub enum PartitioningError {
+    /// Approximate search failed for one of the evaluated queries.
+    #[error("approximate search failed for query {query_id}: {source}")]
+    ApproximateSearch {
+        /// The record id of the query being evaluated.
+        query_id: u64,
+        /// The underlying search failure.
+        #[source]
+        source: shardlake_index::IndexError,
+    },
+}
 
 /// Summary statistics for one benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,10 +110,319 @@ pub fn run_benchmark(
     report
 }
 
+// ── Partition evaluation ───────────────────────────────────────────────────────
+
+/// Per-shard hotness entry: how often a shard was probed relative to query count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardHotnessEntry {
+    /// 0-based shard identifier (matches [`shardlake_core::types::ShardId`]).
+    pub shard_id: u32,
+    /// Fraction of evaluated queries that probed this shard (in `[0, 1]`).
+    pub probe_fraction: f64,
+}
+
+/// Full partition quality report produced by [`evaluate_partitioning`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitioningReport {
+    /// Index version this report was generated for.
+    pub index_version: String,
+    /// Total number of vectors in the index.
+    pub total_vectors: u64,
+    /// Number of non-empty shards.
+    pub num_shards: usize,
+    /// The *k* used for recall@k computation.
+    pub k: usize,
+    /// Number of shards probed per query.
+    pub nprobe: usize,
+    /// Number of query vectors used for routing / recall evaluation.
+    pub num_queries: usize,
+    // ── Shard size distribution ────────────────────────────────────────────
+    /// Vector count of the smallest shard.
+    pub min_shard_size: u64,
+    /// Vector count of the largest shard.
+    pub max_shard_size: u64,
+    /// Mean vector count across all shards.
+    pub mean_shard_size: f64,
+    /// Population standard deviation of shard vector counts.
+    pub std_dev_shard_size: f64,
+    /// Imbalance ratio: `max_shard_size / mean_shard_size`.
+    ///
+    /// A perfectly balanced partition has imbalance 1.0; values above 1.0
+    /// indicate progressively more skewed distributions.
+    pub imbalance_ratio: f64,
+    /// Per-shard vector counts: `(shard_id, vector_count)` pairs in shard order.
+    pub per_shard_vector_counts: Vec<(u32, u64)>,
+    // ── Routing accuracy ──────────────────────────────────────────────────
+    /// Fraction of queries where the exact top-1 neighbour's assigned shard
+    /// was among the `nprobe` probed shards.
+    ///
+    /// `None` when the manifest lacks centroid metadata (manifest_version < 2)
+    /// or when no query vectors were evaluated.
+    pub routing_accuracy: Option<f64>,
+    // ── Recall impact ─────────────────────────────────────────────────────
+    /// Recall@k achieved with the current partition and `nprobe` setting.
+    ///
+    /// `None` when no query vectors were evaluated.
+    pub recall_at_k: Option<f64>,
+    // ── Shard hotness ─────────────────────────────────────────────────────
+    /// Per-shard probe fractions across all evaluated queries.
+    ///
+    /// Empty when no query vectors were evaluated or centroid metadata is
+    /// absent (manifest_version < 2).
+    pub shard_hotness: Vec<ShardHotnessEntry>,
+}
+
+/// Evaluate partition quality against a built index.
+///
+/// Computes:
+/// - **Shard size distribution** directly from `manifest.shards`.
+/// - **Routing accuracy**: fraction of queries where the exact top-1 neighbour's
+///   assigned shard (nearest centroid) is in the `nprobe`-probed set.
+/// - **Recall impact**: recall@k achieved with the current `nprobe` setting.
+/// - **Shard hotness**: per-shard fraction of queries that probe each shard.
+///
+/// `queries` is the sample of vectors used for routing / recall measurements.
+/// `corpus` is the full set of vectors used as the exact-search ground truth.
+/// Routing accuracy and hotness are skipped (set to `None` / empty) when the
+/// manifest lacks centroid metadata (manifest_version < 2).
+pub fn evaluate_partitioning(
+    searcher: &IndexSearcher,
+    queries: &[VectorRecord],
+    corpus: &[VectorRecord],
+    k: usize,
+    nprobe: usize,
+    metric: DistanceMetric,
+) -> Result<PartitioningReport, PartitioningError> {
+    let manifest = searcher.manifest();
+
+    // ── 1. Shard size distribution ─────────────────────────────────────────
+    let per_shard_vector_counts: Vec<(u32, u64)> = manifest
+        .shards
+        .iter()
+        .map(|s| (s.shard_id.0, s.vector_count))
+        .collect();
+
+    let num_shards = manifest.shards.len();
+    let total_vectors = manifest.total_vector_count;
+
+    let min_shard_size = per_shard_vector_counts
+        .iter()
+        .map(|&(_, c)| c)
+        .min()
+        .unwrap_or(0);
+    let max_shard_size = per_shard_vector_counts
+        .iter()
+        .map(|&(_, c)| c)
+        .max()
+        .unwrap_or(0);
+    let mean_shard_size = if num_shards > 0 {
+        total_vectors as f64 / num_shards as f64
+    } else {
+        0.0
+    };
+    let variance = if num_shards > 0 {
+        per_shard_vector_counts
+            .iter()
+            .map(|&(_, c)| (c as f64 - mean_shard_size).powi(2))
+            .sum::<f64>()
+            / num_shards as f64
+    } else {
+        0.0
+    };
+    let std_dev_shard_size = variance.sqrt();
+    let imbalance_ratio = if mean_shard_size > 0.0 {
+        max_shard_size as f64 / mean_shard_size
+    } else {
+        0.0
+    };
+
+    // ── 2. Routing accuracy, recall@k, and shard hotness ──────────────────
+    let centroids: Vec<Vec<f32>> = manifest.shards.iter().map(|s| s.centroid.clone()).collect();
+    let has_centroids = !centroids.is_empty() && centroids.iter().all(|c| !c.is_empty());
+
+    if queries.is_empty() {
+        return Ok(PartitioningReport {
+            index_version: manifest.index_version.0.clone(),
+            total_vectors,
+            num_shards,
+            k,
+            nprobe,
+            num_queries: 0,
+            min_shard_size,
+            max_shard_size,
+            mean_shard_size,
+            std_dev_shard_size,
+            imbalance_ratio,
+            per_shard_vector_counts,
+            routing_accuracy: None,
+            recall_at_k: None,
+            shard_hotness: Vec::new(),
+        });
+    }
+
+    // Fast lookup: VectorId → vector data for GT neighbour assignment.
+    let corpus_map: HashMap<VectorId, &[f32]> =
+        corpus.iter().map(|r| (r.id, r.data.as_slice())).collect();
+
+    let mut routing_correct = 0usize;
+    let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut probe_counts = vec![0usize; num_shards];
+    let fan_out_policy = FanOutPolicy {
+        candidate_centroids: nprobe as u32,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+
+    for query in queries {
+        // Exact top-k ground truth for recall@k.
+        let gt = exact_search(&query.data, corpus, metric, k);
+        let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+        // Approximate search for recall impact. This works for both modern and
+        // legacy manifests because `IndexSearcher` falls back to loading shard
+        // centroids from artifact bytes when the manifest does not embed them.
+        let approx = searcher
+            .search(&query.data, k, &fan_out_policy)
+            .map_err(|source| PartitioningError::ApproximateSearch {
+                query_id: query.id.0,
+                source,
+            })?;
+        let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
+        recalls.push(recall_at_k(&gt_ids, &approx_ids));
+
+        if has_centroids {
+            // Which shards are probed for this query?
+            let probe_indices =
+                top_n_centroids(&query.data, &centroids, nprobe.min(centroids.len()));
+            for &idx in &probe_indices {
+                if idx < num_shards {
+                    probe_counts[idx] += 1;
+                }
+            }
+
+            // Routing accuracy: is the GT top-1 neighbour's assigned shard probed?
+            if let Some(&gt_top1_id) = gt_ids.first() {
+                if let Some(neighbor_data) = corpus_map.get(&gt_top1_id) {
+                    let neighbor_shard = top_n_centroids(neighbor_data, &centroids, 1);
+                    if let Some(&ns_idx) = neighbor_shard.first() {
+                        if probe_indices.contains(&ns_idx) {
+                            routing_correct += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let n = queries.len();
+    debug_assert!(n > 0, "queries must be non-empty at this point");
+    let recall_at_k_val = recalls.iter().sum::<f64>() / n as f64;
+    let routing_accuracy = has_centroids.then_some(routing_correct as f64 / n as f64);
+
+    let shard_hotness = if has_centroids {
+        per_shard_vector_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &(shard_id, _))| ShardHotnessEntry {
+                shard_id,
+                probe_fraction: probe_counts[i] as f64 / n as f64,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    info!(
+        routing_accuracy = ?routing_accuracy,
+        recall_at_k = recall_at_k_val,
+        imbalance_ratio,
+        "Partition evaluation complete"
+    );
+
+    Ok(PartitioningReport {
+        index_version: manifest.index_version.0.clone(),
+        total_vectors,
+        num_shards,
+        k,
+        nprobe,
+        num_queries: n,
+        min_shard_size,
+        max_shard_size,
+        mean_shard_size,
+        std_dev_shard_size,
+        imbalance_ratio,
+        per_shard_vector_counts,
+        routing_accuracy,
+        recall_at_k: Some(recall_at_k_val),
+        shard_hotness,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use shardlake_core::types::VectorId;
-    use shardlake_index::exact::recall_at_k;
+    use std::sync::Arc;
+
+    use shardlake_core::{
+        config::SystemConfig,
+        types::{
+            DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
+        },
+    };
+    use shardlake_index::{exact::recall_at_k, BuildParams, IndexBuilder, IndexSearcher};
+    use shardlake_storage::{LocalObjectStore, ObjectStore};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
+        (0..n)
+            .map(|i| {
+                let base = i * dims;
+                VectorRecord {
+                    id: VectorId(i as u64),
+                    data: (0..dims).map(|d| (base + d) as f32).collect(),
+                    metadata: None,
+                }
+            })
+            .collect()
+    }
+
+    fn build_test_index(
+        store: &LocalObjectStore,
+        records: Vec<VectorRecord>,
+        num_shards: u32,
+        storage_root: std::path::PathBuf,
+    ) -> shardlake_manifest::Manifest {
+        let dims = records[0].data.len();
+        let config = SystemConfig {
+            storage_root,
+            num_shards,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            pq_enabled: false,
+            pq_num_subspaces: SystemConfig::default_pq_num_subspaces(),
+            pq_codebook_size: SystemConfig::default_pq_codebook_size(),
+        };
+        IndexBuilder::new(store, &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-test".into()),
+                embedding_version: EmbeddingVersion("emb-test".into()),
+                index_version: IndexVersion("idx-test".into()),
+                metric: DistanceMetric::Euclidean,
+                dims,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-test"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-test"),
+                pq_params: None,
+            })
+            .unwrap()
+    }
 
     #[test]
     fn test_recall_perfect() {
@@ -111,5 +436,146 @@ mod tests {
         let gt = vec![VectorId(1), VectorId(2)];
         let ret = vec![VectorId(3), VectorId(4)];
         assert_eq!(recall_at_k(&gt, &ret), 0.0);
+    }
+
+    #[test]
+    fn evaluate_partitioning_reports_shard_size_distribution() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let report =
+            evaluate_partitioning(&searcher, &[], &records, 5, 1, DistanceMetric::Euclidean)
+                .unwrap();
+
+        assert_eq!(report.num_shards, report.per_shard_vector_counts.len());
+        assert_eq!(report.total_vectors, 20);
+        let total: u64 = report.per_shard_vector_counts.iter().map(|&(_, c)| c).sum();
+        assert_eq!(total, 20);
+        assert!(report.imbalance_ratio >= 1.0);
+        // No queries → routing/recall are None.
+        assert!(report.routing_accuracy.is_none());
+        assert!(report.recall_at_k.is_none());
+        assert!(report.shard_hotness.is_empty());
+    }
+
+    #[test]
+    fn evaluate_partitioning_reports_routing_and_recall_with_queries() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(40, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..10].to_vec();
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let report = evaluate_partitioning(
+            &searcher,
+            &queries,
+            &records,
+            5,
+            1,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap();
+
+        assert_eq!(report.num_queries, 10);
+        assert!(report.routing_accuracy.is_some());
+        let ra = report.routing_accuracy.unwrap();
+        assert!((0.0..=1.0).contains(&ra));
+
+        assert!(report.recall_at_k.is_some());
+        let r = report.recall_at_k.unwrap();
+        assert!((0.0..=1.0).contains(&r));
+
+        assert_eq!(report.shard_hotness.len(), report.num_shards);
+        let hotness_sum: f64 = report.shard_hotness.iter().map(|e| e.probe_fraction).sum();
+        // nprobe=1, so each query probes exactly 1 shard → sum = 1.0
+        assert!((hotness_sum - 1.0_f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_partitioning_keeps_recall_for_legacy_manifests() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(40, 4);
+        let mut manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        manifest.manifest_version = 1;
+        for shard in &mut manifest.shards {
+            shard.centroid.clear();
+        }
+
+        let queries: Vec<VectorRecord> = records[..10].to_vec();
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let report = evaluate_partitioning(
+            &searcher,
+            &queries,
+            &records,
+            5,
+            1,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap();
+
+        assert_eq!(report.num_queries, 10);
+        assert!(report.routing_accuracy.is_none());
+        assert!(report.shard_hotness.is_empty());
+        assert!(report.recall_at_k.is_some());
+        let recall = report.recall_at_k.unwrap();
+        assert!((0.0..=1.0).contains(&recall));
+    }
+
+    #[test]
+    fn evaluate_partitioning_std_dev_zero_for_equal_shards() {
+        // When all shards have exactly the same size, std_dev == 0 and imbalance == 1.
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        // 2 records, 1 shard → single shard with 2 vectors.
+        let records = make_records(2, 2);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 1, tmp.path().to_path_buf());
+
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let report =
+            evaluate_partitioning(&searcher, &[], &records, 1, 1, DistanceMetric::Euclidean)
+                .unwrap();
+
+        assert_eq!(report.num_shards, 1);
+        assert!((report.std_dev_shard_size - 0.0_f64).abs() < 1e-9);
+        assert!((report.imbalance_ratio - 1.0_f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_partitioning_propagates_search_errors() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(8, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let bad_query = VectorRecord {
+            id: VectorId(999),
+            data: vec![0.0, 1.0],
+            metadata: None,
+        };
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let err = evaluate_partitioning(
+            &searcher,
+            &[bad_query],
+            &records,
+            3,
+            1,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PartitioningError::ApproximateSearch { query_id: 999, .. }
+        ));
     }
 }
