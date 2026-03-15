@@ -83,7 +83,8 @@ Current labels defined by the orchestrator:
 
 | Label | Meaning |
 | ----- | ------- |
-| `ready-to-implement` | The issue is in the bounded implementation queue |
+| `ready-to-implement` | The issue is in the bounded implementation queue and is not yet assigned to Copilot |
+| `implementation-in-progress` | The issue is assigned to Copilot and actively being implemented |
 | `ready-for-draft-check` | A draft PR appears ready for a readiness review |
 | `ready-for-open-review` | An open non-draft PR is ready for review handling |
 | `ready-to-merge` | An open PR has completed review handling and is ready for a final merge pass |
@@ -191,7 +192,7 @@ The repository now has a prompt split for concurrent local execution without Git
 `.github/prompts/loop_reconcile.prompt.md` performs repository-wide reconciliation only. It:
 
 - triages the `ready-to-implement` issue queue
-- assigns currently ready issues
+- assigns currently ready issues and transitions them to `implementation-in-progress`
 - reconciles draft-PR labels
 - reconciles open-PR labels
 - publishes the draft-review, open-review, and merge queues
@@ -260,26 +261,27 @@ The orchestrator prompt defines a single-iteration workflow with bounded action 
 
 ### 1. Issue triage
 
-The issue triage stage maintains the `ready-to-implement` queue.
+The issue triage stage maintains the unassigned `ready-to-implement` queue.
 
 Its core rules are:
 
 - only child issues of open epics are eligible
 - only child issues whose author login passes the actor guard rail are eligible
+- issues already assigned to Copilot or already labeled `implementation-in-progress` are not eligible
 - blocked issues are not eligible
-- at most 5 open issues may hold `ready-to-implement`
+- at most 5 open unassigned issues may hold `ready-to-implement`
 - the queue is filled deterministically by epic number, then child issue number
 
 Operationally, this stage turns a larger backlog into a bounded implementation frontier.
 
 ### 2. Issue assignment
 
-The assignment stage hands actionable work to Copilot. The current checked-in supporting prompt for this responsibility is `.github/prompts/assign-open-non-blocked-epic-issues.prompt.md`, which operates on open, non-blocked epic child issues and assigns them to `copilot-swe-agent`.
+The assignment stage hands actionable work to Copilot. The current checked-in supporting prompt for this responsibility is `.github/prompts/assign-ready-issues.prompt.md`, which operates on open, unblocked issues already labeled `ready-to-implement`, assigns them to `copilot-swe-agent`, and transitions them to `implementation-in-progress`.
 
 Operators should treat assignment as a separate concern from triage:
 
 - triage decides which issues belong in the active queue
-- assignment decides which actionable issues should be handed to the agent
+- assignment decides which actionable issues should be handed to the agent and moves them into the in-progress state
 - assignment skips issues whose author login fails the actor guard rail
 
 ### 3. Draft PR triage
