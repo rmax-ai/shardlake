@@ -32,6 +32,7 @@ Definitions:
   - it is not labeled `needs-human`
   - it is not labeled `has-merge-conflicts`
   - its author login passes the workflow actor guard rail
+- A PR labeled `has-merge-conflicts` is excluded from the open-review and merge worker queues, but it may keep exactly one of `ready-for-open-review` or `ready-to-merge` as its routing label so conflict resolution can return it to the correct stage.
 
 Requirements:
 
@@ -42,11 +43,11 @@ Requirements:
 5. Reconcile the `ready-for-open-review` label deterministically:
    - add it to each eligible PR missing the label
    - remove it from any draft, closed, or merge-ready PR
-   - remove it from any PR labeled `needs-human` or `has-merge-conflicts`
+   - remove it from any PR labeled `needs-human`
    - remove it from any open PR that has no Copilot or Codex review comments yet
   - remove it from any PR whose author login falls outside the workflow actor guard rail or cannot be determined safely
 6. Reconcile obviously stale `ready-to-merge` labels:
-  - remove the label from any draft, closed, workflow-guard-rail-blocked, `needs-human`, or `has-merge-conflicts` PR still carrying it
+  - remove the label from any draft, closed, workflow-guard-rail-blocked, or `needs-human` PR still carrying it
   - if GitHub reports a real merge conflict for a PR, ensure `has-merge-conflicts` exists and add it when missing
   - do not add `needs-human` for a plain merge-conflict detection in this triage stage; reserve that escalation for a prior documented conflict-resolution failure on the current head/base pair or a separate required human design, architecture, policy, or product decision
 7. Do not decide merge readiness from local code checks in this prompt.

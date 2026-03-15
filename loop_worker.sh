@@ -182,6 +182,8 @@ def eligible(item: dict) -> bool:
   labels = {label["name"] for label in item.get("labels", [])}
   author = item.get("author") or {}
   author_login = author.get("login")
+  route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+  present_route_labels = route_labels & labels
 
   if item.get("state") != "OPEN":
     return False
@@ -211,11 +213,11 @@ def eligible(item: dict) -> bool:
       and "has-merge-conflicts" not in labels
     )
   if lane == "conflict-resolve":
-    return (
-      (not item.get("isDraft"))
-      and "has-merge-conflicts" in labels
-      and "needs-human" not in labels
-    )
+    if "has-merge-conflicts" not in labels or "needs-human" in labels:
+      return False
+    if item.get("isDraft"):
+      return present_route_labels == {"ready-for-draft-check"}
+    return present_route_labels in ({"ready-for-open-review"}, {"ready-to-merge"})
   raise SystemExit(f"unsupported lane: {lane}")
 
 
@@ -269,6 +271,8 @@ labels = {label["name"] for label in payload.get("labels", [])}
 author = payload.get("author") or {}
 author_login = author.get("login")
 allowed_logins = {"copilot-swe-agent", "copilot-swe-agent[bot]", "app/copilot-swe-agent", "rmax"}
+route_labels = {"ready-for-draft-check", "ready-for-open-review", "ready-to-merge"}
+present_route_labels = route_labels & labels
 errors = []
 
 if payload.get("state") != "OPEN":
@@ -307,10 +311,14 @@ elif lane == "merge":
     if "has-merge-conflicts" in labels:
         errors.append("PR is labeled has-merge-conflicts")
 elif lane == "conflict-resolve":
-    if payload.get("isDraft"):
-        errors.append("PR reverted to draft")
     if "has-merge-conflicts" not in labels:
         errors.append("PR no longer has has-merge-conflicts")
+  if payload.get("isDraft"):
+    if present_route_labels != {"ready-for-draft-check"}:
+      errors.append("draft conflict-resolve PR must keep exactly ready-for-draft-check as its routing label")
+  else:
+    if present_route_labels not in ({"ready-for-open-review"}, {"ready-to-merge"}):
+      errors.append("open conflict-resolve PR must keep exactly one routing label: ready-for-open-review or ready-to-merge")
 else:
     errors.append(f"unsupported lane: {lane}")
 
