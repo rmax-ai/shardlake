@@ -118,7 +118,7 @@ run_prompt() {
     cd "$iteration_worktree"
     export SHARDLAKE_PRIMARY_ROOT="$REPO_ROOT"
     export SHARDLAKE_ITERATION_WORKTREE="$iteration_worktree"
-    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp -p "$prompt_text
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --allow-all-paths --add-dir /tmp -p "$prompt_text
 
 ${gh_only_instruction}"
   ) | tee "$output_file"

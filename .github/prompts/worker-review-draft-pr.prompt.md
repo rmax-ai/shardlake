@@ -38,8 +38,11 @@ Requirements:
    - open
    - still in draft state
    - labeled `ready-for-draft-check`
+   - not labeled `needs-human`
+   - not labeled `has-merge-conflicts`
    - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
+   - still backed by `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; stop if the latest Copilot work event is no longer `copilot_work_finished`
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
 6. Fetch PR metadata, including author identity, changed files, linked issues, labels, and summary context.
@@ -56,6 +59,12 @@ Requirements:
 13. If changes were made:
    - rerun the affected quality gates until they pass or a hard blocker remains
    - commit and push only the changes needed for this PR
+   - immediately refresh the PR head SHA with the exact command `gh pr view <pr-number> --json headRefOid --jq .headRefOid`
+   - confirm that refreshed SHA exactly matches `git rev-parse HEAD` in the dedicated PR worktree; if it does not, stop and report both SHAs
+   - renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id> --head-sha <new-head-sha>` so the lease tracks the pushed commit
+   - inspect the lease again and confirm its recorded expected head SHA exactly matches that same refreshed SHA before any later durable write
+   - treat that renewed lease metadata and refreshed PR head SHA as the new expected head SHA for all remaining checks and writes
+   - stop immediately if the push, head refresh, or lease renewal fails or disagrees about the new head SHA
 14. Before changing PR state, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 15. If the PR is ready for review:
    - mark it ready with `gh pr ready <pr-number>`
@@ -66,9 +75,36 @@ Requirements:
 17. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
 18. Do not inspect or modify any other PR.
 
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` label exists and add it to the PR. Do not add `needs-human` for plain conflict detection in this prompt. Add `needs-human` only if a prior conflict-resolution attempt for the current head/base pair is already documented as failed or another independent required human design, architecture, policy, or product decision blocks safe automation. Leave a concise evidence-based PR comment describing whether the PR is being routed to the conflict-resolution lane or escalated to `needs-human`, do not advance the PR state in this run, and report the conflict clearly as the blocker.
+
+If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+
+If the PR already carries `needs-human` or `has-merge-conflicts`, stop immediately, report that the PR is excluded from draft review, and do not perform review work in this run.
+
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
-Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run pushes a new commit, refresh the new head with `gh pr view <pr-number> --json headRefOid --jq .headRefOid`, verify it matches `git rev-parse HEAD`, then renew again with `--head-sha <new-head-sha>` before any later PR state change, comment, or other durable GitHub write.
+
+Worktree guidance:
+
+- Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
+- Use `python3 $SHARDLAKE_PRIMARY_ROOT/tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` before branch work so a stale or premature `ready-for-draft-check` label does not advance the PR.
+- After the helper returns the worktree path, `cd` into that path before any PR checkout command.
+- Do not pass `--worktree` to `gh pr checkout`; the installed GitHub CLI in this workflow does not support that flag.
+- Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
+- If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
+
+Merge-conflict handling:
+
+- When you need to verify whether the PR is merge-conflicted, use `gh pr view <pr-number> --json mergeable` or another `gh` read that exposes the same state.
+- Treat `mergeable` values that indicate conflicts as authoritative for applying `has-merge-conflicts`.
+- Ensure the `has-merge-conflicts` label exists before adding it.
+- Treat conflicted PRs without `needs-human` as candidates for the dedicated `conflict-resolve` lane.
+- Add `needs-human` only when a prior bounded conflict-resolution attempt already failed for the current head/base pair or another required human design, architecture, policy, or product decision blocks safe automation.
+- A plain `mergeable=CONFLICTING` or `mergeStateStatus=DIRTY` read in this prompt is not enough to add `needs-human`.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts` to record a recoverable merge-conflict blocker.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts --add-label needs-human` only when escalating the conflict to terminal human handling.
+- Use `gh pr edit <pr-number> --add-label needs-human` and `gh pr comment <pr-number> --body-file <file>` when a human decision is required.
 
 Output format:
 

@@ -21,6 +21,7 @@ The remote lease protocol stores one active lease per PR lane at:
 
 Each ref tip is a synthetic commit containing a single lease.json file.
 Acquire and renew are compare-and-swap updates implemented as fast-forward pushes.
+Renew also replaces the recorded expected head SHA when `--head-sha <sha>` is provided.
 Release is a compare-and-swap delete implemented with --force-with-lease.
 EOF
   exit 64

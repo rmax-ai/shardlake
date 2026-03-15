@@ -17,6 +17,8 @@
 //! │       └── info.json               ← dataset_info_key
 //! ├── indexes/
 //! │   └── <index-version>/
+//! │       ├── manifest.json      ← index_manifest_key
+//! │       ├── pq_codebook.bin    ← index_pq_codebook_key (PQ builds only)
 //! │       ├── manifest.json           ← index_manifest_key
 //! │       ├── coarse_quantizer.cq     ← index_coarse_quantizer_key
 //! │       └── shards/
@@ -59,6 +61,16 @@ pub fn indexes_prefix() -> &'static str {
 /// naturally (`shard-10000.sidx`) without truncation.
 pub fn index_shard_key(index_version: &str, shard_number: u32) -> String {
     format!("indexes/{index_version}/shards/shard-{shard_number:04}.sidx")
+}
+
+/// Storage key for the PQ codebook artifact of a given index version.
+///
+/// The codebook is a single binary file that encodes all sub-space centroids
+/// trained during a product-quantisation build.  It is referenced by
+/// `CompressionConfig.codebook_key` in the manifest and loaded by
+/// `IndexSearcher` when searching PQ-compressed indexes.
+pub fn index_pq_codebook_key(index_version: &str) -> String {
+    format!("indexes/{index_version}/pq_codebook.bin")
 }
 
 /// Storage key for the IVF coarse-quantizer artifact of a given index version.
@@ -114,6 +126,14 @@ mod tests {
         assert_eq!(
             index_shard_key("idx-v1", 10_000),
             "indexes/idx-v1/shards/shard-10000.sidx"
+        );
+    }
+
+    #[test]
+    fn index_pq_codebook_key_has_stable_layout() {
+        assert_eq!(
+            index_pq_codebook_key("idx-v1"),
+            "indexes/idx-v1/pq_codebook.bin"
         );
     }
 

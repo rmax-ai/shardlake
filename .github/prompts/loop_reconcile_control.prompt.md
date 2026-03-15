@@ -13,7 +13,7 @@ Inputs:
 Definitions:
 
 - `Claimable work exists` means at least one issue or PR is currently eligible for a worker lane after reconciliation.
-- `All waiting on other agents` means no claimable work exists and every skipped draft PR was skipped only because agent work was still pending or ambiguous. Any open-review PR, ready-to-merge PR, human-blocked item, or policy-blocked item means the answer is `no`.
+- `All waiting on other agents` means no claimable work exists and every skipped draft PR was skipped only because agent work was still pending or ambiguous. Any open-review PR, ready-to-merge PR, conflict-resolution PR, human-blocked item, or policy-blocked item means the answer is `no`.
 
 Instructions:
 
