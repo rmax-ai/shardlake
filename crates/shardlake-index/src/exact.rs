@@ -87,13 +87,11 @@ pub fn recall_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
 
 /// Precision@k: fraction of retrieved ids that are in the ground-truth top-k.
 ///
-/// Returns `1.0` when `retrieved` is empty, consistent with the convention used by
-/// [`recall_at_k`] for empty ground-truth sets (i.e., the vacuous case is scored
-/// as perfect).  In practice the caller should ensure `retrieved` is non-empty
-/// before interpreting this value.
+/// Returns `0.0` when `retrieved` is empty because an ANN search that produces no
+/// candidates should not appear as a perfect-quality result.
 pub fn precision_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
     if retrieved.is_empty() {
-        return 1.0;
+        return 0.0;
     }
     let hits = retrieved
         .iter()
@@ -162,7 +160,7 @@ mod tests {
     #[test]
     fn test_precision_at_k_empty_retrieved() {
         let gt = vec![VectorId(1)];
-        assert_eq!(precision_at_k(&gt, &[]), 1.0);
+        assert_eq!(precision_at_k(&gt, &[]), 0.0);
     }
 
     #[test]
