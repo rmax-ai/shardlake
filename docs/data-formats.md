@@ -428,6 +428,76 @@ methods for serialisation.
 
 ---
 
+## Product-quantizer codebook binary format (`.pq`)
+
+The product-quantizer codebook encodes each vector as a sequence of small integer codes
+(one per sub-space) to enable fast Asymmetric Distance Computation (ADC) at query time.
+It is implemented by `shardlake_index::PqCodebook` and serialised with `to_bytes` /
+`from_bytes`.
+
+Binary, little-endian throughout.
+
+```
+Offset   Size             Field
+------   ----             -----
+0        8                Magic bytes: 0x534C4B5051434200 ("SLKPQCB\0")
+8        4                Format version (u32) — currently 1
+12       4                dims (u32)
+16       4                num_subspaces (u32)   — M
+20       4                num_centroids (u32)   — K (must be in [1, 256])
+24       4                sub_dims (u32)
+
+--- Codebooks (num_subspaces × num_centroids entries) ---
+outer loop: num_subspaces iterations (one per sub-space)
+  inner loop: num_centroids iterations (one centroid per sub-space)
+    sub_dims × 4          Centroid coordinates (f32 × sub_dims, little-endian)
+                          where sub_dims = dims / num_subspaces
+```
+
+### ADC scoring
+
+At query time the pipeline precomputes a distance table of shape `[M][K]`:
+
+```
+tables[m][k] = squared_euclidean(query_subvec[m], codebooks[m][k])
+```
+
+The approximate distance from the query to any encoded vector with codes `c[0..M]`
+is then a constant-time lookup sum:
+
+```
+approx_dist = sum over m: tables[m][c[m]]
+```
+
+This O(M) per-vector scoring replaces the O(dims) exact distance computation.
+
+### Pipeline integration
+
+`PqCodebook` is used by `PqCandidateStage` inside the composable
+[`QueryPipeline`](../crates/shardlake-index/src/pipeline.rs).  Combined with
+`ExactRerankStage`, the pipeline can first retrieve approximate candidates cheaply
+and then rerank the shortlist with exact distances:
+
+```
+let pq = Arc::new(PqCodebook::train(
+    &vectors,
+    PqParams {
+        num_subspaces: 4,
+        codebook_size: 256,
+    },
+    42,
+    20,
+)?);
+
+QueryPipeline::builder(store, manifest)
+    .candidate_stage(Arc::new(PqCandidateStage::new(pq)))
+    .rerank_stage(Arc::new(ExactRerankStage))
+    .rerank_oversample(10)
+    .build()
+```
+
+---
+
 ## Manifest integrity validation
 
 `shardlake_index::validator` provides a reusable validation layer that checks manifests

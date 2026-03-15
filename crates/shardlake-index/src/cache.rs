@@ -131,6 +131,12 @@ pub struct ShardCache<V> {
     misses: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheAccess {
+    Hit,
+    Miss,
+}
+
 impl<V: Send + 'static> ShardCache<V> {
     /// Create a cache that holds at most `capacity` entries.
     ///
@@ -161,6 +167,18 @@ impl<V: Send + 'static> ShardCache<V> {
     where
         F: FnOnce() -> Result<Arc<V>>,
     {
+        self.get_or_load_with_status(shard_id, load)
+            .map(|(value, _)| value)
+    }
+
+    pub(crate) fn get_or_load_with_status<F>(
+        &self,
+        shard_id: ShardId,
+        load: F,
+    ) -> Result<(Arc<V>, CacheAccess)>
+    where
+        F: FnOnce() -> Result<Arc<V>>,
+    {
         // Fast path: check the cache under the lock.
         {
             let mut guard = self
@@ -169,7 +187,7 @@ impl<V: Send + 'static> ShardCache<V> {
                 .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))?;
             if let Some(cached) = guard.get(&shard_id) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(cached);
+                return Ok((cached, CacheAccess::Hit));
             }
         }
 
@@ -183,7 +201,7 @@ impl<V: Send + 'static> ShardCache<V> {
             .lock()
             .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))?;
         guard.insert(shard_id, Arc::clone(&value));
-        Ok(value)
+        Ok((value, CacheAccess::Miss))
     }
 
     /// Return the cumulative number of cache hits.
