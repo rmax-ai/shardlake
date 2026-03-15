@@ -175,8 +175,6 @@ impl LoadShardStage for CachedShardLoader {
             }
         }
 
-        self.metrics.record_miss();
-
         let shard_def = self
             .manifest
             .shards
@@ -184,18 +182,21 @@ impl LoadShardStage for CachedShardLoader {
             .find(|shard| shard.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-        let t0 = Instant::now();
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        self.metrics.record_miss();
 
-        self.metrics.record_load(elapsed_ns, bytes.len() as u64);
+        let t0 = Instant::now();
+        let bytes = self.store.get(&shard_def.artifact_key);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        self.metrics.record_load_attempt(elapsed_ns);
+        let bytes = bytes?;
+        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
         cache.insert(shard_id, Arc::clone(&idx));
+        self.metrics.record_retained_bytes(bytes.len() as u64);
         Ok(idx)
     }
 }

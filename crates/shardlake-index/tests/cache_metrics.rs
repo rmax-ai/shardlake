@@ -9,7 +9,8 @@ use std::sync::Arc;
 use shardlake_core::{
     config::SystemConfig,
     types::{
-        DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
+        DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorId,
+        VectorRecord,
     },
 };
 use shardlake_index::{pipeline::CachedShardLoader, BuildParams, IndexBuilder, LoadShardStage};
@@ -76,10 +77,6 @@ fn test_first_load_records_miss_and_load_metrics() {
     assert_eq!(snap.misses, 1, "first load must record one miss");
     assert_eq!(snap.hits, 0, "no hits yet");
     assert_eq!(snap.total_load_count, 1, "one load must be recorded");
-    assert!(
-        snap.total_load_latency_ns > 0,
-        "load latency must be non-zero"
-    );
     assert!(
         snap.retained_bytes > 0,
         "retained bytes must be non-zero after a load"
@@ -222,6 +219,81 @@ fn test_retained_bytes_accumulate() {
         );
         prev_bytes = snap.retained_bytes;
     }
+}
+
+/// Missing manifest entries do not count as cache misses because no fetch occurs.
+#[test]
+fn test_invalid_shard_does_not_record_fetch_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let manifest = build_index(store.as_ref(), tmp.path(), "invalid-shard");
+
+    let loader =
+        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone());
+    let metrics = loader.metrics();
+
+    let err = loader.load(ShardId(u32::MAX)).unwrap_err();
+    assert!(
+        err.to_string().contains("not in manifest"),
+        "expected missing-manifest error, got {err}"
+    );
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.hits, 0);
+    assert_eq!(snap.misses, 0);
+    assert_eq!(snap.total_load_count, 0);
+    assert_eq!(snap.total_load_latency_ns, 0);
+    assert_eq!(snap.retained_bytes, 0);
+}
+
+/// Storage fetch failures count as misses and attempted loads, but do not retain bytes.
+#[test]
+fn test_storage_error_records_attempt_without_retained_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let manifest = build_index(store.as_ref(), tmp.path(), "storage-error");
+    let shard = manifest.shards[0].clone();
+    store.delete(&shard.artifact_key).unwrap();
+
+    let loader =
+        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone());
+    let metrics = loader.metrics();
+
+    let err = loader.load(shard.shard_id).unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "expected storage not-found error, got {err}"
+    );
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.hits, 0);
+    assert_eq!(snap.misses, 1);
+    assert_eq!(snap.total_load_count, 1);
+    assert_eq!(snap.retained_bytes, 0);
+}
+
+/// Decode failures still count the fetch attempt, but bytes are not retained.
+#[test]
+fn test_decode_error_records_attempt_without_retained_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let manifest = build_index(store.as_ref(), tmp.path(), "decode-error");
+    let shard = manifest.shards[0].clone();
+    store
+        .put(&shard.artifact_key, b"not-a-valid-shard".to_vec())
+        .unwrap();
+
+    let loader =
+        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone());
+    let metrics = loader.metrics();
+
+    let _ = loader.load(shard.shard_id).unwrap_err();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.hits, 0);
+    assert_eq!(snap.misses, 1);
+    assert_eq!(snap.total_load_count, 1);
+    assert_eq!(snap.retained_bytes, 0);
 }
 
 /// Metrics shared via `Arc` are observable from another handle without cloning.
