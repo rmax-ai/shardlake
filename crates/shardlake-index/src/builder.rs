@@ -19,12 +19,11 @@ use shardlake_manifest::{
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    kmeans::{kmeans, nearest_centroid},
+    ivf::IvfQuantizer,
     pq::{PqCodebook, PqParams},
     shard::{PqShard, ShardIndex},
     IndexError, Result, PQ8_CODEC,
 };
-use crate::{ivf::IvfQuantizer, shard::ShardIndex, IndexError, Result};
 
 /// Parameters for an index build operation.
 pub struct BuildParams {
@@ -110,6 +109,12 @@ impl<'a> IndexBuilder<'a> {
                 None
             }
         });
+
+        if resolved_pq.is_some() && metric != DistanceMetric::Euclidean {
+            return Err(IndexError::Other(
+                "PQ indexes currently support only euclidean distance".into(),
+            ));
+        }
 
         let build_start = std::time::Instant::now();
 
@@ -216,14 +221,6 @@ impl<'a> IndexBuilder<'a> {
         for (i, (_, shard_recs)) in non_empty_clusters.drain(..).enumerate() {
             let shard_id = ShardId(i as u32);
             let count = shard_recs.len() as u64;
-            let idx = ShardIndex {
-                shard_id,
-                dims,
-                centroids: vec![quantizer.centroids()[i].clone()],
-                records: shard_recs,
-            };
-            let bytes = idx.to_bytes()?;
-            let sha = crate::artifact_fingerprint(&bytes);
             let shard_artifact_key =
                 shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
 
@@ -231,14 +228,14 @@ impl<'a> IndexBuilder<'a> {
                 // PQ-encoded shard (format version 2).
                 let entries: Vec<_> = shard_recs
                     .iter()
-                    .map(|r| (r.id, cb.encode(&r.data)))
-                    .collect();
+                    .map(|r| cb.encode(&r.data).map(|codes| (r.id, codes)))
+                    .collect::<Result<Vec<_>>>()?;
                 let pq_shard = PqShard {
                     shard_id,
                     dims,
                     pq_m: cb.params.num_subspaces,
                     pq_k: cb.params.codebook_size,
-                    centroids: vec![centroids[i].clone()],
+                    centroids: vec![quantizer.centroids()[i].clone()],
                     entries,
                 };
                 pq_shard.to_bytes()?
@@ -247,7 +244,7 @@ impl<'a> IndexBuilder<'a> {
                 let idx = ShardIndex {
                     shard_id,
                     dims,
-                    centroids: vec![centroids[i].clone()],
+                    centroids: vec![quantizer.centroids()[i].clone()],
                     records: shard_recs,
                 };
                 idx.to_bytes()?
@@ -436,6 +433,39 @@ mod tests {
             .contains("record 2 has dimension mismatch: expected 2, got 3"));
     }
 
+    #[test]
+    fn build_rejects_pq_for_non_euclidean_metric() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+
+        let err = IndexBuilder::new(&store, &config)
+            .build(BuildParams {
+                records: vec![record(1, 4), record(2, 4)],
+                dataset_version: DatasetVersion("ds-pq-metric".into()),
+                embedding_version: EmbeddingVersion("emb-pq-metric".into()),
+                index_version: IndexVersion("idx-pq-metric".into()),
+                metric: DistanceMetric::Cosine,
+                dims: 4,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-pq-metric"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-pq-metric"),
+                pq_params: Some(PqParams {
+                    num_subspaces: 2,
+                    codebook_size: 4,
+                }),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("only euclidean distance"));
+    }
+
     /// Verify that when `kmeans_sample_size` is set, all vectors are still
     /// assigned (no records dropped), the manifest records the parameter, and
     /// the resulting shard artifact fingerprints are non-empty.
@@ -453,6 +483,7 @@ mod tests {
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             // Use a sample smaller than the full dataset.
             kmeans_sample_size: Some(10),
+            ..SystemConfig::default()
         };
 
         let records: Vec<VectorRecord> = (0..n)
@@ -473,6 +504,7 @@ mod tests {
                 dims,
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-sample"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-sample"),
+                pq_params: None,
             })
             .unwrap();
 
@@ -507,6 +539,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: Some(0),
+            ..SystemConfig::default()
         };
 
         let err = IndexBuilder::new(&store, &config)
@@ -536,6 +569,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: Some(99),
+            ..SystemConfig::default()
         };
 
         let manifest = IndexBuilder::new(&store, &config)
@@ -548,6 +582,7 @@ mod tests {
                 dims,
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-full"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-full"),
+                pq_params: None,
             })
             .unwrap();
 
@@ -581,6 +616,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: SystemConfig::default_kmeans_seed(),
                 kmeans_sample_size: Some(10),
+                ..SystemConfig::default()
             };
             IndexBuilder::new(&store, &config)
                 .build(BuildParams {
@@ -592,6 +628,7 @@ mod tests {
                     dims,
                     vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-det-sample"),
                     metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-det-sample"),
+                    pq_params: None,
                 })
                 .unwrap()
         };

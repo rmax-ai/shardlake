@@ -30,6 +30,7 @@ pub struct IndexSearcher {
     pq_shard_cache: Mutex<HashMap<ShardId, Arc<PqShard>>>,
     /// PQ codebook; loaded once on first PQ search, then cached.
     codebook: Mutex<Option<Arc<PqCodebook>>>,
+    metadata_cache: Mutex<Option<Arc<HashMap<String, serde_json::Value>>>>,
 }
 
 impl IndexSearcher {
@@ -46,6 +47,7 @@ impl IndexSearcher {
             cache: Mutex::new(HashMap::new()),
             pq_shard_cache: Mutex::new(HashMap::new()),
             codebook: Mutex::new(None),
+            metadata_cache: Mutex::new(None),
         }
     }
 
@@ -140,10 +142,17 @@ impl IndexSearcher {
         query: &[f32],
         probe_shards: &[ShardId],
         k: usize,
-        _metric: DistanceMetric,
+        metric: DistanceMetric,
     ) -> Result<Vec<SearchResult>> {
+        if metric != DistanceMetric::Euclidean {
+            return Err(IndexError::Other(
+                "PQ search currently supports only euclidean distance".into(),
+            ));
+        }
+
         let codebook = self.load_codebook()?;
-        let table = codebook.compute_distance_table(query);
+        let table = codebook.compute_distance_table(query)?;
+        let metadata_map = self.load_metadata_map()?;
 
         let mut all_results: Vec<SearchResult> = Vec::new();
 
@@ -155,7 +164,7 @@ impl IndexSearcher {
                 .map(|(id, codes)| SearchResult {
                     id: *id,
                     score: codebook.adc_distance(codes, &table),
-                    metadata: None,
+                    metadata: metadata_map.get(&id.to_string()).cloned(),
                 })
                 .collect();
             scored.sort_by(|a, b| {
@@ -218,6 +227,30 @@ impl IndexSearcher {
             .map_err(|_| IndexError::Other("codebook lock poisoned".into()))?;
         *guard = Some(Arc::clone(&cb));
         Ok(cb)
+    }
+
+    fn load_metadata_map(&self) -> Result<Arc<HashMap<String, serde_json::Value>>> {
+        {
+            let guard = self
+                .metadata_cache
+                .lock()
+                .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
+            if let Some(ref metadata) = *guard {
+                return Ok(Arc::clone(metadata));
+            }
+        }
+
+        let bytes = self.store.get(&self.manifest.metadata_key)?;
+        let metadata: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)
+            .map_err(|err| IndexError::Other(format!("invalid dataset metadata map: {err}")))?;
+        let metadata = Arc::new(metadata);
+
+        let mut guard = self
+            .metadata_cache
+            .lock()
+            .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
+        *guard = Some(Arc::clone(&metadata));
+        Ok(metadata)
     }
 
     /// Load a PQ-encoded shard from cache or store.

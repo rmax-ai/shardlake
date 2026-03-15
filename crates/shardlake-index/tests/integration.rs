@@ -12,6 +12,7 @@ use shardlake_core::{
     },
 };
 use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher, PqParams};
+use shardlake_manifest::{DatasetManifest, IngestMetadata, DATASET_MANIFEST_VERSION};
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore, StorageError};
 
 fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
@@ -281,6 +282,9 @@ fn test_pq_build_and_search() {
 
     // Use 8-dimensional vectors so we can split into 4 sub-spaces of 2 dims.
     let records = make_records(40, 8);
+    store
+        .put(&paths::dataset_metadata_key("ds-pq"), b"{}".to_vec())
+        .unwrap();
     let manifest = IndexBuilder::new(store.as_ref(), &config)
         .build(BuildParams {
             records: records.clone(),
@@ -360,6 +364,7 @@ fn test_pq_build_via_config() {
         pq_enabled: true,
         pq_num_subspaces: 2,
         pq_codebook_size: 4,
+        ..SystemConfig::default()
     };
 
     let records = make_records(20, 4);
@@ -429,4 +434,100 @@ fn test_pq_build_is_deterministic() {
             "PQ shard fingerprints must be identical across deterministic builds"
         );
     }
+}
+
+#[test]
+fn test_pq_search_preserves_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
+    };
+
+    let mut records = make_records(12, 8);
+    records[0].metadata = Some(serde_json::json!({"label": "first"}));
+    records[1].metadata = Some(serde_json::json!({"label": "second"}));
+
+    let metadata_key = paths::dataset_metadata_key("ds-pq-meta");
+    let metadata = serde_json::json!({
+        records[0].id.to_string(): records[0].metadata.clone().unwrap(),
+        records[1].id.to_string(): records[1].metadata.clone().unwrap(),
+    });
+    store
+        .put(&metadata_key, serde_json::to_vec(&metadata).unwrap())
+        .unwrap();
+    DatasetManifest {
+        manifest_version: DATASET_MANIFEST_VERSION,
+        dataset_version: DatasetVersion("ds-pq-meta".into()),
+        embedding_version: EmbeddingVersion("emb-pq-meta".into()),
+        dims: 8,
+        vector_count: records.len() as u64,
+        vectors_key: paths::dataset_vectors_key("ds-pq-meta"),
+        metadata_key: metadata_key.clone(),
+        ingest_metadata: Some(IngestMetadata {
+            ingested_at: chrono::Utc::now(),
+            ingester_version: "test".into(),
+        }),
+    }
+    .save(store.as_ref())
+    .unwrap();
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-pq-meta".into()),
+            embedding_version: EmbeddingVersion("emb-pq-meta".into()),
+            index_version: IndexVersion("idx-pq-meta".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 8,
+            vectors_key: paths::dataset_vectors_key("ds-pq-meta"),
+            metadata_key,
+            pq_params: Some(PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            }),
+        })
+        .unwrap();
+
+    let searcher = IndexSearcher::new(store as Arc<dyn shardlake_storage::ObjectStore>, manifest);
+    let results = searcher.search(&records[0].data, 3, 2).unwrap();
+    assert_eq!(results[0].id, records[0].id);
+    assert_eq!(results[0].metadata, records[0].metadata);
+}
+
+#[test]
+fn test_pq_build_rejects_non_euclidean_metric() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
+    };
+
+    let err = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: make_records(20, 8),
+            dataset_version: DatasetVersion("ds-pq-cos".into()),
+            embedding_version: EmbeddingVersion("emb-pq-cos".into()),
+            index_version: IndexVersion("idx-pq-cos".into()),
+            metric: DistanceMetric::Cosine,
+            dims: 8,
+            vectors_key: paths::dataset_vectors_key("ds-pq-cos"),
+            metadata_key: paths::dataset_metadata_key("ds-pq-cos"),
+            pq_params: Some(PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            }),
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("only euclidean distance"));
 }

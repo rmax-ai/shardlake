@@ -24,10 +24,10 @@ use shardlake_storage::{ObjectStore, StorageError};
 
 use crate::{
     artifact_fingerprint,
+    ivf::IvfQuantizer,
     shard::{PqShard, ShardIndex},
     PQ8_CODEC,
 };
-use crate::{artifact_fingerprint, ivf::IvfQuantizer, shard::ShardIndex};
 
 /// A single structured validation failure returned by the integrity engine.
 ///

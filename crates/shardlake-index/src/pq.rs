@@ -34,6 +34,7 @@ use crate::{
     kmeans::{kmeans, nearest_centroid},
     IndexError, Result,
 };
+use shardlake_core::error::CoreError;
 
 // ── Magic / format version ────────────────────────────────────────────────────
 
@@ -109,10 +110,25 @@ impl PqCodebook {
         }
         let dims = vectors[0].len();
         Self::validate_params(&params, dims)?;
+        for (idx, vector) in vectors.iter().enumerate() {
+            if vector.len() != dims {
+                return Err(IndexError::Core(CoreError::DimensionMismatch {
+                    expected: dims,
+                    got: vector.len(),
+                }))
+                .map_err(|err| match err {
+                    IndexError::Core(core) => IndexError::Other(format!(
+                        "PQ training vector {idx} has invalid dimension: {core}"
+                    )),
+                    other => other,
+                });
+            }
+        }
 
         let sub_dims = dims / params.num_subspaces;
         let k = params.codebook_size;
         let mut codebooks = Vec::with_capacity(params.num_subspaces);
+        let mut effective_codebook_size = k;
 
         for m in 0..params.num_subspaces {
             let start = m * sub_dims;
@@ -127,11 +143,21 @@ impl PqCodebook {
             let sub_seed = seed.wrapping_add(m as u64);
             let mut rng = rand::rngs::StdRng::seed_from_u64(sub_seed);
             let centroids = kmeans(&sub_vecs, k, kmeans_iters, &mut rng);
+            if m == 0 {
+                effective_codebook_size = centroids.len();
+            } else if centroids.len() != effective_codebook_size {
+                return Err(IndexError::Other(
+                    "PQ training produced inconsistent centroid counts across subspaces".into(),
+                ));
+            }
             codebooks.push(centroids);
         }
 
         Ok(Self {
-            params,
+            params: PqParams {
+                num_subspaces: params.num_subspaces,
+                codebook_size: effective_codebook_size,
+            },
             dims,
             sub_dims,
             codebooks,
@@ -144,7 +170,14 @@ impl PqCodebook {
     ///
     /// Each byte is the index of the nearest centroid in the corresponding
     /// sub-space codebook.
-    pub fn encode(&self, vector: &[f32]) -> Vec<u8> {
+    pub fn encode(&self, vector: &[f32]) -> Result<Vec<u8>> {
+        if vector.len() != self.dims {
+            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                expected: self.dims,
+                got: vector.len(),
+            }));
+        }
+
         let mut codes = Vec::with_capacity(self.params.num_subspaces);
         for m in 0..self.params.num_subspaces {
             let start = m * self.sub_dims;
@@ -153,11 +186,11 @@ impl PqCodebook {
             let code = nearest_centroid(sub_vec, &self.codebooks[m]);
             codes.push(code as u8);
         }
-        codes
+        Ok(codes)
     }
 
     /// Encode a slice of vectors, returning one code vector per input vector.
-    pub fn encode_batch(&self, vectors: &[Vec<f32>]) -> Vec<Vec<u8>> {
+    pub fn encode_batch(&self, vectors: &[Vec<f32>]) -> Result<Vec<Vec<u8>>> {
         vectors.iter().map(|v| self.encode(v)).collect()
     }
 
@@ -169,7 +202,14 @@ impl PqCodebook {
     /// of `query` and the `k`-th centroid of sub-space `m`.  Pre-computing
     /// this table once per query allows the approximate distance to any encoded
     /// vector to be computed with only `M` table look-ups.
-    pub fn compute_distance_table(&self, query: &[f32]) -> Vec<Vec<f32>> {
+    pub fn compute_distance_table(&self, query: &[f32]) -> Result<Vec<Vec<f32>>> {
+        if query.len() != self.dims {
+            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                expected: self.dims,
+                got: query.len(),
+            }));
+        }
+
         let m = self.params.num_subspaces;
         let k = self.params.codebook_size;
         let mut table = vec![vec![0.0f32; k]; m];
@@ -188,7 +228,7 @@ impl PqCodebook {
             }
         }
 
-        table
+        Ok(table)
     }
 
     /// Compute the approximate squared-L2 distance between `query` (represented
@@ -422,7 +462,7 @@ mod tests {
         };
         let cb = PqCodebook::train(&vectors, params.clone(), 0, 10).unwrap();
 
-        let codes = cb.encode(&vectors[0]);
+        let codes = cb.encode(&vectors[0]).unwrap();
         assert_eq!(codes.len(), params.num_subspaces);
         for &c in &codes {
             assert!((c as usize) < params.codebook_size, "code {c} out of range");
@@ -438,8 +478,8 @@ mod tests {
         };
         let cb = PqCodebook::train(&vectors, params, 42, 10).unwrap();
 
-        let c1 = cb.encode(&vectors[0]);
-        let c2 = cb.encode(&vectors[0]);
+        let c1 = cb.encode(&vectors[0]).unwrap();
+        let c2 = cb.encode(&vectors[0]).unwrap();
         assert_eq!(c1, c2);
     }
 
@@ -453,8 +493,8 @@ mod tests {
         let cb = PqCodebook::train(&vectors, params, 0, 10).unwrap();
 
         let query = &vectors[0];
-        let table = cb.compute_distance_table(query);
-        let codes = cb.encode(query);
+        let table = cb.compute_distance_table(query).unwrap();
+        let codes = cb.encode(query).unwrap();
         let dist = cb.adc_distance(&codes, &table);
         assert!(dist >= 0.0, "ADC distance must be non-negative, got {dist}");
     }
@@ -481,8 +521,8 @@ mod tests {
             .chain(cb.codebooks[3][0].iter().cloned())
             .collect::<Vec<f32>>();
 
-        let table = cb.compute_distance_table(&centroid);
-        let codes = cb.encode(&centroid);
+        let table = cb.compute_distance_table(&centroid).unwrap();
+        let codes = cb.encode(&centroid).unwrap();
         let dist = cb.adc_distance(&codes, &table);
         assert!(
             dist < 1e-4,
@@ -515,6 +555,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn train_rejects_inconsistent_vector_dimensions() {
+        let vectors = vec![vec![0.0; 8], vec![1.0; 7]];
+        let err = PqCodebook::train(
+            &vectors,
+            PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            },
+            0,
+            10,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid dimension"));
+    }
+
+    #[test]
+    fn train_clamps_codebook_size_to_available_vectors() {
+        let vectors = make_vectors(2, 8, 11);
+        let cb = PqCodebook::train(
+            &vectors,
+            PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            },
+            0,
+            10,
+        )
+        .unwrap();
+        assert_eq!(cb.params.codebook_size, 2);
+        assert!(cb.codebooks.iter().all(|sub| sub.len() == 2));
+    }
+
+    #[test]
+    fn encode_rejects_dimension_mismatch() {
+        let vectors = make_vectors(10, 8, 13);
+        let cb = PqCodebook::train(
+            &vectors,
+            PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            },
+            0,
+            10,
+        )
+        .unwrap();
+        let err = cb.encode(&vectors[0][..7]).unwrap_err();
+        assert!(err.to_string().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn distance_table_rejects_dimension_mismatch() {
+        let vectors = make_vectors(10, 8, 17);
+        let cb = PqCodebook::train(
+            &vectors,
+            PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            },
+            0,
+            10,
+        )
+        .unwrap();
+        let err = cb.compute_distance_table(&vectors[0][..7]).unwrap_err();
+        assert!(err.to_string().contains("dimension mismatch"));
     }
 
     #[test]
