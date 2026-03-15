@@ -99,8 +99,8 @@ re-reading the full JSONL file.
 | `vector_count` | integer | Total number of vectors in this dataset. Must be > 0. |
 | `vectors_key` | string | Storage key of the raw vectors JSONL file. |
 | `metadata_key` | string | Storage key of the id → metadata JSON file. |
-| `ingest_metadata.ingested_at` | ISO 8601 datetime | When the dataset was ingested (UTC). |
-| `ingest_metadata.ingester_version` | string | Semver version of the `shardlake` binary that ingested this dataset. |
+| `ingest_metadata.ingested_at` | ISO 8601 datetime | When the dataset was ingested or generated (UTC). |
+| `ingest_metadata.ingester_version` | string | Semver version of the `shardlake` binary that produced this dataset manifest. |
 
 ---
 

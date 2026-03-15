@@ -75,11 +75,17 @@ impl Default for GenerateConfig {
 ///
 /// # Panics
 ///
-/// Panics if any of `num_vectors`, `dims`, or `num_clusters` is zero.
+/// Panics if any of `num_vectors`, `dims`, or `num_clusters` is zero, or if
+/// `cluster_spread` is negative or non-finite.
 pub fn generate_dataset(config: &GenerateConfig) -> Vec<VectorRecord> {
     assert!(config.num_vectors > 0, "num_vectors must be > 0");
     assert!(config.dims > 0, "dims must be > 0");
     assert!(config.num_clusters > 0, "num_clusters must be > 0");
+    assert!(
+        config.cluster_spread.is_finite(),
+        "cluster_spread must be finite"
+    );
+    assert!(config.cluster_spread >= 0.0, "cluster_spread must be >= 0");
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
@@ -203,6 +209,24 @@ mod tests {
     fn rejects_zero_num_clusters() {
         generate_dataset(&GenerateConfig {
             num_clusters: 0,
+            ..default_config()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "cluster_spread must be >= 0")]
+    fn rejects_negative_cluster_spread() {
+        generate_dataset(&GenerateConfig {
+            cluster_spread: -0.1,
+            ..default_config()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "cluster_spread must be finite")]
+    fn rejects_non_finite_cluster_spread() {
+        generate_dataset(&GenerateConfig {
+            cluster_spread: f32::NAN,
             ..default_config()
         });
     }

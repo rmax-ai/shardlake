@@ -37,6 +37,11 @@ shardlake [--storage <PATH>] ingest --input <FILE> [OPTIONS]
 | `--dataset-version <STRING>` | string | `ds-<timestamp>` | Version tag for the ingested dataset |
 | `--embedding-version <STRING>` | string | same as `--dataset-version` | Version tag for the embedding artifact |
 
+### Validation
+
+- `--num-vectors`, `--dims`, and `--num-clusters` must each be greater than 0.
+- `--cluster-spread` must be finite and non-negative.
+
 ### Output
 
 Writes to `<storage>/datasets/<dataset-version>/`:
@@ -69,8 +74,9 @@ Generates a reproducible synthetic benchmark dataset and writes versioned
 dataset artifacts to storage.  Cluster centroids are drawn uniformly from
 `[-1, 1]^dims`; each vector is a randomly selected centroid perturbed by
 uniform noise in `[-cluster-spread, cluster-spread]^dims`.  Identical
-arguments and `--seed` values always produce identical stored artifacts, making
-repeated benchmark evaluations reproducible.
+arguments and `--seed` values always produce identical `vectors.jsonl`
+content, making repeated benchmark evaluations reproducible. The generated
+`info.json` manifest still records the current generation timestamp.
 
 ### Usage
 
@@ -89,6 +95,11 @@ shardlake [--storage <PATH>] generate [OPTIONS]
 | `--cluster-spread <F>` | f32 | `0.1` | Half-range of uniform noise added per dimension around each cluster centroid |
 | `--dataset-version <STRING>` | string | `ds-<timestamp>` | Version tag for the generated dataset |
 | `--embedding-version <STRING>` | string | same as `--dataset-version` | Version tag for the embedding artifact |
+
+### Validation
+
+- `--num-vectors`, `--dims`, and `--num-clusters` must each be greater than 0.
+- `--cluster-spread` must be finite and non-negative.
 
 ### Output
 

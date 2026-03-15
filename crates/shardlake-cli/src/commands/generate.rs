@@ -1,10 +1,11 @@
 //! `shardlake generate` – write a reproducible synthetic benchmark dataset to storage.
 //!
 //! Generates a clustered vector corpus with configurable dimension, cluster
-//! structure, and dataset size from a deterministic seed.  Identical arguments
-//! always produce identical stored artifacts.
+//! structure, and dataset size from a deterministic seed. Identical arguments
+//! and seeds produce identical generated vectors, while `info.json` records the
+//! current generation timestamp.
 
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -19,20 +20,20 @@ use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 #[derive(Parser, Debug)]
 pub struct GenerateArgs {
     /// Total number of vectors to generate.
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 1_000, value_parser = parse_positive_usize)]
     pub num_vectors: usize,
     /// Dimensionality of each generated vector.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
     pub dims: usize,
     /// Number of clusters controlling the synthetic corpus structure.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub num_clusters: usize,
     /// RNG seed for deterministic generation; the same seed always produces
     /// the same dataset.
     #[arg(long, default_value_t = 0xdead_beef)]
     pub seed: u64,
     /// Half-range of uniform noise added around each cluster centroid per
-    /// dimension.  Smaller values produce tighter clusters.
+    /// dimension. Smaller values produce tighter clusters.
     #[arg(long, default_value_t = 0.1)]
     pub cluster_spread: f32,
     /// Dataset version tag (defaults to a timestamp).
@@ -44,6 +45,8 @@ pub struct GenerateArgs {
 }
 
 pub async fn run(storage: PathBuf, args: GenerateArgs) -> Result<()> {
+    validate_generate_args(&args)?;
+
     let dataset_ver = args
         .dataset_version
         .unwrap_or_else(|| format!("ds-{}", Utc::now().format("%Y%m%dT%H%M%S")));
@@ -74,14 +77,19 @@ pub async fn run(storage: PathBuf, args: GenerateArgs) -> Result<()> {
     let vectors_key = paths::dataset_vectors_key(&dataset_ver);
     let metadata_key = paths::dataset_metadata_key(&dataset_ver);
 
-    let mut jsonl: Vec<u8> = Vec::new();
+    let mut vectors_writer = store
+        .create_writer(&vectors_key)
+        .context("failed to open vectors output")?;
     for record in &records {
-        let line = serde_json::to_string(record)
+        serde_json::to_writer(&mut vectors_writer, record)
             .with_context(|| format!("failed to serialise record {}", record.id))?;
-        jsonl.extend_from_slice(line.as_bytes());
-        jsonl.push(b'\n');
+        vectors_writer
+            .write_all(b"\n")
+            .with_context(|| format!("failed to write record {}", record.id))?;
     }
-    store.put(&vectors_key, jsonl)?;
+    vectors_writer
+        .flush()
+        .context("failed to flush vectors output")?;
 
     // Generated vectors carry no per-record metadata; write an empty object.
     store.put(&metadata_key, b"{}".to_vec())?;
@@ -116,6 +124,32 @@ pub async fn run(storage: PathBuf, args: GenerateArgs) -> Result<()> {
     Ok(())
 }
 
+fn parse_positive_usize(raw: &str) -> std::result::Result<usize, String> {
+    let value = raw.parse::<usize>().map_err(|err| err.to_string())?;
+    if value == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(value)
+}
+
+fn validate_generate_args(args: &GenerateArgs) -> Result<()> {
+    anyhow::ensure!(args.num_vectors > 0, "--num-vectors must be greater than 0");
+    anyhow::ensure!(args.dims > 0, "--dims must be greater than 0");
+    anyhow::ensure!(
+        args.num_clusters > 0,
+        "--num-clusters must be greater than 0"
+    );
+    anyhow::ensure!(
+        args.cluster_spread.is_finite(),
+        "--cluster-spread must be finite"
+    );
+    anyhow::ensure!(
+        args.cluster_spread >= 0.0,
+        "--cluster-spread must be non-negative"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -141,19 +175,16 @@ mod tests {
         .unwrap();
 
         let storage = tmp.path().join("storage");
-        // vectors JSONL should exist and have 20 lines.
         let vectors_path = storage.join("datasets/ds-gen-test/vectors.jsonl");
         let content = std::fs::read_to_string(&vectors_path).unwrap();
         let line_count = content.lines().count();
         assert_eq!(line_count, 20, "expected 20 vector lines, got {line_count}");
 
-        // metadata.json should be an empty JSON object.
         let meta_path = storage.join("datasets/ds-gen-test/metadata.json");
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
         assert_eq!(meta, serde_json::json!({}));
 
-        // info.json (dataset manifest) should record correct counts.
         let info_path = storage.join("datasets/ds-gen-test/info.json");
         let info: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(info_path).unwrap()).unwrap();
@@ -162,7 +193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_is_reproducible() {
+    async fn run_writes_reproducible_vectors_jsonl() {
         let tmp = tempdir().unwrap();
         let storage = tmp.path().join("storage");
 
@@ -189,5 +220,41 @@ mod tests {
             read_vectors("run-b"),
             "identical seeds must produce identical JSONL output"
         );
+    }
+
+    #[test]
+    fn validate_generate_args_rejects_zero_num_vectors() {
+        let err = validate_generate_args(&GenerateArgs {
+            num_vectors: 0,
+            dims: 4,
+            num_clusters: 2,
+            seed: 1,
+            cluster_spread: 0.1,
+            dataset_version: None,
+            embedding_version: None,
+        })
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--num-vectors must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_generate_args_rejects_negative_cluster_spread() {
+        let err = validate_generate_args(&GenerateArgs {
+            num_vectors: 1,
+            dims: 4,
+            num_clusters: 2,
+            seed: 1,
+            cluster_spread: -0.1,
+            dataset_version: None,
+            embedding_version: None,
+        })
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--cluster-spread must be non-negative"));
     }
 }
