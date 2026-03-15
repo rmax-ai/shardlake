@@ -1,11 +1,13 @@
 ---
 name: loop-control
-description: Derive the machine-readable loop control block from a completed loop iteration log.
+description: Derive the machine-readable loop control block from a completed serialized loop iteration log.
 ---
-Primary goal: read the completed loop iteration log passed in the invoking prompt and emit only the machine-readable loop control block.
+Primary goal: read the completed serialized loop iteration log passed in the invoking prompt and emit only the machine-readable loop control block.
 
-This prompt is responsible only for loop control synthesis. It must not inspect repository state, call GitHub, or propose workflow changes.
-It is intended to run as a final subagent step inside the main loop iteration session so the orchestrator does not need a second top-level Copilot invocation.
+This prompt is responsible only for serialized-loop control synthesis. It must not inspect repository state, call GitHub, or propose workflow changes.
+It is intended to run as a final subagent step inside the serialized main loop iteration session so the orchestrator does not need a second top-level Copilot invocation.
+
+Do not use this prompt for the concurrent local loop design. Concurrent reconciler runs should use `loop_reconcile_control.prompt.md` instead.
 
 Inputs:
 

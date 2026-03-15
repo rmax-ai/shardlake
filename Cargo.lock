@@ -870,6 +870,7 @@ name = "shardlake-bench"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rand",
  "serde",
  "serde_json",
  "shardlake-core",

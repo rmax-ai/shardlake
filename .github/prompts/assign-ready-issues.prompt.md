@@ -1,8 +1,8 @@
 ---
 name: assign-ready-issues
-description: Assign currently ready-to-implement issues to Copilot and nothing else.
+description: Assign currently ready-to-implement issues to Copilot, then transition them to implementation-in-progress.
 ---
-Primary goal: assign open, unblocked issues already labeled `ready-to-implement` to `copilot-swe-agent`.
+Primary goal: assign open, unblocked issues already labeled `ready-to-implement` to `copilot-swe-agent`, then replace `ready-to-implement` with `implementation-in-progress`.
 
 This prompt is responsible only for assignment. It must not triage labels, inspect PRs, or make code changes.
 
@@ -21,14 +21,34 @@ Requirements:
 1. Retrieve all open issues labeled `ready-to-implement`.
 2. For each such issue, verify before assignment:
    - it is still open
+  - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
    - it still has a parent epic in this repository
    - it still has no open blockers
-3. Assign only verified ready issues that are not already assigned to `copilot-swe-agent`.
-4. Prefer `gh issue edit <issue-number> --add-assignee "@copilot"`.
-5. If that fails because the CLI or token cannot resolve `@copilot`, fall back to the REST API agent-assignment payload.
-6. Verify the final assignee state after every assignment attempt.
-7. Skip any issue that is closed, blocked, missing a parent epic, or no longer labeled `ready-to-implement`.
-8. Do not alter labels in this prompt except when an assignment command requires an idempotent retry with no semantic change.
+3. Ensure the label `implementation-in-progress` exists.
+4. Assign only verified ready issues that are not already assigned to `copilot-swe-agent`.
+5. Prefer `gh issue edit <issue-number> --add-assignee "@copilot"`.
+6. If that fails because the CLI or token cannot resolve `@copilot`, fall back to the REST API agent-assignment payload.
+7. After each successful assignment, remove `ready-to-implement` and add `implementation-in-progress`.
+8. If a verified issue is already assigned to `copilot-swe-agent`, reconcile its labels so it carries `implementation-in-progress` instead of `ready-to-implement`.
+9. Verify the final assignee and label state after every assignment or reconciliation attempt.
+10. Skip any issue that is closed, blocked, authored outside the workflow actor guard rail, missing a parent epic, or no longer labeled `ready-to-implement`.
+
+Execution guidance:
+
+- Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
+- Use `gh label list` and `gh label create` to ensure the `implementation-in-progress` label exists before transitioning any issue.
+- Use this fixed verification pipeline:
+  1. Run `gh issue list --state open --label ready-to-implement --limit 200 --json number,title,assignees,labels,author` once to collect candidate issues.
+  2. Run one fixed `gh api graphql` query over the repository's open epic issues to collect each epic's `subIssues` and each child issue's `number`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
+  3. Derive whether each candidate still has a parent epic from that GraphQL sub-issue snapshot instead of from `gh issue view` JSON fields.
+  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints.
+- Retrieve or refresh each candidate issue's author login before assignment only when it is not already present in the initial snapshot.
+- Do not use `gh api graphql --repo ...` or `gh api --repo ...`; `gh api` in this environment does not support that flag, so repository identity must stay inside the GraphQL query variables.
+- Do not request `parent` from `gh issue view --json`; that field is not supported by the GitHub CLI issue JSON output.
+- Use `gh issue edit <issue-number> --remove-label ready-to-implement --add-label implementation-in-progress` only after the issue is verified to be assigned to `copilot-swe-agent`.
+- Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
+- If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
+- If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 REST fallback payload:
 
@@ -55,7 +75,7 @@ EOF
 Output format:
 
 1. Ready issues inspected
-2. Newly assigned to `copilot-swe-agent`
-3. Already assigned
+2. Newly assigned and moved to `implementation-in-progress`
+3. Already assigned or already transitioned
 4. Skipped with reasons
-5. Assignment failures, if any
+5. Assignment or transition failures, if any

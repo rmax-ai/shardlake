@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use shardlake_core::{error::CoreError, types::SearchResult};
+use shardlake_core::{config::FanOutPolicy, error::CoreError, types::SearchResult};
 use shardlake_index::IndexError;
 
 use crate::AppState;
@@ -18,7 +18,18 @@ use crate::AppState;
 pub struct QueryRequest {
     pub vector: Vec<f32>,
     pub k: usize,
+    /// Number of nearest centroids to select (overrides the server default).
+    /// Alias for `candidate_centroids`; kept for backward compatibility.
     pub nprobe: Option<usize>,
+    /// Number of nearest centroids to select for shard routing.
+    /// When present, takes precedence over `nprobe`.
+    pub candidate_centroids: Option<u32>,
+    /// Maximum number of shards to probe after deduplication.
+    /// `0` means no cap.  Overrides the server default when present.
+    pub candidate_shards: Option<u32>,
+    /// Maximum number of vectors to evaluate per probed shard.
+    /// `0` means no limit.  Overrides the server default when present.
+    pub max_vectors_per_shard: Option<u32>,
 }
 
 /// Query response envelope.
@@ -62,11 +73,50 @@ async fn query_handler(
         )
             .into_response();
     }
-    let nprobe = req.nprobe.unwrap_or(state.nprobe);
+
+    // Build per-request fan-out policy, falling back to server defaults.
+    // `candidate_centroids` takes precedence over the legacy `nprobe` field.
+    let legacy_candidate_centroids = match req.nprobe.map(u32::try_from).transpose() {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("nprobe must be <= {}", u32::MAX)
+                })),
+            )
+                .into_response();
+        }
+    };
+    let candidate_centroids = req
+        .candidate_centroids
+        .or(legacy_candidate_centroids)
+        .unwrap_or(state.fan_out.candidate_centroids);
+    let candidate_shards = req
+        .candidate_shards
+        .unwrap_or(state.fan_out.candidate_shards);
+    let max_vectors_per_shard = req
+        .max_vectors_per_shard
+        .unwrap_or(state.fan_out.max_vectors_per_shard);
+
+    let policy = FanOutPolicy {
+        candidate_centroids,
+        candidate_shards,
+        max_vectors_per_shard,
+    };
+
+    if let Err(e) = policy.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    match tokio::task::spawn_blocking(move || searcher.search(&vector, req.k, nprobe)).await {
+    match tokio::task::spawn_blocking(move || searcher.search(&vector, req.k, &policy)).await {
         Ok(Ok(results)) => Json(QueryResponse {
             results,
             index_version: version,
@@ -104,7 +154,7 @@ mod tests {
         http::Request,
     };
     use shardlake_core::{
-        config::SystemConfig,
+        config::{FanOutPolicy, SystemConfig},
         types::{
             DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
         },
@@ -125,7 +175,10 @@ mod tests {
             kmeans_iters: 4,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let records = vec![
             VectorRecord {
@@ -149,12 +202,17 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
+                pq_params: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
         let state = AppState {
             searcher,
-            nprobe: 2,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 2,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
         };
         (build_router(state), tmp)
     }
@@ -225,5 +283,92 @@ mod tests {
             payload["error"],
             "query vector dimensions do not match the index"
         );
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_zero_candidate_centroids() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"candidate_centroids":0}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("candidate_centroids"),
+            "expected error mentioning candidate_centroids, got: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_route_accepts_fan_out_overrides() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"candidate_centroids":1,"candidate_shards":1,"max_vectors_per_shard":10}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_nprobe_backward_compat() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1,"nprobe":2}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_nprobe_overflow() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"nprobe":4294967296}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"], format!("nprobe must be <= {}", u32::MAX));
     }
 }

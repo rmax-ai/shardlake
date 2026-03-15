@@ -45,6 +45,7 @@ Execution guidance:
 - Perform assignment by emitting the approved `assign_to_agent` safe output, not by editing issues directly.
 - If the epic has no sub-issues, report that clearly and do not attempt assignment.
 - If there are no actionable issues, report that clearly and do not treat it as an error.
+- If automation is blocked on a needed human decision for a specific issue, ensure the `needs-human` label exists, add it to that issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 Recommended workflow:
 1. Resolve the epic reference.
