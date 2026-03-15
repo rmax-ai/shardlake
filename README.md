@@ -48,10 +48,14 @@ cargo build --release
 ### Generate sample data
 
 ```bash
-# Uses the included fixture
-cp fixtures/sample_10.jsonl /tmp/sample.jsonl
+# Use the built-in synthetic dataset generator
+./target/release/shardlake generate \
+  --num-vectors 1000 \
+  --dims 64 \
+  --num-clusters 8 \
+  --dataset-version ds-generated-v1
 
-# Or generate a larger dataset
+# Or generate a standalone JSONL fixture
 python3 tools/gen_sample.py --count 1000 --dims 64 > /tmp/vectors.jsonl
 ```
 
@@ -93,6 +97,7 @@ make demo
 
 | Command | Description |
 |---------|-------------|
+| `shardlake generate` | Generate a reproducible synthetic dataset in versioned storage |
 | `shardlake ingest` | Read JSONL vectors into versioned artifact storage |
 | `shardlake build-index` | Build K-means shard index from ingested dataset |
 | `shardlake publish` | Create/update alias pointer (e.g. `latest`) |

@@ -46,7 +46,9 @@ the top candidates by exact distance computation before returning results.
 {
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
-  "nprobe": 3,
+  "candidate_centroids": 3,
+  "candidate_shards": 2,
+  "max_vectors_per_shard": 500,
   "rerank": true
 }
 ```
@@ -55,7 +57,10 @@ the top candidates by exact distance computation before returning results.
 |-------|------|----------|-------------|
 | `vector` | `float[]` | Yes | Query vector. Must have the same number of dimensions as the index. |
 | `k` | integer | Yes | Number of results to return. Must be ≥ 1. |
-| `nprobe` | integer | No | Number of shards to probe. Defaults to the value set via `--nprobe` when the server was started. Higher values improve recall at the cost of latency. |
+| `nprobe` | integer | No | Backward-compatible alias for `candidate_centroids`. Ignored when `candidate_centroids` is also provided. Defaults to the server's `--nprobe` value. |
+| `candidate_centroids` | integer | No | Number of nearest IVF centroids to select for shard routing. Must be ≥ 1 when provided. Takes precedence over `nprobe`. Defaults to the server's `--nprobe` value. |
+| `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
+| `max_vectors_per_shard` | integer | No | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Defaults to the server's `--max-vectors-per-shard` value. |
 | `rerank` | boolean | No | When `true`, the ANN candidates are re-scored against their raw vectors using exact distance computation before the final ranking is returned. Defaults to `false`. See [Exact reranking](#exact-reranking) below. |
 
 ### Success response — `200 OK`
@@ -91,6 +96,7 @@ the top candidates by exact distance computation before returning results.
 | Status | Body | Cause |
 |--------|------|-------|
 | `400 Bad Request` | `{"error": "k must be > 0"}` | `k` field is 0 |
+| `400 Bad Request` | `{"error": "invalid fan-out policy: candidate_centroids must be ≥ 1"}` | `candidate_centroids` (or `nprobe`) is 0 |
 | `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
 | `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
@@ -114,7 +120,7 @@ curl -s -X POST http://localhost:8080/query \
   -d '{
     "vector": [0.5, 0.3, 0.8, 0.1],
     "k": 5,
-    "nprobe": 3,
+    "candidate_centroids": 3,
     "rerank": true
   }' | python3 -m json.tool
 ```
@@ -123,26 +129,22 @@ curl -s -X POST http://localhost:8080/query \
 
 When `"rerank": true` is set, the server applies a two-stage pipeline:
 
-1. **ANN stage** – probes the `nprobe` nearest shards using centroid routing
-   and retrieves the top-k candidate vectors (same as the default path).
-2. **Rerank stage** – fetches the raw float vectors for every ANN candidate
-   from the in-memory shard cache and recomputes the exact distance between
-   the query and each candidate.  The candidates are then re-sorted by their
-   exact scores and the final top-k list is returned.
+1. **ANN stage** – routes the query through the configured fan-out policy and
+   retrieves the top-k candidate vectors from the probed shards.
+2. **Rerank stage** – fetches the raw float vectors for the ANN candidates
+   already loaded in the in-memory raw-shard cache, recomputes exact distances,
+   and returns the candidates sorted by those exact scores.
 
-This ensures that the returned scores and ranking accurately reflect the
-true distances between the query and each result, even when the ANN phase
-would otherwise return a slightly suboptimal ordering (e.g. when future
-compression such as product quantisation is introduced).
+This ensures that the final ordering reflects the true distance metric even
+when the ANN stage is only an approximate first pass.
 
 **When to use reranking:**
 - When ranking accuracy matters more than raw throughput.
-- When the index was built with a lossy compression method and you want
-  the final scores to reflect exact distances.
+- When you want exact final scores after an approximate routing stage.
 
-**Performance note:** reranking loads and scans the raw vectors of the ANN
-candidates from the in-memory shard cache.  The overhead is proportional to
-`k × dims` and is typically small relative to the ANN stage.
+**Performance note:** reranking reads the raw vectors for the returned
+candidates from the in-memory shard cache, so the extra cost is proportional to
+the number of candidates reranked and their dimensionality.
 
 ## Notes on scoring
 

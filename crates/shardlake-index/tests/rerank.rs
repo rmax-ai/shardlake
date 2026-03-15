@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use shardlake_core::{
-    config::SystemConfig,
+    config::{FanOutPolicy, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult, VectorId,
         VectorRecord,
@@ -25,7 +25,10 @@ fn make_searcher(
         kmeans_iters: 2,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
         kmeans_sample_size: None,
+        ..SystemConfig::default()
     };
     let manifest = IndexBuilder::new(store.as_ref(), &config)
         .build(BuildParams {
@@ -37,6 +40,7 @@ fn make_searcher(
             dims: 2,
             vectors_key: "datasets/ds-rr/vectors.jsonl".into(),
             metadata_key: "datasets/ds-rr/metadata.json".into(),
+            pq_params: None,
         })
         .unwrap();
     IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
@@ -64,7 +68,12 @@ fn records_2d() -> Vec<VectorRecord> {
 
 /// Run a search to warm the shard cache so `rerank` has raw vectors available.
 fn warm_cache(searcher: &IndexSearcher, query: &[f32]) {
-    let _ = searcher.search(query, 3, 1).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 1,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let _ = searcher.search(query, 3, &policy).unwrap();
 }
 
 /// Rerank must correct scores when candidates are injected with wrong scores.
@@ -114,7 +123,7 @@ fn rerank_scores_match_exact_euclidean_distance() {
     let query = [0.5f32, 0.5];
 
     // search() both warms the cache and provides the initial candidate list.
-    let ann_results = searcher.search(&query, 3, 1).unwrap();
+    let ann_results = search_with_default_policy(&searcher, &query);
     let reranked = searcher.rerank(&query, ann_results).unwrap();
     assert!(!reranked.is_empty());
 
@@ -170,7 +179,7 @@ fn rerank_cosine_distance_ordering() {
     let searcher = make_searcher(&tmp, records_2d(), DistanceMetric::Cosine);
     let query = [1.0f32, 0.0];
 
-    let ann_results = searcher.search(&query, 3, 1).unwrap();
+    let ann_results = search_with_default_policy(&searcher, &query);
     let reranked = searcher.rerank(&query, ann_results).unwrap();
 
     assert_eq!(
@@ -192,7 +201,7 @@ fn rerank_top_result_is_stable_for_exact_ann() {
     let searcher = make_searcher(&tmp, records_2d(), DistanceMetric::Euclidean);
     let query = [0.9f32, 0.0];
 
-    let ann = searcher.search(&query, 3, 1).unwrap();
+    let ann = search_with_default_policy(&searcher, &query);
     let reranked = searcher.rerank(&query, ann.clone()).unwrap();
 
     // The best result must be the same.
@@ -200,4 +209,13 @@ fn rerank_top_result_is_stable_for_exact_ann() {
         ann[0].id, reranked[0].id,
         "top-1 should be the same candidate with and without reranking"
     );
+}
+
+fn search_with_default_policy(searcher: &IndexSearcher, query: &[f32]) -> Vec<SearchResult> {
+    let policy = FanOutPolicy {
+        candidate_centroids: 1,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    searcher.search(query, 3, &policy).unwrap()
 }
