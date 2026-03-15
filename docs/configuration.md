@@ -109,6 +109,29 @@ request time (for per-request HTTP overrides).  The following invariants are enf
   `"invalid fan-out policy: candidate_centroids must be ≥ 1"`.
 - `candidate_shards` and `max_vectors_per_shard` accept any value including `0`
   (meaning no limit).
+  
+## Query-time centroid shard routing
+
+`IndexSearcher` implements centroid-based routing rather than a naive fan-out to every
+shard.  At search time:
+
+1. **Centroid lookup** — each shard's centroid is read directly from the in-memory
+   manifest (`ShardDef.centroid`, present in manifest v2 and later).  No shard bodies
+   are loaded during this phase.
+2. **Top-`nprobe` selection** — the `nprobe` shards whose centroids are nearest to the
+   query vector (by squared Euclidean distance) are selected.
+3. **Lazy shard loading** — only the selected probe shards are deserialized from storage
+   and cached.  Non-selected shards are never touched during a given query.
+4. **Merge** — exact nearest-neighbour search is run within each probed shard and the
+   per-shard top-k results are merged into a single ordered list.
+
+For indexes built from a legacy manifest v1 (no `centroid` field in `ShardDef`) the
+searcher falls back to loading every shard body to extract its centroid on first use.
+Rebuilding the index with the current builder produces a v4 manifest (which still
+includes the `centroid` field introduced in v2), restoring the zero-I/O routing path.
+
+The routing centroids are stored in the manifest and verified by
+`shardlake validate` (check `ShardCentroidMismatch` in the validation report).
 
 ## Logging
 

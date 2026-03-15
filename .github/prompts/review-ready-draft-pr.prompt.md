@@ -26,10 +26,11 @@ Requirements:
    - open
    - still in draft state
    - labeled `ready-for-draft-check`
-3. Before any branch checkout, verify the repository's primary checkout is safe with `git status --short`.
-4. Fetch PR metadata, changed files, linked issues, labels, and summary context.
-5. Create or refresh a dedicated git worktree for this PR under `tmp/pr_worktrees/pr-<pr-number>`.
-6. Inside that worktree, check out the PR branch and do all branch edits there. Do not modify files from the repository's primary checkout.
+3. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
+4. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
+5. Fetch PR metadata, changed files, linked issues, labels, and summary context.
+6. Create or refresh a dedicated git worktree for this PR by running `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>`.
+7. Inside that worktree, check out the PR branch and do all branch edits there. Do not modify files from the repository's primary checkout or the iteration worktree.
 7. Review the diff against the PR summary and linked issue acceptance criteria.
 8. Run the repository quality gates from inside the dedicated worktree:
    - `cargo fmt --check`
@@ -52,9 +53,10 @@ Requirements:
 
 Worktree guidance:
 
-- Prefer `git worktree add --force tmp/pr_worktrees/pr-<pr-number> <base-branch>` to create the worktree, then enter it and run `gh pr checkout <pr-number>` there.
-- If `tmp/pr_worktrees/pr-<pr-number>` already exists, verify it is for the same PR branch before reusing it; otherwise remove and recreate it safely.
-- After push and final verification, remove the worktree with `git worktree remove --force` when the tree is clean.
+- Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
+- Run `gh pr checkout <pr-number>` only after `cd` into the prepared worktree path returned by the helper.
+- If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
+- After push and final verification, remove the worktree with `git -C "$SHARDLAKE_PRIMARY_ROOT" worktree remove --force <worktree-path>` when the tree is clean.
 
 Output format:
 

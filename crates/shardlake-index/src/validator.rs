@@ -22,7 +22,7 @@ use shardlake_core::types::ShardId;
 use shardlake_manifest::{DatasetManifest, Manifest};
 use shardlake_storage::{ObjectStore, StorageError};
 
-use crate::{artifact_fingerprint, shard::ShardIndex};
+use crate::{artifact_fingerprint, ivf::IvfQuantizer, shard::ShardIndex};
 
 /// A single structured validation failure returned by the integrity engine.
 ///
@@ -84,6 +84,11 @@ pub enum ValidationFailure {
     /// The shard artifact bytes could not be parsed as a valid shard binary.
     #[error("shard binary invalid for {key}: {message}")]
     ShardParseError { key: String, message: String },
+
+    /// The coarse-quantizer artifact bytes are missing, malformed, or
+    /// inconsistent with the manifest.
+    #[error("coarse quantizer invalid for {key}: {message}")]
+    CoarseQuantizerInvalid { key: String, message: String },
 }
 
 // ── ValidationReport ──────────────────────────────────────────────────────────
@@ -128,7 +133,10 @@ impl ValidationReport {
 ///    internal consistency (shard count sums, fingerprint presence, etc.).
 /// 2. **Artifact existence** — verifies that `vectors_key` and `metadata_key`
 ///    exist in `store`.
-/// 3. **Per-shard checks** (for each entry in `manifest.shards`):
+/// 3. **Coarse quantizer checks** — when `coarse_quantizer_key` is present,
+///    verifies the artifact exists, parses as a valid [`IvfQuantizer`], and
+///    stays consistent with manifest dimensions and shard routing metadata.
+/// 4. **Per-shard checks** (for each entry in `manifest.shards`):
 ///    - the shard artifact key exists in `store`;
 ///    - the artifact's FNV-1a fingerprint matches the `fingerprint` field in the
 ///      shard definition;
@@ -158,7 +166,96 @@ pub fn validate_index(manifest: &Manifest, store: &dyn ObjectStore) -> Validatio
         check_exists(key, &mut report, store);
     }
 
-    // 3. Per-shard checks.
+    if let Some(key) = manifest.coarse_quantizer_key.as_deref() {
+        match store.get(key) {
+            Err(StorageError::NotFound(_)) => {
+                report.failures.push(ValidationFailure::ArtifactMissing {
+                    key: key.to_owned(),
+                });
+            }
+            Err(e) => {
+                report.failures.push(ValidationFailure::StorageError {
+                    key: key.to_owned(),
+                    message: e.to_string(),
+                });
+            }
+            Ok(bytes) => {
+                match IvfQuantizer::from_bytes(&bytes) {
+                    Err(e) => {
+                        report
+                            .failures
+                            .push(ValidationFailure::CoarseQuantizerInvalid {
+                                key: key.to_owned(),
+                                message: e.to_string(),
+                            });
+                    }
+                    Ok(quantizer) => {
+                        if quantizer.dims() != manifest.dims as usize {
+                            report
+                                .failures
+                                .push(ValidationFailure::CoarseQuantizerInvalid {
+                                    key: key.to_owned(),
+                                    message: format!(
+                                        "dimension mismatch: expected {}, actual {}",
+                                        manifest.dims,
+                                        quantizer.dims()
+                                    ),
+                                });
+                        }
+                        if quantizer.num_clusters() != manifest.shards.len() {
+                            report
+                                .failures
+                                .push(ValidationFailure::CoarseQuantizerInvalid {
+                                    key: key.to_owned(),
+                                    message: format!(
+                                        "cluster count mismatch: expected {}, actual {}",
+                                        manifest.shards.len(),
+                                        quantizer.num_clusters()
+                                    ),
+                                });
+                        }
+                        for shard in &manifest.shards {
+                            if shard.centroid.is_empty() {
+                                continue;
+                            }
+                            let centroid_idx = shard.shard_id.0 as usize;
+                            match quantizer.centroids().get(centroid_idx) {
+                                None => report.failures.push(
+                                    ValidationFailure::CoarseQuantizerInvalid {
+                                        key: key.to_owned(),
+                                        message: format!(
+                                            "missing centroid for shard {}",
+                                            shard.shard_id
+                                        ),
+                                    },
+                                ),
+                                Some(centroid)
+                                    if centroid.len() != shard.centroid.len()
+                                        || !centroid
+                                            .iter()
+                                            .zip(shard.centroid.iter())
+                                            .all(|(a, b)| a.to_bits() == b.to_bits()) =>
+                                {
+                                    report.failures.push(
+                                        ValidationFailure::CoarseQuantizerInvalid {
+                                            key: key.to_owned(),
+                                            message: format!(
+                                                "centroid mismatch for shard {}",
+                                                shard.shard_id
+                                            ),
+                                        },
+                                    );
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Per-shard checks.
     for shard in &manifest.shards {
         let key = shard.artifact_key.as_str();
 

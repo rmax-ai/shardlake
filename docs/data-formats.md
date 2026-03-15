@@ -40,18 +40,19 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 <storage-root>/
 ├── datasets/
 │   └── <dataset-version>/
-│       ├── vectors.jsonl      ← dataset_vectors_key
-│       ├── metadata.json      ← dataset_metadata_key
-│       └── info.json          ← dataset_info_key
+│       ├── vectors.jsonl              ← dataset_vectors_key
+│       ├── metadata.json              ← dataset_metadata_key
+│       └── info.json                  ← dataset_info_key
 ├── indexes/
 │   └── <index-version>/
-│       ├── manifest.json      ← index_manifest_key
+│       ├── manifest.json              ← index_manifest_key
+│       ├── coarse_quantizer.cq        ← index_coarse_quantizer_key
 │       └── shards/
-│           ├── shard-0000.sidx  ← index_shard_key(…, 0)
-│           ├── shard-0001.sidx  ← index_shard_key(…, 1)
+│           ├── shard-0000.sidx        ← index_shard_key(…, 0)
+│           ├── shard-0001.sidx        ← index_shard_key(…, 1)
 │           └── ...
 └── aliases/
-    └── <alias-name>.json      ← alias_key
+    └── <alias-name>.json              ← alias_key
 ```
 
 [`shardlake_storage::paths`]: ../crates/shardlake-storage/src/paths.rs
@@ -141,8 +142,9 @@ and index version and describes every shard artifact.
     "build_duration_secs": 3.14
   },
   "algorithm": {
-    "algorithm": "kmeans-flat",
+    "algorithm": "ivf-flat",
     "params": {
+      "num_clusters": 4,
       "num_shards": 4,
       "kmeans_iters": 20,
       "kmeans_seed": 3735928559,
@@ -157,7 +159,8 @@ and index version and describes every shard artifact.
   "compression": {
     "enabled": false,
     "codec": "none"
-  }
+  },
+  "coarse_quantizer_key": "indexes/idx-v1/coarse_quantizer.cq"
 }
 ```
 
@@ -197,8 +200,9 @@ and index version and describes every shard artifact.
 | `build_metadata.num_kmeans_iters` | integer | K-means iterations used. |
 | `build_metadata.nprobe_default` | integer | Default nprobe recorded at build time. |
 | `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
-| `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name (e.g. `"kmeans-flat"`). Defaults to `"kmeans-flat"` for v1/v2 manifests. |
+| `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name. `"ivf-flat"` for current builds; `"kmeans-flat"` for indexes built before IVF was introduced. Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. |
 | `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
 | `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
 | `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
@@ -209,6 +213,7 @@ and index version and describes every shard artifact.
 | `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). |
 | `recall_estimate.recall_at_k` | float | Estimated recall@k in [0, 1]. |
 | `recall_estimate.sample_size` | integer | Number of sample queries used. |
+| `coarse_quantizer_key` | string \| null | Storage key of the IVF coarse-quantizer artifact (`coarse_quantizer.cq`). Present for `"ivf-flat"` indexes; absent for legacy `"kmeans-flat"` indexes. |
 
 ### Shard definition fields
 
@@ -247,6 +252,7 @@ A Shardlake index build is **reproducible** when the following inputs are held c
 | Input vectors (dataset) | `dataset_version` + `vectors_key` |
 | Vector dimension | `dims` |
 | Distance metric | `distance_metric` |
+| Number of IVF clusters | `algorithm.params.num_clusters` |
 | Number of shards | `algorithm.params.num_shards` |
 | K-means iterations | `algorithm.params.kmeans_iters` |
 | K-means RNG seed | `algorithm.params.kmeans_seed` |
@@ -316,6 +322,34 @@ per vector:
 
 The magic bytes and format version allow the reader to detect corrupt or incompatible
 artifacts before parsing any vector data.
+
+---
+
+## IVF coarse-quantizer binary format (`.cq`)
+
+Written by `shardlake build-index` alongside `manifest.json`.  The file stores the
+trained centroids that constitute the IVF coarse quantizer — the component responsible
+for mapping an incoming query vector to its nearest cluster shard(s) at search time.
+
+Binary, little-endian throughout.
+
+```
+Offset   Size             Field
+------   ----             -----
+0        8                Magic bytes: 0x534C4B4956460000 ("SLKIVF\0\0")
+8        4                Format version (u32) — currently 1
+12       4                dims (u32)
+16       4                num_clusters (u32)
+
+--- Centroids (num_clusters entries) ---
+per centroid:
+  dims × 4                Centroid coordinates (f32 × dims, little-endian)
+```
+
+The coarse quantizer is referenced from the manifest via `coarse_quantizer_key` and can
+be loaded independently of the per-shard `.sidx` files.  It is exposed as
+`shardlake_index::IvfQuantizer` in the library API with `to_bytes` / `from_bytes`
+methods for serialisation.
 
 ---
 
