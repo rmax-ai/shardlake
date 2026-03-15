@@ -339,7 +339,7 @@ Worker inputs:
     export SHARDLAKE_LEASE_REF_NAME="$LEASE_REF_NAME"
     export SHARDLAKE_EXPECTED_HEAD_SHA="$EXPECTED_HEAD_SHA"
     export SHARDLAKE_WORKER_LANE="$LANE"
-    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp --add-dir "$REPO_ROOT" -p "$prompt_text"
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --allow-all-paths --add-dir /tmp --add-dir "$REPO_ROOT" -p "$prompt_text"
   ) | tee "$output_file"
   command_status=${PIPESTATUS[0]}
   set -e
