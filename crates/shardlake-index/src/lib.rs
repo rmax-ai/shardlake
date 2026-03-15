@@ -4,6 +4,7 @@ pub mod builder;
 pub mod exact;
 pub mod ivf;
 pub mod kmeans;
+pub mod metrics;
 pub mod pipeline;
 pub mod pq;
 pub mod searcher;
@@ -13,10 +14,12 @@ pub mod validator;
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
+pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
-    IdentityEmbedder, LoadShardStage, MergeStage, MmapShardLoader, NoopReranker, QueryPipeline,
-    QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
+    ExactCandidateStage, ExactRerankStage, IdentityEmbedder, LoadShardStage, MergeStage,
+    MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder,
+    RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
