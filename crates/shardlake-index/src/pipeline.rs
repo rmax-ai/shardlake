@@ -16,6 +16,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use tracing::debug;
@@ -30,6 +31,7 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    metrics::CacheMetrics,
     pq::PqCodebook,
     shard::ShardIndex,
     IndexError, Result,
@@ -123,10 +125,19 @@ impl RouteStage for CentroidRouter {
 }
 
 /// Shard loader that caches loaded shards in an in-memory map.
+///
+/// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
+/// to resolve the artifact key for each shard ID before fetching bytes from
+/// the store.
+///
+/// Cache observability is available via [`CachedShardLoader::metrics`]: a
+/// shared [`CacheMetrics`] instance that tracks hits, misses, load latency,
+/// and retained bytes for every shard loaded through this loader.
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
     cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    metrics: Arc<CacheMetrics>,
 }
 
 impl CachedShardLoader {
@@ -136,19 +147,31 @@ impl CachedShardLoader {
             store,
             manifest,
             cache: Mutex::new(HashMap::new()),
+            metrics: Arc::new(CacheMetrics::new()),
         }
+    }
+
+    /// Return a shared reference to the cache metrics for this loader.
+    ///
+    /// The returned [`Arc`] is the same instance used internally, so callers
+    /// observe live counter updates without any extra synchronisation cost.
+    pub fn metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
-            let cache = self
-                .cache
-                .lock()
-                .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
-            if let Some(index) = cache.get(&shard_id) {
-                return Ok(Arc::clone(index));
+            let cache = self.cache.lock().map_err(|_| {
+                IndexError::Other(
+                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
+                        .into(),
+                )
+            })?;
+            if let Some(idx) = cache.get(&shard_id) {
+                self.metrics.record_hit();
+                return Ok(Arc::clone(idx));
             }
         }
 
@@ -159,15 +182,22 @@ impl LoadShardStage for CachedShardLoader {
             .find(|shard| shard.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let index = Arc::new(ShardIndex::from_bytes(&bytes)?);
+        self.metrics.record_miss();
+
+        let t0 = Instant::now();
+        let bytes = self.store.get(&shard_def.artifact_key);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        self.metrics.record_load_attempt(elapsed_ns);
+        let bytes = bytes?;
+        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
-        cache.insert(shard_id, Arc::clone(&index));
-        Ok(index)
+        cache.insert(shard_id, Arc::clone(&idx));
+        self.metrics.record_retained_bytes(bytes.len() as u64);
+        Ok(idx)
     }
 }
 
