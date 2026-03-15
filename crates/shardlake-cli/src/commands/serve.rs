@@ -7,7 +7,7 @@ use clap::Parser;
 use tracing::info;
 
 use shardlake_core::config::FanOutPolicy;
-use shardlake_index::IndexSearcher;
+use shardlake_index::{IndexSearcher, DEFAULT_SHARD_CACHE_CAPACITY};
 use shardlake_manifest::Manifest;
 use shardlake_serve::{build_router, AppState};
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -33,6 +33,11 @@ pub struct ServeArgs {
     /// `0` means no limit (all vectors in the shard are scored).
     #[arg(long, default_value_t = 0)]
     pub max_vectors_per_shard: u32,
+    /// Maximum number of shard indexes to keep in the in-memory LRU cache.
+    /// Larger values improve repeat-query latency at the cost of higher memory
+    /// usage.  Should be at least as large as `--nprobe`.
+    #[arg(long, default_value_t = DEFAULT_SHARD_CACHE_CAPACITY)]
+    pub shard_cache_capacity: usize,
 }
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
@@ -49,9 +54,14 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     info!(
         alias = %args.alias,
         index_version = %manifest.index_version,
+        shard_cache_capacity = args.shard_cache_capacity,
         "Serving manifest"
     );
-    let searcher = std::sync::Arc::new(IndexSearcher::new(std::sync::Arc::clone(&store), manifest));
+    let searcher = std::sync::Arc::new(IndexSearcher::with_cache_capacity(
+        std::sync::Arc::clone(&store),
+        manifest,
+        args.shard_cache_capacity,
+    ));
     let state = AppState { searcher, fan_out };
     let router = build_router(state);
 

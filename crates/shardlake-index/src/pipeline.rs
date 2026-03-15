@@ -12,10 +12,7 @@
 //! Assemble a pipeline using [`QueryPipeline::builder`] and call
 //! [`QueryPipeline::run`] to execute a search query through all stages.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 use shardlake_core::{
     error::CoreError,
@@ -25,6 +22,7 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
+    cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
     shard::ShardIndex,
@@ -134,59 +132,57 @@ impl RouteStage for CentroidRouter {
     }
 }
 
-/// Shard loader that caches loaded shards in an in-memory map.
+/// Shard loader that caches loaded shards in a bounded LRU cache.
 ///
 /// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
 /// to resolve the artifact key for each shard ID before fetching bytes from
-/// the store.
+/// the store.  Evicts the least-recently-used shard when the cache is full.
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    cache: ShardCache<ShardIndex>,
 }
 
 impl CachedShardLoader {
-    /// Create a new loader backed by `store` and `manifest`.
+    /// Create a new loader using the [`DEFAULT_SHARD_CACHE_CAPACITY`].
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self::with_cache_capacity(store, manifest, DEFAULT_SHARD_CACHE_CAPACITY)
+    }
+
+    /// Create a new loader with the given LRU cache `capacity`.
+    ///
+    /// Use this constructor when you want to size the cache based on runtime
+    /// configuration, for example from
+    /// [`SystemConfig::shard_cache_capacity`](shardlake_core::config::SystemConfig::shard_cache_capacity).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    pub fn with_cache_capacity(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        capacity: usize,
+    ) -> Self {
         Self {
             store,
             manifest,
-            cache: Mutex::new(HashMap::new()),
+            cache: ShardCache::new(capacity),
         }
     }
 }
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        {
-            let cache = self.cache.lock().map_err(|_| {
-                IndexError::Other(
-                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
-                        .into(),
-                )
-            })?;
-            if let Some(idx) = cache.get(&shard_id) {
-                return Ok(Arc::clone(idx));
-            }
-        }
-
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|s| s.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        let mut cache = self.cache.lock().map_err(|_| {
-            IndexError::Other(
-                "shard loader cache lock poisoned: a panic occurred while holding the lock".into(),
-            )
-        })?;
-        cache.insert(shard_id, Arc::clone(&idx));
-        Ok(idx)
+        self.cache.get_or_load(shard_id, || {
+            let shard_def = self
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard_id)
+                .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+            let bytes = self.store.get(&shard_def.artifact_key)?;
+            Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+        })
     }
 }
 
@@ -371,6 +367,7 @@ pub struct QueryPipelineBuilder {
     candidate_search: Box<dyn CandidateSearchStage>,
     merge: Box<dyn MergeStage>,
     reranker: Box<dyn RerankStage>,
+    shard_cache_capacity: usize,
 }
 
 impl QueryPipelineBuilder {
@@ -384,6 +381,7 @@ impl QueryPipelineBuilder {
             candidate_search: Box::new(ExactCandidateSearch),
             merge: Box::new(TopKMerge),
             reranker: Box::new(NoopReranker),
+            shard_cache_capacity: DEFAULT_SHARD_CACHE_CAPACITY,
         }
     }
 
@@ -423,16 +421,27 @@ impl QueryPipelineBuilder {
         self
     }
 
+    /// Set the shard LRU cache capacity for the default [`CachedShardLoader`].
+    ///
+    /// Ignored when a custom loader is supplied via
+    /// [`with_loader`](Self::with_loader).  Defaults to
+    /// [`DEFAULT_SHARD_CACHE_CAPACITY`].
+    pub fn with_shard_cache_capacity(mut self, capacity: usize) -> Self {
+        self.shard_cache_capacity = capacity;
+        self
+    }
+
     /// Assemble the [`QueryPipeline`].
     ///
     /// If no custom loader was provided via [`with_loader`](Self::with_loader),
     /// a [`CachedShardLoader`] backed by the store passed to
-    /// [`QueryPipeline::builder`] is used.
+    /// [`QueryPipeline::builder`] is used with the configured cache capacity.
     pub fn build(self) -> QueryPipeline {
         let loader: Box<dyn LoadShardStage> = self.loader.unwrap_or_else(|| {
-            Box::new(CachedShardLoader::new(
+            Box::new(CachedShardLoader::with_cache_capacity(
                 Arc::clone(&self.store),
                 self.manifest.clone(),
+                self.shard_cache_capacity,
             ))
         });
         QueryPipeline {
