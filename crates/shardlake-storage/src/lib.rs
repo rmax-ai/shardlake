@@ -1,12 +1,20 @@
 //! Object-store abstraction for artifact persistence.
 //!
-//! Currently only a local filesystem backend is provided.
-//! A future backend (S3, MinIO) only needs to implement [`ObjectStore`].
+//! Two backends are shipped in this crate:
+//!
+//! - [`LocalObjectStore`] — production-ready local-filesystem backend.
+//! - [`s3::S3CompatibleBackend`] — initial stub for S3-compatible services
+//!   (AWS S3, MinIO, GCS, etc.).  Compiles against the abstraction but does
+//!   not yet perform real network I/O.  See [`s3`] for non-goals and roadmap.
+//!
+//! Additional backends only need to implement [`ObjectStore`].
 
 pub mod local;
 pub mod paths;
+pub mod s3;
 
 pub use local::LocalObjectStore;
+pub use s3::{S3CompatibleBackend, S3Config};
 
 /// Errors surfaced by storage operations.
 #[derive(Debug, thiserror::Error)]

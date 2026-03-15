@@ -32,7 +32,10 @@ fn default_config(tmp: &std::path::Path, num_shards: u32) -> SystemConfig {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
         kmeans_sample_size: None,
+        ..SystemConfig::default()
     }
 }
 
@@ -116,6 +119,7 @@ fn build_emits_ivf_flat_algorithm() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-ivf"),
             metadata_key: paths::dataset_metadata_key("ds-ivf"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -142,6 +146,7 @@ fn build_records_num_clusters_in_params() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-nc"),
             metadata_key: paths::dataset_metadata_key("ds-nc"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -172,6 +177,7 @@ fn build_persists_coarse_quantizer_artifact() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-cq"),
             metadata_key: paths::dataset_metadata_key("ds-cq"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -221,6 +227,7 @@ fn coarse_quantizer_key_matches_canonical_path() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-path"),
             metadata_key: paths::dataset_metadata_key("ds-path"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -248,6 +255,7 @@ fn coarse_quantizer_centroids_match_shard_def_centroids() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-cen"),
             metadata_key: paths::dataset_metadata_key("ds-cen"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -292,6 +300,7 @@ fn build_compacts_empty_clusters_before_persisting_quantizer() {
             dims: 2,
             vectors_key: paths::dataset_vectors_key("ds-empty"),
             metadata_key: paths::dataset_metadata_key("ds-empty"),
+            pq_params: None,
         })
         .unwrap();
 

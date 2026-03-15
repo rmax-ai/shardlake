@@ -6,11 +6,14 @@ pub use routes::build_router;
 
 use std::sync::Arc;
 
+use shardlake_core::config::FanOutPolicy;
 use shardlake_index::IndexSearcher;
 
 /// Shared application state injected into axum routes.
 #[derive(Clone)]
 pub struct AppState {
     pub searcher: Arc<IndexSearcher>,
-    pub nprobe: usize,
+    /// Default fan-out policy used when the query request does not supply
+    /// per-request overrides.
+    pub fan_out: FanOutPolicy,
 }

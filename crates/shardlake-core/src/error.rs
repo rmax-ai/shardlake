@@ -29,6 +29,9 @@ pub enum CoreError {
     #[error("manifest not found at {0}")]
     ManifestNotFound(String),
 
+    #[error("invalid fan-out policy: {0}")]
+    InvalidFanOutPolicy(String),
+
     #[error("{0}")]
     Other(String),
 }

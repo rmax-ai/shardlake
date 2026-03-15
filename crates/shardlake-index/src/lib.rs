@@ -5,6 +5,7 @@ pub mod exact;
 pub mod ivf;
 pub mod kmeans;
 pub mod pipeline;
+pub mod pq;
 pub mod searcher;
 pub mod shard;
 pub mod validator;
@@ -17,9 +18,17 @@ pub use pipeline::{
     QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge,
 };
 pub use ivf::IvfQuantizer;
+pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
-pub use shard::{ShardIndex, SHARD_MAGIC};
+pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};
+
+/// Codec identifier for 8-bit product quantisation.
+///
+/// Used in [`shardlake_manifest::CompressionConfig::codec`] to identify
+/// PQ-compressed indexes and referenced by the builder, searcher, and
+/// validator to distinguish PQ shards from raw-vector shards.
+pub const PQ8_CODEC: &str = "pq8";
 
 /// Errors that can arise in index operations.
 #[derive(Debug, thiserror::Error)]
