@@ -12,12 +12,14 @@ RUN_OPEN_REVIEW="${RUN_OPEN_REVIEW:-yes}"
 RUN_MERGE="${RUN_MERGE:-yes}"
 RUN_CONFLICT_RESOLUTION="${RUN_CONFLICT_RESOLUTION:-yes}"
 RUN_RECONCILE="${RUN_RECONCILE:-yes}"
+DRAIN_LANES="${DRAIN_LANES:-no}"
 COPILOT_BIN="${COPILOT_BIN:-copilot}"
 LOG_DIR="${LOOP_SCHEDULER_LOG_DIR:-$REPO_ROOT/tmp/loop_scheduler}"
+WORKER_NO_CANDIDATE_EXIT_STATUS="${LOOP_WORKER_NO_CANDIDATE_EXIT_STATUS:-10}"
 
 usage() {
   cat >&2 <<'EOF'
-usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--skip-reconcile] [--skip-draft-review] [--skip-open-review] [--skip-merge] [--skip-conflict-resolution]
+usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--drain-lanes] [--skip-reconcile] [--skip-draft-review] [--skip-open-review] [--skip-merge] [--skip-conflict-resolution]
 
 Runs the concurrent local loop as:
   1. one reconcile pass unless --skip-reconcile is set
@@ -25,6 +27,7 @@ Runs the concurrent local loop as:
   3. optional sleep and repeat
 
 Draft-review and open-review lanes may run concurrently. Merge and conflict-resolve remain single-lane.
+When --drain-lanes is set, each enabled lane keeps launching workers until that lane reports no remaining eligible PRs.
 EOF
   exit 64
 }
@@ -200,20 +203,159 @@ wait_for_worker() {
   local pid="$2"
   local log_file="$3"
   local status
+  local errexit_was_on="no"
 
-  set +e
+  if [[ "$-" == *e* ]]; then
+    errexit_was_on="yes"
+    set +e
+  fi
   wait "$pid"
   status=$?
-  set -e
+  if [[ "$errexit_was_on" == "yes" ]]; then
+    set -e
+  fi
 
   if [[ "$status" -eq 0 ]]; then
     echo "[loop_scheduler] worker lane=${lane} completed successfully"
+    WAITED_WORKER_STATUS="$status"
+    return 0
+  fi
+
+  if [[ "$status" -eq "$WORKER_NO_CANDIDATE_EXIT_STATUS" ]]; then
+    echo "[loop_scheduler] worker lane=${lane} reported no remaining eligible work"
+    WAITED_WORKER_STATUS="$status"
     return 0
   fi
 
   echo "[loop_scheduler] worker lane=${lane} failed with status ${status}; log=${log_file}" >&2
   sed -n '1,200p' "$log_file" >&2 || true
   exit "$status"
+}
+
+run_worker_once() {
+  local lane="$1"
+  local log_file="$2"
+  local status
+  local errexit_was_on="no"
+
+  echo "[loop_scheduler] launching worker lane=${lane}"
+  if [[ "$-" == *e* ]]; then
+    errexit_was_on="yes"
+    set +e
+  fi
+  (
+    cd "$REPO_ROOT"
+    COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane "$lane"
+  ) >"$log_file" 2>&1
+  status=$?
+  if [[ "$errexit_was_on" == "yes" ]]; then
+    set -e
+  fi
+
+  if [[ "$status" -eq 0 ]]; then
+    echo "[loop_scheduler] worker lane=${lane} completed successfully"
+    return 0
+  fi
+
+  if [[ "$status" -eq "$WORKER_NO_CANDIDATE_EXIT_STATUS" ]]; then
+    echo "[loop_scheduler] worker lane=${lane} reported no remaining eligible work"
+    return "$status"
+  fi
+
+  echo "[loop_scheduler] worker lane=${lane} failed with status ${status}; log=${log_file}" >&2
+  sed -n '1,200p' "$log_file" >&2 || true
+  exit "$status"
+}
+
+drain_review_lanes() {
+  local cycle="$1"
+  local draft_active="no"
+  local open_active="no"
+  local attempt=1
+  local draft_pid=""
+  local draft_log=""
+  local open_pid=""
+  local open_log=""
+
+  if [[ "$RUN_DRAFT_REVIEW" == "yes" && "$DRAFT_REVIEW_QUEUE_EXISTS" == "yes" ]]; then
+    draft_active="yes"
+  elif [[ "$RUN_DRAFT_REVIEW" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=draft-review because the reconciler reported no queued work"
+  fi
+
+  if [[ "$RUN_OPEN_REVIEW" == "yes" && "$OPEN_REVIEW_QUEUE_EXISTS" == "yes" ]]; then
+    open_active="yes"
+  elif [[ "$RUN_OPEN_REVIEW" == "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=open-review because the reconciler reported no queued work"
+  fi
+
+  while [[ "$draft_active" == "yes" || "$open_active" == "yes" ]]; do
+    draft_pid=""
+    draft_log=""
+    open_pid=""
+    open_log=""
+
+    if [[ "$draft_active" == "yes" ]]; then
+      draft_log="$LOG_DIR/cycle_${cycle}_drain${attempt}_draft-review.log"
+      launch_worker draft-review "$draft_log"
+      draft_pid="$LAUNCHED_WORKER_PID"
+    fi
+
+    if [[ "$open_active" == "yes" ]]; then
+      open_log="$LOG_DIR/cycle_${cycle}_drain${attempt}_open-review.log"
+      launch_worker open-review "$open_log"
+      open_pid="$LAUNCHED_WORKER_PID"
+    fi
+
+    if [[ -n "$draft_pid" ]]; then
+      wait_for_worker draft-review "$draft_pid" "$draft_log"
+      if [[ "$WAITED_WORKER_STATUS" -eq "$WORKER_NO_CANDIDATE_EXIT_STATUS" ]]; then
+        draft_active="no"
+      fi
+    fi
+
+    if [[ -n "$open_pid" ]]; then
+      wait_for_worker open-review "$open_pid" "$open_log"
+      if [[ "$WAITED_WORKER_STATUS" -eq "$WORKER_NO_CANDIDATE_EXIT_STATUS" ]]; then
+        open_active="no"
+      fi
+    fi
+
+    attempt=$((attempt + 1))
+  done
+}
+
+drain_single_lane() {
+  local cycle="$1"
+  local lane="$2"
+  local enabled="$3"
+  local queue_exists="$4"
+  local attempt=1
+  local log_file
+  local status
+
+  if [[ "$enabled" != "yes" ]]; then
+    return
+  fi
+
+  if [[ "$queue_exists" != "yes" ]]; then
+    echo "[loop_scheduler] skipping worker lane=${lane} because the reconciler reported no queued work"
+    return
+  fi
+
+  while true; do
+    log_file="$LOG_DIR/cycle_${cycle}_drain${attempt}_${lane}.log"
+    set +e
+    run_worker_once "$lane" "$log_file"
+    status=$?
+    set -e
+
+    if [[ "$status" -eq "$WORKER_NO_CANDIDATE_EXIT_STATUS" ]]; then
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+  done
 }
 
 dispatch_workers() {
@@ -231,6 +373,13 @@ dispatch_workers() {
   fi
 
   mkdir -p "$LOG_DIR"
+
+  if [[ "$DRAIN_LANES" == "yes" ]]; then
+    drain_review_lanes "$cycle"
+    drain_single_lane "$cycle" merge "$RUN_MERGE" "$MERGE_QUEUE_EXISTS"
+    drain_single_lane "$cycle" conflict-resolve "$RUN_CONFLICT_RESOLUTION" "$CONFLICT_RESOLVE_QUEUE_EXISTS"
+    return
+  fi
 
   if [[ "$RUN_DRAFT_REVIEW" == "yes" && "$DRAFT_REVIEW_QUEUE_EXISTS" == "yes" ]]; then
     draft_log="$LOG_DIR/cycle_${cycle}_draft-review.log"
@@ -257,49 +406,19 @@ dispatch_workers() {
   fi
 
   if [[ "$RUN_MERGE" == "yes" && "$MERGE_QUEUE_EXISTS" == "yes" ]]; then
-    local merge_status
-
     merge_log="$LOG_DIR/cycle_${cycle}_merge.log"
-    echo "[loop_scheduler] launching worker lane=merge"
     set +e
-    (
-      cd "$REPO_ROOT"
-      COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane merge
-    ) >"$merge_log" 2>&1
-    merge_status=$?
+    run_worker_once merge "$merge_log"
     set -e
-
-    if [[ "$merge_status" -ne 0 ]]; then
-      echo "[loop_scheduler] worker lane=merge failed with status ${merge_status}; log=${merge_log}" >&2
-      sed -n '1,200p' "$merge_log" >&2 || true
-      exit "$merge_status"
-    fi
-
-    echo "[loop_scheduler] worker lane=merge completed successfully"
   elif [[ "$RUN_MERGE" == "yes" ]]; then
     echo "[loop_scheduler] skipping worker lane=merge because the reconciler reported no queued work"
   fi
 
   if [[ "$RUN_CONFLICT_RESOLUTION" == "yes" && "$CONFLICT_RESOLVE_QUEUE_EXISTS" == "yes" ]]; then
-    local conflict_status
-
     conflict_log="$LOG_DIR/cycle_${cycle}_conflict-resolve.log"
-    echo "[loop_scheduler] launching worker lane=conflict-resolve"
     set +e
-    (
-      cd "$REPO_ROOT"
-      COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane conflict-resolve
-    ) >"$conflict_log" 2>&1
-    conflict_status=$?
+    run_worker_once conflict-resolve "$conflict_log"
     set -e
-
-    if [[ "$conflict_status" -ne 0 ]]; then
-      echo "[loop_scheduler] worker lane=conflict-resolve failed with status ${conflict_status}; log=${conflict_log}" >&2
-      sed -n '1,200p' "$conflict_log" >&2 || true
-      exit "$conflict_status"
-    fi
-
-    echo "[loop_scheduler] worker lane=conflict-resolve completed successfully"
   elif [[ "$RUN_CONFLICT_RESOLUTION" == "yes" ]]; then
     echo "[loop_scheduler] skipping worker lane=conflict-resolve because the reconciler reported no queued work"
   fi
@@ -321,6 +440,10 @@ while [[ $# -gt 0 ]]; do
     --wait-seconds)
       WAIT_SECONDS="$2"
       shift 2
+      ;;
+    --drain-lanes)
+      DRAIN_LANES="yes"
+      shift
       ;;
     --skip-reconcile)
       RUN_RECONCILE="no"
@@ -364,6 +487,7 @@ RUN_OPEN_REVIEW="$(normalize_bool "$RUN_OPEN_REVIEW")"
 RUN_MERGE="$(normalize_bool "$RUN_MERGE")"
 RUN_CONFLICT_RESOLUTION="$(normalize_bool "$RUN_CONFLICT_RESOLUTION")"
 RUN_RECONCILE="$(normalize_bool "$RUN_RECONCILE")"
+DRAIN_LANES="$(normalize_bool "$DRAIN_LANES")"
 
 if [[ "$RUN_RECONCILE" == "yes" || "$RUN_DRAFT_REVIEW" == "yes" || "$RUN_OPEN_REVIEW" == "yes" || "$RUN_MERGE" == "yes" || "$RUN_CONFLICT_RESOLUTION" == "yes" ]]; then
   require_command "$COPILOT_BIN"
@@ -387,6 +511,7 @@ echo "[loop_scheduler] reconcile prompt: $RECONCILE_PROMPT_PATH"
 echo "[loop_scheduler] max_cycles: $MAX_CYCLES"
 echo "[loop_scheduler] wait_seconds: $WAIT_SECONDS"
 echo "[loop_scheduler] run_reconcile: $RUN_RECONCILE"
+echo "[loop_scheduler] drain_lanes: $DRAIN_LANES"
 echo "[loop_scheduler] run_draft_review: $RUN_DRAFT_REVIEW"
 echo "[loop_scheduler] run_open_review: $RUN_OPEN_REVIEW"
 echo "[loop_scheduler] run_merge: $RUN_MERGE"

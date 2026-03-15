@@ -213,7 +213,7 @@ The concurrent worker prompts are:
 
 The checked-in worker launcher is `loop_worker.sh`. It resolves the next eligible PR for a single lane with `gh`, acquires a lease, revalidates the claimed PR's current state and head SHA with `gh`, runs the matching worker prompt with explicit inputs, and then releases the lease.
 
-The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane, and finally runs the `conflict-resolve` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles. When started with `--skip-reconcile`, it bypasses that reconcile pass and dispatches the worker lanes directly on every cycle instead.
+The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane, and finally runs the `conflict-resolve` worker as a single lane. By default each lane worker processes at most one PR per cycle. When started with `--drain-lanes`, the scheduler keeps relaunching each enabled lane until that lane reports no remaining eligible PRs, while preserving concurrent dispatch between `draft-review` and `open-review`. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles. When started with `--skip-reconcile`, it bypasses that reconcile pass and dispatches the worker lanes directly on every cycle instead.
 
 Each worker prompt assumes a target item has already been claimed. It must:
 
@@ -477,6 +477,12 @@ For one bounded scheduler cycle:
 ./loop_scheduler.sh --once
 ```
 
+To drain each enabled lane until it has no remaining eligible PRs:
+
+```bash
+./loop_scheduler.sh --once --drain-lanes
+```
+
 To disable selected lanes during supervised operation:
 
 ```bash
@@ -531,7 +537,7 @@ At the time of writing:
 - `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
 - `tools/loop_claim.sh` now implements the lease protocol expected by the worker prompts
 - `loop_worker.sh` now implements a lane-aware worker launcher that resolves queue entries, acquires leases, revalidates claimed PRs, and invokes the matching worker prompt with explicit inputs
-- `loop_scheduler.sh` now implements the thin local scheduler that polls via reconcile cycles and dispatches the per-lane workers, including the single-lane `conflict-resolve` worker after `merge`
+- `loop_scheduler.sh` now implements the thin local scheduler that polls via reconcile cycles and dispatches the per-lane workers, including the single-lane `conflict-resolve` worker after `merge`; `--drain-lanes` makes the scheduler keep relaunching each enabled lane until it reports no remaining eligible PRs
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
 

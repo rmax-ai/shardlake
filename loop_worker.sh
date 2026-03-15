@@ -10,6 +10,7 @@ PRIMARY_BRANCH="${PRIMARY_BRANCH:-main}"
 WORKER_ITERATION_DIR="${WORKER_ITERATION_DIR:-$REPO_ROOT/tmp/worker_iterations}"
 WORKER_LOG_DIR="${WORKER_LOG_DIR:-$REPO_ROOT/tmp/loop_workers}"
 CLAIM_TTL_SECONDS="${LOOP_CLAIM_TTL_SECONDS:-1800}"
+NO_CANDIDATE_EXIT_STATUS="${LOOP_WORKER_NO_CANDIDATE_EXIT_STATUS:-10}"
 GH_PAGER_VALUE="${GH_PAGER:-cat}"
 NO_COLOR_VALUE="${NO_COLOR:-1}"
 CLICOLOR_VALUE="${CLICOLOR:-0}"
@@ -465,6 +466,10 @@ release_claim() {
   fi
 
   tools/loop_claim.sh release --owner "$WORKER_OWNER_ID" --ref "$LEASE_REF_NAME"
+  LEASE_ACQUIRED="no"
+  LEASE_REF_NAME=""
+  CLAIMED_PR_NUMBER=""
+  EXPECTED_HEAD_SHA=""
 }
 
 cleanup() {
@@ -626,11 +631,13 @@ while IFS= read -r candidate_json; do
   fresh_pr_json="$(gh pr view "$CLAIMED_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url)"
   if ! validate_claimed_pr "$LANE" "$EXPECTED_HEAD_SHA" "$fresh_pr_json"; then
     echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} no longer matches lane requirements; releasing claim" >&2
-    exit 0
+    release_claim
+    continue
   fi
   if [[ "$LANE" == "draft-review" ]] && ! validate_draft_completion_state "$CLAIMED_PR_NUMBER"; then
     echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} is labeled ready-for-draft-check without a current copilot_work_finished event; releasing claim" >&2
-    exit 0
+    release_claim
+    continue
   fi
 
   log_file="$WORKER_LOG_DIR/${LANE}_pr${CLAIMED_PR_NUMBER}_${timestamp}.log"
@@ -651,6 +658,10 @@ if [[ "$candidate_found" == "no" ]]; then
   else
     echo "[loop_worker] no eligible PR found for lane ${LANE}"
   fi
+elif [[ -n "$TARGET_PR" ]]; then
+  echo "[loop_worker] target PR #${TARGET_PR} was not processable for lane ${LANE}" >&2
+else
+  echo "[loop_worker] no processable PR found for lane ${LANE}"
 fi
 
-exit 0
+exit "$NO_CANDIDATE_EXIT_STATUS"
