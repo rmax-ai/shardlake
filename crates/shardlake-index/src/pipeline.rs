@@ -11,11 +11,15 @@
 //!
 //! Assemble a pipeline using [`QueryPipeline::builder`] and call
 //! [`QueryPipeline::run`] to execute a search query through all stages.
+//! Stages 3 and 4 execute concurrently across probed shards using the
+//! Rayon thread pool.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+
+use rayon::prelude::*;
 
 use shardlake_core::{
     error::CoreError,
@@ -337,13 +341,22 @@ impl QueryPipeline {
             .router
             .route(&embedded, &all_centroids, &centroid_to_shard, nprobe);
 
-        // Stages 3 + 4: Load each probed shard and collect candidates.
-        let mut all_results = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.loader.load(shard_id)?;
-            let results = self.candidate_search.search(&embedded, &shard, metric, k);
-            all_results.extend(results);
-        }
+        // Stages 3 + 4: Load and search each probed shard concurrently.
+        //
+        // Rayon's parallel iterator overlaps shard I/O and scoring across
+        // multiple threads.  Each task loads one shard and runs the candidate
+        // search; the results are gathered back and flattened below.  Any
+        // error from a shard load short-circuits the whole fan-out: `collect`
+        // returns the first `Err` encountered and the remaining tasks are
+        // abandoned.
+        let per_shard: Result<Vec<Vec<SearchResult>>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.loader.load(shard_id)?;
+                Ok(self.candidate_search.search(&embedded, &shard, metric, k))
+            })
+            .collect();
+        let all_results: Vec<SearchResult> = per_shard?.into_iter().flatten().collect();
 
         // Stage 5: Merge.
         let merged = self.merge.merge(all_results, k);

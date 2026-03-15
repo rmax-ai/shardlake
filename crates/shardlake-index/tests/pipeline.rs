@@ -17,10 +17,11 @@ use shardlake_core::{
 };
 use shardlake_index::{
     pipeline::{
-        CandidateSearchStage, EmbedStage, MergeStage, QueryPipeline, RerankStage, RouteStage,
+        CandidateSearchStage, EmbedStage, LoadShardStage, MergeStage, QueryPipeline, RerankStage,
+        RouteStage,
     },
     shard::ShardIndex,
-    BuildParams, IndexBuilder, Result,
+    BuildParams, IndexBuilder, IndexError, Result,
 };
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore, StorageError};
 
@@ -461,5 +462,140 @@ fn test_pipeline_exact_and_ann_paths_through_same_skeleton() {
     assert!(
         !ann_results.is_empty(),
         "ann stub pipeline must return results"
+    );
+}
+
+/// Shard searches execute concurrently: two searches must overlap in time.
+///
+/// A [`SleepingSearcher`] sleeps inside every `search()` call.  A
+/// [`ConcurrencyCounter`] tracks the peak number of simultaneously-active
+/// searches.  If the pipeline serialises shard work the peak is always 1;
+/// if it parallelises it the peak reaches ≥ 2 for a 2-shard probe.
+#[test]
+fn test_pipeline_shard_searches_run_concurrently() {
+    struct ConcurrentProbeSearcher {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl CandidateSearchStage for ConcurrentProbeSearcher {
+        fn search(
+            &self,
+            _query: &[f32],
+            _shard: &ShardIndex,
+            _metric: DistanceMetric,
+            _k: usize,
+        ) -> Vec<SearchResult> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            // Update peak if we just set a new high-water mark.
+            let mut cur = self.peak.load(Ordering::SeqCst);
+            while now > cur {
+                match self
+                    .peak
+                    .compare_exchange(cur, now, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+            // Sleep long enough for all threads to enter simultaneously.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            vec![]
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    // Four shards → four concurrent search tasks.
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 4,
+        kmeans_iters: 10,
+        nprobe: 4,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
+    };
+    let records = make_records(40, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-par".into()),
+            embedding_version: EmbeddingVersion("emb-par".into()),
+            index_version: IndexVersion("idx-par".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-par"),
+            metadata_key: paths::dataset_metadata_key("ds-par"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let pipeline = QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest)
+        .with_candidate_search(Box::new(ConcurrentProbeSearcher {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        }))
+        .build();
+
+    // Probe all 4 shards.
+    pipeline.run(&records[0].data, 5, 4).unwrap();
+
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak >= 2,
+        "expected at least 2 concurrent shard searches, observed peak = {observed_peak}"
+    );
+}
+
+/// A shard-load failure in any parallel task propagates through the pipeline.
+///
+/// [`FailingLoader`] returns an error for every shard it is asked to load.
+/// Even though the manifest has valid inline centroids (so routing succeeds),
+/// the parallel fan-out must surface the error and `run()` must return `Err`.
+#[test]
+fn test_pipeline_shard_load_failure_propagates() {
+    struct FailingLoader;
+    impl LoadShardStage for FailingLoader {
+        fn load(&self, _shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+            Err(IndexError::Other("injected shard load failure".into()))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = default_config(tmp.path(), 2);
+    let records = make_records(20, 4);
+
+    // Build a real index so the manifest has valid inline centroids.
+    // The loader is replaced below so the shard bytes are never read.
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-fail".into()),
+            embedding_version: EmbeddingVersion("emb-fail".into()),
+            index_version: IndexVersion("idx-fail".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-fail"),
+            metadata_key: paths::dataset_metadata_key("ds-fail"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    let pipeline = QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest)
+        .with_loader(Box::new(FailingLoader))
+        .build();
+
+    let err = pipeline
+        .run(&records[0].data, 5, 2)
+        .expect_err("pipeline must propagate shard load error");
+    assert!(
+        err.to_string().contains("injected shard load failure"),
+        "unexpected error message: {err}"
     );
 }
