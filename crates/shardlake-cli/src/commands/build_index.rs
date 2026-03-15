@@ -74,6 +74,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         nprobe: args.nprobe,
         kmeans_seed: args.kmeans_seed,
         kmeans_sample_size: args.kmeans_sample_size,
+        ..SystemConfig::default()
     };
 
     let dm = match DatasetManifest::load(&store, &dataset_ver) {
@@ -119,6 +120,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         dims,
         vectors_key,
         metadata_key,
+        pq_params: None,
     })?;
 
     println!(

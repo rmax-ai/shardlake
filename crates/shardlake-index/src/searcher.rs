@@ -17,8 +17,9 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
-    shard::ShardIndex,
-    IndexError, Result,
+    pq::PqCodebook,
+    shard::{PqShard, ShardIndex},
+    IndexError, Result, PQ8_CODEC,
 };
 
 /// Searcher that loads shard indexes lazily from `store`, caching them in RAM.
@@ -26,6 +27,10 @@ pub struct IndexSearcher {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
     cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    pq_shard_cache: Mutex<HashMap<ShardId, Arc<PqShard>>>,
+    /// PQ codebook; loaded once on first PQ search, then cached.
+    codebook: Mutex<Option<Arc<PqCodebook>>>,
+    metadata_cache: Mutex<Option<Arc<HashMap<String, serde_json::Value>>>>,
 }
 
 impl IndexSearcher {
@@ -40,6 +45,9 @@ impl IndexSearcher {
             store,
             manifest,
             cache: Mutex::new(HashMap::new()),
+            pq_shard_cache: Mutex::new(HashMap::new()),
+            codebook: Mutex::new(None),
+            metadata_cache: Mutex::new(None),
         }
     }
 
@@ -59,6 +67,8 @@ impl IndexSearcher {
         }
 
         let metric: DistanceMetric = self.manifest.distance_metric;
+        let pq_enabled =
+            self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
         // Collect centroids for routing from the manifest when available (manifest v2+).
         // Shards built with an older builder (manifest v1) have an empty centroid vec; for
@@ -81,10 +91,18 @@ impl IndexSearcher {
             } else {
                 // Slow path: legacy manifest without centroid metadata -- load the shard
                 // body to read its centroids (preserves backward compatibility).
-                let shard = self.load_shard(shard_def.shard_id)?;
-                for c in &shard.centroids {
-                    all_centroids.push(c.clone());
-                    centroid_to_shard.push(shard_def.shard_id);
+                if pq_enabled {
+                    let shard = self.load_pq_shard(shard_def.shard_id)?;
+                    for c in &shard.centroids {
+                        all_centroids.push(c.clone());
+                        centroid_to_shard.push(shard_def.shard_id);
+                    }
+                } else {
+                    let shard = self.load_shard(shard_def.shard_id)?;
+                    for c in &shard.centroids {
+                        all_centroids.push(c.clone());
+                        centroid_to_shard.push(shard_def.shard_id);
+                    }
                 }
             }
         }
@@ -103,17 +121,189 @@ impl IndexSearcher {
 
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
-        let mut all_results = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.load_shard(shard_id)?;
-            let results = exact_search(query, &shard.records, metric, k);
-            all_results.extend(results);
+        if pq_enabled {
+            self.search_pq_shards(query, &probe_shards, k, metric)
+        } else {
+            let mut all_results = Vec::new();
+            for shard_id in probe_shards {
+                let shard = self.load_shard(shard_id)?;
+                let results = exact_search(query, &shard.records, metric, k);
+                all_results.extend(results);
+            }
+            Ok(merge_top_k(all_results, k))
+        }
+    }
+
+    // ── PQ search path ────────────────────────────────────────────────────────
+
+    /// Search probed PQ-encoded shards using Asymmetric Distance Computation.
+    fn search_pq_shards(
+        &self,
+        query: &[f32],
+        probe_shards: &[ShardId],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Result<Vec<SearchResult>> {
+        if metric != DistanceMetric::Euclidean {
+            return Err(IndexError::Other(
+                "PQ search currently supports only euclidean distance".into(),
+            ));
+        }
+
+        let codebook = self.load_codebook()?;
+        let table = codebook.compute_distance_table(query)?;
+        let metadata_map = self.load_metadata_map()?;
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+
+        for &shard_id in probe_shards {
+            let shard = self.load_pq_shard(shard_id)?;
+            let mut scored: Vec<SearchResult> = shard
+                .entries
+                .iter()
+                .map(|(id, codes)| SearchResult {
+                    id: *id,
+                    score: codebook.adc_distance(codes, &table),
+                    metadata: metadata_map.get(&id.to_string()).cloned(),
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(k);
+            all_results.extend(scored);
         }
 
         Ok(merge_top_k(all_results, k))
     }
 
-    /// Load a shard from cache or store.
+    /// Load (or return from cache) the PQ codebook for this index.
+    fn load_codebook(&self) -> Result<Arc<PqCodebook>> {
+        {
+            let guard = self
+                .codebook
+                .lock()
+                .map_err(|_| IndexError::Other("codebook lock poisoned".into()))?;
+            if let Some(ref cb) = *guard {
+                return Ok(Arc::clone(cb));
+            }
+        }
+
+        let cb_key = self
+            .manifest
+            .compression
+            .codebook_key
+            .as_deref()
+            .ok_or_else(|| {
+                IndexError::Other("PQ index has no codebook_key in compression config".into())
+            })?;
+
+        let bytes = self.store.get(cb_key)?;
+        let cb = Arc::new(PqCodebook::from_bytes(&bytes)?);
+        if cb.dims != self.manifest.dims as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook dims {} do not match manifest dims {}",
+                cb.dims, self.manifest.dims
+            )));
+        }
+        if cb.params.num_subspaces != self.manifest.compression.pq_num_subspaces as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook subspaces {} do not match manifest pq_num_subspaces {}",
+                cb.params.num_subspaces, self.manifest.compression.pq_num_subspaces
+            )));
+        }
+        if cb.params.codebook_size != self.manifest.compression.pq_codebook_size as usize {
+            return Err(IndexError::Other(format!(
+                "PQ codebook size {} do not match manifest pq_codebook_size {}",
+                cb.params.codebook_size, self.manifest.compression.pq_codebook_size
+            )));
+        }
+
+        let mut guard = self
+            .codebook
+            .lock()
+            .map_err(|_| IndexError::Other("codebook lock poisoned".into()))?;
+        *guard = Some(Arc::clone(&cb));
+        Ok(cb)
+    }
+
+    fn load_metadata_map(&self) -> Result<Arc<HashMap<String, serde_json::Value>>> {
+        {
+            let guard = self
+                .metadata_cache
+                .lock()
+                .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
+            if let Some(ref metadata) = *guard {
+                return Ok(Arc::clone(metadata));
+            }
+        }
+
+        let bytes = self.store.get(&self.manifest.metadata_key)?;
+        let metadata: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)
+            .map_err(|err| IndexError::Other(format!("invalid dataset metadata map: {err}")))?;
+        let metadata = Arc::new(metadata);
+
+        let mut guard = self
+            .metadata_cache
+            .lock()
+            .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
+        *guard = Some(Arc::clone(&metadata));
+        Ok(metadata)
+    }
+
+    /// Load a PQ-encoded shard from cache or store.
+    fn load_pq_shard(&self, shard_id: ShardId) -> Result<Arc<PqShard>> {
+        {
+            let cache = self
+                .pq_shard_cache
+                .lock()
+                .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
+            if let Some(s) = cache.get(&shard_id) {
+                return Ok(Arc::clone(s));
+            }
+        }
+
+        let shard_def = self
+            .manifest
+            .shards
+            .iter()
+            .find(|s| s.shard_id == shard_id)
+            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+        let bytes = self.store.get(&shard_def.artifact_key)?;
+        let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+        if shard.dims != self.manifest.dims as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} dims {} do not match manifest dims {}",
+                shard.dims, self.manifest.dims
+            )));
+        }
+        if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
+                shard.pq_m, self.manifest.compression.pq_num_subspaces
+            )));
+        }
+        if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
+            return Err(IndexError::Other(format!(
+                "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
+                shard.pq_k, self.manifest.compression.pq_codebook_size
+            )));
+        }
+
+        let mut cache = self
+            .pq_shard_cache
+            .lock()
+            .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
+        cache.insert(shard_id, Arc::clone(&shard));
+        Ok(shard)
+    }
+
+    // ── Raw shard path ────────────────────────────────────────────────────────
+
+    /// Load a raw shard from cache or store.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
             let cache = self
@@ -169,6 +359,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let records = vec![VectorRecord {
             id: VectorId(1),
@@ -186,6 +377,7 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
 
