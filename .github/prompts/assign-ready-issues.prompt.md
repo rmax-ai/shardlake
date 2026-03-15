@@ -21,14 +21,20 @@ Requirements:
 1. Retrieve all open issues labeled `ready-to-implement`.
 2. For each such issue, verify before assignment:
    - it is still open
+  - its author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
    - it still has a parent epic in this repository
    - it still has no open blockers
 3. Assign only verified ready issues that are not already assigned to `copilot-swe-agent`.
 4. Prefer `gh issue edit <issue-number> --add-assignee "@copilot"`.
 5. If that fails because the CLI or token cannot resolve `@copilot`, fall back to the REST API agent-assignment payload.
 6. Verify the final assignee state after every assignment attempt.
-7. Skip any issue that is closed, blocked, missing a parent epic, or no longer labeled `ready-to-implement`.
+7. Skip any issue that is closed, blocked, authored outside the workflow actor guard rail, missing a parent epic, or no longer labeled `ready-to-implement`.
 8. Do not alter labels in this prompt except when an assignment command requires an idempotent retry with no semantic change.
+
+Execution guidance:
+
+- Retrieve or refresh each candidate issue's author login before assignment when it is not already present in the initial snapshot.
+- If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
 
 REST fallback payload:
 

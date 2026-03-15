@@ -26,9 +26,10 @@ Requirements:
    - open
    - not in draft state
    - labeled `ready-for-open-review`
+   - authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
 3. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 4. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
-5. Fetch PR metadata, changed files, labels, linked issues, CI/status checks, reviews, review comments, and general comments.
+5. Fetch PR metadata, including author identity, changed files, labels, linked issues, CI/status checks, reviews, review comments, and general comments.
 6. Create or refresh a dedicated git worktree for this PR by running `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>`.
 7. Inside that worktree, check out the PR branch and do all branch edits there. Do not modify files from the repository's primary checkout or the iteration worktree.
 7. Separate must-fix items from safe deferrals using actual review feedback and direct code/doc/test observations.
@@ -48,6 +49,8 @@ Requirements:
 14. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
 15. Do not merge the PR in this prompt.
 16. Do not inspect or modify any other PR.
+
+If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
 Worktree guidance:
 

@@ -26,7 +26,8 @@ Requirements:
    - open
    - not in draft state
    - labeled `ready-to-merge`
-3. Fetch the latest PR metadata, status checks, review state, and labels.
+   - authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`
+3. Fetch the latest PR metadata, including author identity, status checks, review state, and labels.
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
 6. Create or refresh a dedicated git worktree for this PR by running `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>`.
@@ -42,6 +43,8 @@ Requirements:
 11. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
 12. If the merge fails, report the exact failure clearly and do not guess.
 13. Do not process any other PR.
+
+If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
 Worktree guidance:
 

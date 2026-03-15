@@ -89,6 +89,12 @@ Current labels defined by the orchestrator:
 
 This gives operators a visible state machine in GitHub instead of hidden in local process memory.
 
+### Actor guard rail
+
+- The loop only processes issues and pull requests whose author login is `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax`.
+- Author identity is treated as required eligibility metadata for triage, assignment, review, and merge stages.
+- If author identity cannot be determined safely, the item is skipped as policy-blocked instead of being advanced optimistically.
+
 ### One goal per stage
 
 Each stage prompt is meant to perform one narrow task. The orchestrator prompt explicitly forbids merging stage responsibilities. This keeps failure modes smaller and makes the logs easier to audit.
@@ -190,6 +196,7 @@ The issue triage stage maintains the `ready-to-implement` queue.
 Its core rules are:
 
 - only child issues of open epics are eligible
+- only child issues whose author login passes the actor guard rail are eligible
 - blocked issues are not eligible
 - at most 5 open issues may hold `ready-to-implement`
 - the queue is filled deterministically by epic number, then child issue number
@@ -204,6 +211,7 @@ Operators should treat assignment as a separate concern from triage:
 
 - triage decides which issues belong in the active queue
 - assignment decides which actionable issues should be handed to the agent
+- assignment skips issues whose author login fails the actor guard rail
 
 ### 3. Draft PR triage
 
@@ -212,11 +220,14 @@ The orchestrator includes a draft PR triage stage before any detailed draft revi
 At a high level this stage should:
 
 - inspect open draft PRs from a repository snapshot
+- skip PRs whose author login fails the actor guard rail
 - determine whether agent work appears complete enough for readiness review
 - reconcile the `ready-for-draft-check` label
 - record skipped items and why they remain waiting
 
 ### 4. Open PR triage
+
+Open PR triage follows the same author restriction as the other stages: only open non-draft PRs authored by `copilot-swe-agent`, `copilot-swe-agent[bot]`, or `rmax` are eligible to receive loop-managed review or merge labels.
 
 The orchestrator then triages open non-draft PRs for active review. The goal is to identify which open PRs should carry `ready-for-open-review` and which are still waiting for review input, CI, or manual decisions.
 
