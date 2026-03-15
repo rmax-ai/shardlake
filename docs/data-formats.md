@@ -63,8 +63,9 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 
 ## Dataset manifest (`datasets/<version>/info.json`)
 
-Written by `shardlake ingest`. Contains a versioned description of the dataset
-for use by `shardlake build-index` without re-reading the full JSONL file.
+Written by `shardlake ingest` and `shardlake generate`. Contains a versioned
+description of the dataset for use by `shardlake build-index` without
+re-reading the full JSONL file.
 
 ```json
 {
@@ -87,7 +88,7 @@ for use by `shardlake build-index` without re-reading the full JSONL file.
 | `manifest_version` | Description |
 |--------------------|-------------|
 | `0` | Pre-versioning legacy file. No `manifest_version` field (defaults to `0`), no `ingest_metadata`. Uses `"count"` instead of `"vector_count"`. Still accepted by `shardlake build-index`. |
-| `1` | Current schema (produced by `shardlake ingest` ≥ 0.1.0). Includes `ingest_metadata` with lifecycle fields. Uses `"vector_count"`. |
+| `1` | Current schema (produced by `shardlake ingest` or `shardlake generate` ≥ 0.1.0). Includes `ingest_metadata` with lifecycle fields. Uses `"vector_count"`. |
 
 ### Fields
 
@@ -100,8 +101,8 @@ for use by `shardlake build-index` without re-reading the full JSONL file.
 | `vector_count` | integer | Total number of vectors in this dataset. Must be > 0. |
 | `vectors_key` | string | Storage key of the raw vectors JSONL file. |
 | `metadata_key` | string | Storage key of the id → metadata JSON file. |
-| `ingest_metadata.ingested_at` | ISO 8601 datetime | When the dataset was ingested (UTC). |
-| `ingest_metadata.ingester_version` | string | Semver version of the `shardlake` binary that ingested this dataset. |
+| `ingest_metadata.ingested_at` | ISO 8601 datetime | When the dataset was ingested or generated (UTC). |
+| `ingest_metadata.ingester_version` | string | Semver version of the `shardlake` binary that produced this dataset manifest. |
 
 ---
 
