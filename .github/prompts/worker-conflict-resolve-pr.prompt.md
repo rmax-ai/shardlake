@@ -81,10 +81,11 @@ Requirements:
     - renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id> --head-sha <new-head-sha>` so the lease tracks the pushed commit
     - inspect the lease again and confirm its recorded expected head SHA exactly matches that same refreshed SHA before any later durable write
     - remove the `has-merge-conflicts` label
+   - leave one concise PR comment that includes the final output of this prompt for the successful resolution
     - do not add `ready-for-open-review` or `ready-to-merge` in this run
 18. If the candidate resolution fails the harness, the merge remains semantically unclear, the push fails, the head SHA changes unexpectedly, or the same head/base pair already failed once:
     - ensure the `needs-human` label exists and add it to the PR
-    - leave one concise PR comment that explains why automation stopped
+   - leave one concise PR comment that includes the final output of this prompt and explains why automation stopped
     - include the retry marker when recording the first failure for that head/base pair
     - do not remove `has-merge-conflicts`
 19. Before any durable label or comment write, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
@@ -117,3 +118,5 @@ Output format:
    - `resolved and pushed`
    - `escalated to needs-human`
 9. Remaining blockers, if any
+
+Post the final output block above to the PR as the durable closing comment for this run with `gh pr comment <pr-number> --body-file <file>`. This comment is required for both successful resolutions and `needs-human` escalations.

@@ -47,6 +47,8 @@ Requirements:
   - remove it from any PR whose author login falls outside the workflow actor guard rail or cannot be determined safely
 6. Reconcile obviously stale `ready-to-merge` labels:
   - remove the label from any draft, closed, workflow-guard-rail-blocked, `needs-human`, or `has-merge-conflicts` PR still carrying it
+  - if GitHub reports a real merge conflict for a PR, ensure `has-merge-conflicts` exists and add it when missing
+  - do not add `needs-human` for a plain merge-conflict detection in this triage stage; reserve that escalation for a prior documented conflict-resolution failure on the current head/base pair or a separate required human design, architecture, policy, or product decision
 7. Do not decide merge readiness from local code checks in this prompt.
 
 Execution guidance:
@@ -54,11 +56,14 @@ Execution guidance:
 - Use `gh label list` and `gh label create` to ensure the labels exist.
 - Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use `gh pr list` and `gh pr view --json author,reviews,comments,reviewDecision,labels,isDraft,state` to inspect eligibility.
+- Use `gh pr view --json mergeable,mergeStateStatus` when you need to confirm whether a stale `ready-to-merge` PR is actually merge-conflicted.
 - Match Copilot or Codex actors by login when deciding whether AI review comments exist.
 - Use `gh pr edit <pr-number> --add-label ready-for-open-review`, `gh pr edit <pr-number> --remove-label ready-for-open-review`, and `gh pr edit <pr-number> --remove-label ready-to-merge` for reconciliation.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts` to record a recoverable merge-conflict blocker discovered during triage.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, do not process the PR further in this stage.
 - If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+- A plain `mergeable=CONFLICTING` or `mergeStateStatus=DIRTY` result is not, by itself, a reason to add `needs-human` in this stage; route the PR into `has-merge-conflicts` instead unless there is already evidence of a failed conflict-resolution attempt or another independent human-only decision.
 
 Output format:
 

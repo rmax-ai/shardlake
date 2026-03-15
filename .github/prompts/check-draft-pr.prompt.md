@@ -58,7 +58,7 @@ Requirements:
 14. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
 15. If any command fails, continue gathering as much context as possible and report the failure clearly.
 
-If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, and leave a concise evidence-based PR comment describing the conflict and the required human resolution.
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` label exists and add it to the PR. Do not add `needs-human` for plain conflict detection in this prompt. Add `needs-human` only if a prior conflict-resolution attempt for the current head/base pair is already documented as failed or another independent required human design, architecture, policy, or product decision blocks safe automation. Leave a concise evidence-based PR comment describing whether the PR is being routed to the conflict-resolution lane or escalated to `needs-human`, and report the conflict clearly as the blocker.
 
 If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 

@@ -29,6 +29,15 @@ assert_not_contains() {
   fi
 }
 
+assert_file_contains() {
+  local file_path="$1"
+  local needle="$2"
+  local content
+
+  content="$(<"$file_path")"
+  assert_contains "$content" "$needle"
+}
+
 setup_sandbox() {
   local sandbox_root="$1"
 
@@ -236,11 +245,17 @@ test_conflict_lane_rejects_draft_prs() (
   assert_not_contains "$output" "considering PR #7"
 )
 
+test_conflict_prompt_requires_final_pr_comment() (
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" "leave one concise PR comment that includes the final output of this prompt for the successful resolution"
+  assert_file_contains "$REPO_ROOT/.github/prompts/worker-conflict-resolve-pr.prompt.md" "Post the final output block above to the PR as the durable closing comment for this run"
+)
+
 main() {
   test_conflict_pr_is_only_claimable_in_conflict_lane
   test_conflict_pr_with_needs_human_is_not_eligible
   test_non_conflicted_pr_is_not_eligible_for_conflict_lane
   test_conflict_lane_rejects_draft_prs
+  test_conflict_prompt_requires_final_pr_comment
   echo "[test_loop_worker] PASS"
 }
 

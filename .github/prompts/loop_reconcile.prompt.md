@@ -53,7 +53,7 @@ Deterministic operating rules:
 3. Each stage prompt has exactly one goal. Do not merge stage responsibilities.
 4. This prompt publishes queues only. It must not claim or process a single issue or PR on behalf of a worker.
 5. Never label a PR ready for a later stage while blocking checks or unresolved blocking feedback remain.
-6. If any stage detects that a PR has merge conflicts, ensure `has-merge-conflicts` is present, remove it from `ready-for-open-review` and `ready-to-merge` eligibility, publish it to the conflict-resolution lane when it is not already `needs-human`, and add `needs-human` only when human resolution or judgment is clearly required or already proven by prior failed automation.
+6. If any stage detects that a PR has merge conflicts, ensure `has-merge-conflicts` is present, remove it from `ready-for-open-review` and `ready-to-merge` eligibility, and publish it to the conflict-resolution lane when it is not already `needs-human`. Do not add `needs-human` for plain conflict detection during reconciliation; reserve that escalation for a previous conflict-resolution failure already documented for the current head/base pair or an independent required human decision.
 7. If eligibility is ambiguous, do not advance the item this iteration.
 8. For draft PR triage, the only positive readiness signal is `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; do not substitute weaker heuristics such as “no visible pending state” or “same pattern as another draft.”
 9. If a new draft PR appears after the initial stage snapshot, refresh that stage's snapshot and reapply the same helper-backed rule instead of labeling it ad hoc.
@@ -86,11 +86,12 @@ Execution guidance:
 - After drafting the full reconciliation report, invoke a subagent that follows `.github/prompts/loop_reconcile_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
 - If GitHub reports a real merge conflict, ensure `has-merge-conflicts` exists before adding it.
 - Remove merge-conflicted PRs from `ready-for-open-review` and `ready-to-merge` queues during reconciliation.
-- Preserve or add `needs-human` for a merge-conflicted PR only when a previous conflict-resolution worker already escalated, the repository state proves the PR is not safely automatable, or another required human decision exists.
+- Preserve or add `needs-human` for a merge-conflicted PR only when a previous conflict-resolution worker already escalated for the current head/base pair or another independent required human design, architecture, policy, or product decision exists.
 - If a stage determines that an issue or PR is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the relevant issue or PR, and leave a concise evidence-based comment describing the decision needed and the minimum next action.
 - Treat the repository's primary checkout as read-only operational state on `main`: it may be fetched for updated refs, but it must not be used for PR branch commands.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 - Treat merge-conflicted PRs without `needs-human` as candidates for the dedicated `conflict-resolve` lane rather than as immediate human-only blockers.
+- A plain `mergeable=CONFLICTING` or `mergeStateStatus=DIRTY` read during reconciliation is not enough to add `needs-human`.
 
 Required final report:
 

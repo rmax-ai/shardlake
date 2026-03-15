@@ -223,7 +223,7 @@ Each worker prompt assumes a target item has already been claimed. It must:
 - use a dedicated PR worktree
 - stop cleanly if the lease is missing, expired, or no longer owned by that worker
 
-The `conflict-resolve` lane is deliberately single-lane like `merge`. It is the bounded recovery path for PRs labeled `has-merge-conflicts` but not `needs-human`. Its worker operates in a dedicated PR worktree, attempts a conservative local merge of the current base branch into the PR branch, gathers PR intent plus base-side intent plus exact conflict hunks plus repository validation commands before proposing edits, and lets the repository harness decide viability. On success, it pushes normally, renews the lease with the new head SHA, removes `has-merge-conflicts`, and exits. On failure, ambiguity, or repeated failure for the same PR-head/base pair, it adds `needs-human`, leaves a concise PR comment, and exits.
+The `conflict-resolve` lane is deliberately single-lane like `merge`. It is the bounded recovery path for PRs labeled `has-merge-conflicts` but not `needs-human`. Its worker operates in a dedicated PR worktree, attempts a conservative local merge of the current base branch into the PR branch, gathers PR intent plus base-side intent plus exact conflict hunks plus repository validation commands before proposing edits, and lets the repository harness decide viability. On success, it pushes normally, renews the lease with the new head SHA, removes `has-merge-conflicts`, leaves a concise PR comment with the final resolution summary and harness outcome, and exits. On failure, ambiguity, or repeated failure for the same PR-head/base pair, it adds `needs-human`, leaves a concise PR comment, and exits.
 
 The checked-in lease helper is `tools/loop_claim.sh`. It uses one remote ref per claimed PR lane at `refs/heads/loop-claims/<lane>/pr-<number>`. The tip commit of that ref contains a `lease.json` payload with owner id, lane, target PR number, expected head SHA, and UTC acquisition and expiry timestamps.
 
@@ -381,7 +381,7 @@ The loop attempts at most one merge candidate per iteration: the lowest-numbered
 
 The merge pass must not advance a PR while blocking checks, unresolved blocking feedback, merge conflicts, or policy blockers remain.
 
-If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. That label is recoverable state: it should route the PR out of `ready-for-open-review` and `ready-to-merge` and into the bounded `conflict-resolve` lane unless the PR is already labeled `needs-human`.
+If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. That label is recoverable state: it should route the PR out of `ready-for-open-review` and `ready-to-merge` and into the bounded `conflict-resolve` lane unless the PR is already labeled `needs-human`. A plain merge-conflict read from review, merge, or reconcile stages should not add `needs-human` by itself.
 
 ### 8. Conflict-resolution pass
 
@@ -396,9 +396,9 @@ Its worker must gather:
 - exact conflict hunks from a local merge attempt
 - repository validation commands and current code context from the dedicated PR worktree
 
-If the resulting local resolution passes the harness, the worker may push the resolved branch normally, renew the lease with the new PR head SHA, remove `has-merge-conflicts`, and stop. It must not automatically continue the PR into review or merge during the same run; the next reconcile pass decides that.
+If the resulting local resolution passes the harness, the worker may push the resolved branch normally, renew the lease with the new PR head SHA, remove `has-merge-conflicts`, leave a concise PR comment summarizing the final resolution and harness result, and stop. It must not automatically continue the PR into review or merge during the same run; the next reconcile pass decides that.
 
-If the resolution is ambiguous, fails validation, or already failed once for the same PR-head/base pair, the worker must add `needs-human`, leave a concise PR comment that explains why automation stopped, and stop.
+If the resolution is ambiguous, fails validation, or already failed once for the same PR-head/base pair, the worker must add `needs-human`, leave a concise PR comment that explains why automation stopped, and stop. That conflict-resolution lane is the normal place where a plain merge-conflict blocker becomes a terminal `needs-human` escalation.
 
 ## Dedicated Worktree Rule
 
