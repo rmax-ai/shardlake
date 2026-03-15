@@ -11,8 +11,8 @@ pub mod validator;
 
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
-pub use pq::{PqCodebook, PqParams};
 pub use ivf::IvfQuantizer;
+pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};
