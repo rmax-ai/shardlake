@@ -294,7 +294,9 @@ At a high level this stage should:
 - reconcile the `ready-for-draft-check` label
 - record skipped items and why they remain waiting
 
-In practice, the loop should treat the PR issue event `copilot_work_finished`, emitted via the `copilot-swe-agent` GitHub App, as the authoritative GitHub-visible signal that Copilot has finished its current work on that draft PR. Standard PR metadata such as Copilot-authored commits or review requests may support the decision, but should not replace the explicit issue event when deciding whether to add `ready-for-draft-check`.
+In practice, the loop should derive draft readiness from the ordered PR issue events emitted via the `copilot-swe-agent` GitHub App. A draft PR is eligible for `ready-for-draft-check` only when the latest relevant Copilot work event is `copilot_work_finished`. If the latest relevant event is `copilot_work_started`, or if no relevant Copilot work events are visible yet, the PR must stay out of `ready-for-draft-check` for that iteration.
+
+To keep that rule deterministic across prompts and workers, the repository includes `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>`. The loop should use that helper for every draft-PR readiness decision instead of inferring readiness from weaker signals such as missing pending banners, Copilot-authored commits, review requests, or a new draft matching the same pattern as earlier completed drafts.
 
 ### 4. Open PR triage
 

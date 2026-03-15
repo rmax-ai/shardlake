@@ -53,7 +53,9 @@ Deterministic operating rules:
 5. Never label a PR ready for a later stage while blocking checks or unresolved blocking feedback remain.
 6. If any stage detects that a PR has merge conflicts, add the `needs-human` label to that PR and do not advance it automatically this iteration.
 7. If eligibility is ambiguous, do not advance the item this iteration.
-8. The final report must end with one plain-text control block exactly matching the required format below.
+8. For draft PR triage, the only positive readiness signal is `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; do not substitute weaker heuristics such as “no visible pending state” or “same pattern as another draft.”
+9. If a new draft PR appears after the initial stage snapshot, refresh that stage's snapshot and reapply the same helper-backed rule instead of labeling it ad hoc.
+10. The final report must end with one plain-text control block exactly matching the required format below.
 
 Stage order:
 
@@ -75,6 +77,7 @@ Execution guidance:
 
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
 - If a required `gh` read or write fails, stop using GitHub data for that stage, report the exact `gh` failure, and do not fall back to other GitHub tools.
+- Use `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` for draft-PR readiness checks so the latest Copilot work event ordering is evaluated consistently.
 - Use ascending numeric order whenever reporting queue members.
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full reconciliation report, invoke a subagent that follows `.github/prompts/loop_reconcile_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.

@@ -62,7 +62,9 @@ Deterministic operating rules:
 6. If any stage detects that a PR has merge conflicts, add the `needs-human` label to that PR and do not advance it automatically this iteration.
 7. If eligibility is ambiguous, do not advance the item this iteration.
 8. Apply the workflow actor guard rail before assigning, labeling, reviewing, or merging any issue or PR.
-9. The final report must end with one plain-text control block exactly matching the required format below.
+9. For draft PR triage, the only positive readiness signal is `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; do not substitute weaker heuristics such as “no visible pending state” or “same pattern as another draft.”
+10. If a new draft PR appears after the initial draft snapshot, refresh the draft-triage stage and apply the same helper-backed rule instead of labeling it ad hoc.
+11. The final report must end with one plain-text control block exactly matching the required format below.
 
 Stage order:
 
@@ -85,6 +87,7 @@ Definitions:
 Execution guidance:
 
 - Use `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, and `gh api` directly.
+- Use `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` for draft-PR readiness checks so the latest Copilot work event ordering is evaluated consistently.
 - Use ascending numeric order whenever choosing a single issue or PR.
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full iteration report, invoke a subagent that follows `.github/prompts/loop_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.

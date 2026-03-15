@@ -40,6 +40,7 @@ Requirements:
    - labeled `ready-for-draft-check`
    - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
+   - still backed by `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; stop if the latest Copilot work event is no longer `copilot_work_finished`
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
 6. Fetch PR metadata, including author identity, changed files, linked issues, labels, and summary context.
@@ -73,6 +74,7 @@ Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <
 Worktree guidance:
 
 - Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` so the worktree is created under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/` rather than inside the active iteration checkout.
+- Use `python3 $SHARDLAKE_PRIMARY_ROOT/tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` before branch work so a stale or premature `ready-for-draft-check` label does not advance the PR.
 - After the helper returns the worktree path, `cd` into that path before any PR checkout command.
 - Do not pass `--worktree` to `gh pr checkout`; the installed GitHub CLI in this workflow does not support that flag.
 - Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.

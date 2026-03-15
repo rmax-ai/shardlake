@@ -294,6 +294,24 @@ if errors:
 PY
 }
 
+validate_draft_completion_state() {
+  local pr_number="$1"
+  local state_json
+
+  state_json="$(python3 "$REPO_ROOT/tools/copilot_pr_state.py" --repo "$GITHUB_REPOSITORY" --pr "$pr_number")"
+  python3 - "$state_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("ready_for_draft_check"):
+    raise SystemExit(0)
+
+reason = payload.get("reason") or payload.get("state") or "unknown draft readiness state"
+raise SystemExit(f"draft PR lacks a current copilot_work_finished signal: {reason}")
+PY
+}
+
 run_worker_prompt() {
   local prompt_path="$1"
   local iteration_worktree="$2"
@@ -321,7 +339,7 @@ Worker inputs:
     export SHARDLAKE_LEASE_REF_NAME="$LEASE_REF_NAME"
     export SHARDLAKE_EXPECTED_HEAD_SHA="$EXPECTED_HEAD_SHA"
     export SHARDLAKE_WORKER_LANE="$LANE"
-    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp -p "$prompt_text"
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools --allow-url=github.com --add-dir /tmp --add-dir "$PWD" -p "$prompt_text"
   ) | tee "$output_file"
   command_status=${PIPESTATUS[0]}
   set -e
@@ -496,6 +514,10 @@ while IFS= read -r candidate_json; do
   fresh_pr_json="$(gh pr view "$CLAIMED_PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json number,title,isDraft,labels,headRefOid,baseRefName,author,state,url)"
   if ! validate_claimed_pr "$LANE" "$EXPECTED_HEAD_SHA" "$fresh_pr_json"; then
     echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} no longer matches lane requirements; releasing claim" >&2
+    exit 0
+  fi
+  if [[ "$LANE" == "draft-review" ]] && ! validate_draft_completion_state "$CLAIMED_PR_NUMBER"; then
+    echo "[loop_worker] claimed PR #${CLAIMED_PR_NUMBER} is labeled ready-for-draft-check without a current copilot_work_finished event; releasing claim" >&2
     exit 0
   fi
 
