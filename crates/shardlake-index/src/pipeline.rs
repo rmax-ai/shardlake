@@ -49,7 +49,7 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
-    pq::ProductQuantizer,
+    pq::PqCodebook,
     shard::ShardIndex,
     IndexError, Result,
 };
@@ -72,7 +72,7 @@ pub trait CandidateSearchStage: Send + Sync {
         shard: &ShardIndex,
         k: usize,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult>;
+    ) -> Result<Vec<SearchResult>>;
 }
 
 /// Stage that re-ranks approximate candidates with exact distances.
@@ -110,8 +110,8 @@ impl CandidateSearchStage for ExactCandidateStage {
         shard: &ShardIndex,
         k: usize,
         metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
-        exact_search(query, &shard.records, metric, k)
+    ) -> Result<Vec<SearchResult>> {
+        Ok(exact_search(query, &shard.records, metric, k))
     }
 }
 
@@ -123,21 +123,20 @@ impl CandidateSearchStage for ExactCandidateStage {
 /// This is significantly faster than computing exact distances when the
 /// vector dimension is high.
 ///
-/// Build with [`PqCandidateStage::new`] and supply a trained
-/// [`ProductQuantizer`].
+/// Build with [`PqCandidateStage::new`] and supply a trained [`PqCodebook`].
 pub struct PqCandidateStage {
-    quantizer: Arc<ProductQuantizer>,
+    codebook: Arc<PqCodebook>,
 }
 
 impl PqCandidateStage {
-    /// Create a PQ candidate stage backed by `quantizer`.
-    pub fn new(quantizer: Arc<ProductQuantizer>) -> Self {
-        Self { quantizer }
+    /// Create a PQ candidate stage backed by `codebook`.
+    pub fn new(codebook: Arc<PqCodebook>) -> Self {
+        Self { codebook }
     }
 
-    /// Return the underlying product quantizer.
-    pub fn quantizer(&self) -> &ProductQuantizer {
-        &self.quantizer
+    /// Return the underlying PQ codebook.
+    pub fn codebook(&self) -> &PqCodebook {
+        &self.codebook
     }
 }
 
@@ -147,29 +146,32 @@ impl CandidateSearchStage for PqCandidateStage {
         query: &[f32],
         shard: &ShardIndex,
         k: usize,
-        _metric: DistanceMetric,
-    ) -> Vec<SearchResult> {
-        let tables = self.quantizer.precompute_distance_tables(query);
-        let mut scored: Vec<SearchResult> = shard
-            .records
-            .iter()
-            .map(|rec| {
-                let codes = self.quantizer.encode(&rec.data);
-                let score = self.quantizer.score_with_tables(&tables, &codes);
-                SearchResult {
-                    id: rec.id,
-                    score,
-                    metadata: rec.metadata.clone(),
-                }
-            })
-            .collect();
+        metric: DistanceMetric,
+    ) -> Result<Vec<SearchResult>> {
+        if metric != DistanceMetric::Euclidean {
+            return Err(IndexError::Other(
+                "PQ search currently supports only euclidean distance".into(),
+            ));
+        }
+
+        let tables = self.codebook.compute_distance_table(query)?;
+        let mut scored = Vec::with_capacity(shard.records.len());
+        for rec in &shard.records {
+            let codes = self.codebook.encode(&rec.data)?;
+            let score = self.codebook.adc_distance(&codes, &tables);
+            scored.push(SearchResult {
+                id: rec.id,
+                score,
+                metadata: rec.metadata.clone(),
+            });
+        }
         scored.sort_by(|a, b| {
             a.score
                 .partial_cmp(&b.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(k);
-        scored
+        Ok(scored)
     }
 }
 
@@ -329,7 +331,7 @@ impl QueryPipeline {
             let shard = self.load_shard(shard_id)?;
             let results =
                 self.candidate_stage
-                    .search_shard(query, &shard, candidates_per_shard, metric);
+                    .search_shard(query, &shard, candidates_per_shard, metric)?;
             all_results.extend(results);
             if self.rerank_stage.is_some() {
                 probed_records.extend(shard.records.iter().cloned());
@@ -488,6 +490,7 @@ mod tests {
             nprobe: num_shards,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
@@ -499,6 +502,7 @@ mod tests {
                 dims,
                 vectors_key: "datasets/ds-pl/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-pl/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
         // `tmp` is intentionally leaked so the directory stays alive for the
@@ -560,6 +564,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let mut manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
@@ -571,6 +576,7 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-empty/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-empty/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
         manifest.shards.clear();
@@ -581,14 +587,21 @@ mod tests {
 
     #[test]
     fn pq_candidate_stage_returns_approximate_results() {
-        use crate::pq::ProductQuantizer;
-        use rand::SeedableRng;
+        use crate::pq::{PqCodebook, PqParams};
 
         let records = make_records(40, 4);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let pq = ProductQuantizer::train(&vecs, 2, 16, 20, &mut rng).unwrap();
+        let pq = PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            42,
+            20,
+        )
+        .unwrap();
         let pq_stage = PqCandidateStage::new(Arc::new(pq));
 
         let shard = crate::shard::ShardIndex {
@@ -599,7 +612,9 @@ mod tests {
         };
 
         let query = records[0].data.clone();
-        let results = pq_stage.search_shard(&query, &shard, 5, DistanceMetric::Euclidean);
+        let results = pq_stage
+            .search_shard(&query, &shard, 5, DistanceMetric::Euclidean)
+            .unwrap();
 
         assert!(!results.is_empty(), "PQ stage should return results");
         assert!(results.len() <= 5);
@@ -650,8 +665,7 @@ mod tests {
 
     #[test]
     fn pipeline_with_pq_stage_and_reranking_finds_correct_top1() {
-        use crate::pq::ProductQuantizer;
-        use rand::SeedableRng;
+        use crate::pq::{PqCodebook, PqParams};
 
         let records = make_records(20, 4);
         let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
@@ -665,6 +679,7 @@ mod tests {
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
@@ -676,11 +691,20 @@ mod tests {
                 dims: 4,
                 vectors_key: "datasets/ds-pq/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-pq/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
 
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let pq = ProductQuantizer::train(&vecs, 2, 16, 20, &mut rng).unwrap();
+        let pq = PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            42,
+            20,
+        )
+        .unwrap();
 
         let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)
             .candidate_stage(Arc::new(PqCandidateStage::new(Arc::new(pq))))
@@ -710,6 +734,7 @@ mod tests {
             nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
+            ..SystemConfig::default()
         };
         let manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
@@ -721,6 +746,7 @@ mod tests {
                 dims: 2,
                 vectors_key: "datasets/ds-os/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-os/metadata.json".into(),
+                pq_params: None,
             })
             .unwrap();
 

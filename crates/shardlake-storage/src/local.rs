@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::BufWriter,
     path::{Component, Path, PathBuf},
 };
 
@@ -35,17 +36,34 @@ impl LocalObjectStore {
     fn full_prefix_path(&self, prefix: &str) -> Result<PathBuf> {
         Ok(self.root.join(sanitise_key(prefix, true)?))
     }
-}
 
-impl ObjectStore for LocalObjectStore {
-    fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        let path = self.full_path(key)?;
+    fn create_parent_dirs(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| StorageError::Io {
                 path: parent.display().to_string(),
                 source: e,
             })?;
         }
+        Ok(())
+    }
+
+    /// Create a buffered writer for `key`, creating intermediate directories as
+    /// needed.
+    pub fn create_writer(&self, key: &str) -> Result<BufWriter<File>> {
+        let path = self.full_path(key)?;
+        Self::create_parent_dirs(&path)?;
+        let file = File::create(&path).map_err(|e| StorageError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(BufWriter::new(file))
+    }
+}
+
+impl ObjectStore for LocalObjectStore {
+    fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        let path = self.full_path(key)?;
+        Self::create_parent_dirs(&path)?;
         trace!(key, bytes = data.len(), "put");
         fs::write(&path, data).map_err(|e| StorageError::Io {
             path: path.display().to_string(),
@@ -213,5 +231,20 @@ mod tests {
             assert_invalid_key(store.list(key).unwrap_err());
             assert_invalid_key(store.delete(key).unwrap_err());
         }
+    }
+
+    #[test]
+    fn create_writer_persists_bytes_at_key() {
+        use std::io::Write;
+
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+
+        let mut writer = store.create_writer("nested/data.jsonl").unwrap();
+        writer.write_all(b"hello\nworld\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(store.get("nested/data.jsonl").unwrap(), b"hello\nworld\n");
     }
 }

@@ -126,26 +126,42 @@ pub struct ShardSummary {
     pub max_shard_vector_count: u64,
 }
 
-/// Placeholder for compression / quantization configuration (manifest v3+).
+/// Compression / quantization configuration for an index (manifest v3+).
 ///
-/// Full quantization support is not yet implemented; this struct is reserved
-/// for future use.  Set `enabled = false` and `codec = "none"` for all current
-/// prototype builds.
+/// When `enabled` is `false` (the default) and `codec` is `"none"`, shard
+/// artifacts use the raw-vector format (version 1).
+///
+/// When `enabled` is `true` and `codec` is `"pq8"`, shard artifacts use the
+/// PQ-encoded format (version 2) and an additional codebook artifact is
+/// stored at the key given by `codebook_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompressionConfig {
-    /// Whether compression / quantization is active.  Always `false` in the
-    /// current prototype.
+    /// Whether compression / quantization is active.
     #[serde(default)]
     pub enabled: bool,
-    /// Codec identifier.  `"none"` means no compression is applied.
-    /// Reserved values for future use: `"pq8"`, `"sq8"`.
+    /// Codec identifier: `"none"` or `"pq8"`.
     #[serde(default = "CompressionConfig::default_codec")]
     pub codec: String,
+    /// Number of PQ sub-spaces (`M`).  `0` when codec is not `"pq8"`.
+    #[serde(default, skip_serializing_if = "CompressionConfig::is_zero_u32")]
+    pub pq_num_subspaces: u32,
+    /// PQ codebook size (`K`).  Defaults to `256` for `"pq8"` builds;
+    /// `0` for uncompressed indexes.
+    #[serde(default, skip_serializing_if = "CompressionConfig::is_zero_u32")]
+    pub pq_codebook_size: u32,
+    /// Storage key of the PQ codebook artifact.  `None` for uncompressed
+    /// indexes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codebook_key: Option<String>,
 }
 
 impl CompressionConfig {
     fn default_codec() -> String {
         "none".into()
+    }
+
+    fn is_zero_u32(v: &u32) -> bool {
+        *v == 0
     }
 }
 
@@ -154,6 +170,9 @@ impl Default for CompressionConfig {
         Self {
             enabled: false,
             codec: Self::default_codec(),
+            pq_num_subspaces: 0,
+            pq_codebook_size: 0,
+            codebook_key: None,
         }
     }
 }

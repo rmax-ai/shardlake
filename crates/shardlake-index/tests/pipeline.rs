@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use shardlake_core::{
-    config::SystemConfig,
+    config::{FanOutPolicy, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorId,
         VectorRecord,
@@ -17,7 +17,7 @@ use shardlake_index::{
         CandidateSearchStage, ExactCandidateStage, ExactRerankStage, PqCandidateStage,
         QueryPipeline, RerankStage,
     },
-    pq::ProductQuantizer,
+    pq::{PqCodebook, PqParams},
     shard::ShardIndex,
     BuildParams, IndexBuilder, IndexSearcher,
 };
@@ -54,6 +54,7 @@ fn build_index(
         nprobe: num_shards,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
         kmeans_sample_size: None,
+        ..SystemConfig::default()
     };
     let manifest = IndexBuilder::new(store.as_ref(), &config)
         .build(BuildParams {
@@ -65,6 +66,7 @@ fn build_index(
             dims,
             vectors_key: format!("datasets/{dataset_tag}/vectors.jsonl"),
             metadata_key: format!("datasets/{dataset_tag}/metadata.json"),
+            pq_params: None,
         })
         .unwrap();
     (store, manifest, tmp)
@@ -176,7 +178,12 @@ fn pipeline_matches_searcher_results() {
 
     for i in [0, 5, 10, 15] {
         let query = records[i].data.clone();
-        let s_res = searcher.search(&query, 5, 2).unwrap();
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let s_res = searcher.search(&query, 5, &policy).unwrap();
         let p_res = pipeline.search(&query, 5, 2).unwrap();
         assert_eq!(
             s_res.len(),
@@ -197,13 +204,21 @@ fn pipeline_matches_searcher_results() {
 /// [`PqCandidateStage`] must rank the identical vector above distant vectors.
 #[test]
 fn pq_candidate_stage_ranks_identical_vector_first() {
-    use rand::SeedableRng;
-
     let records = make_records(30, 4);
     let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
-    let pq = Arc::new(ProductQuantizer::train(&vecs, 2, 16, 20, &mut rng).unwrap());
+    let pq = Arc::new(
+        PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            0xdead_beef,
+            20,
+        )
+        .unwrap(),
+    );
     let stage = PqCandidateStage::new(Arc::clone(&pq));
 
     let shard = ShardIndex {
@@ -214,7 +229,9 @@ fn pq_candidate_stage_ranks_identical_vector_first() {
     };
 
     let query = records[0].data.clone();
-    let results = stage.search_shard(&query, &shard, 5, DistanceMetric::Euclidean);
+    let results = stage
+        .search_shard(&query, &shard, 5, DistanceMetric::Euclidean)
+        .unwrap();
 
     assert!(
         results.iter().any(|r| r.id == VectorId(0)),
@@ -236,14 +253,23 @@ fn pq_candidate_stage_ranks_identical_vector_first() {
 /// PQ top-k recall should be non-trivial against the exact ground truth.
 #[test]
 fn pq_candidate_stage_has_reasonable_recall() {
-    use rand::SeedableRng;
     use shardlake_index::exact::exact_search;
 
     let records = make_records(50, 4);
     let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let pq = Arc::new(ProductQuantizer::train(&vecs, 2, 16, 30, &mut rng).unwrap());
+    let pq = Arc::new(
+        PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            42,
+            30,
+        )
+        .unwrap(),
+    );
     let stage = PqCandidateStage::new(Arc::clone(&pq));
 
     let shard = ShardIndex {
@@ -261,7 +287,9 @@ fn pq_candidate_stage_has_reasonable_recall() {
         let query = records[i * 4].data.clone();
 
         let exact = exact_search(&query, &records, DistanceMetric::Euclidean, k);
-        let approx = stage.search_shard(&query, &shard, k, DistanceMetric::Euclidean);
+        let approx = stage
+            .search_shard(&query, &shard, k, DistanceMetric::Euclidean)
+            .unwrap();
 
         let exact_ids: Vec<VectorId> = exact.iter().map(|r| r.id).collect();
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
@@ -323,15 +351,23 @@ fn exact_rerank_corrects_wrong_scores() {
 /// pipeline result.
 #[test]
 fn pipeline_pq_plus_rerank_equals_exact_result() {
-    use rand::SeedableRng;
-
     let records = make_records(20, 4);
     let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
     let (store, manifest, _tmp) = build_index(records.clone(), 2, 4, "ds-pqrr");
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xdead_beef);
-    let pq = Arc::new(ProductQuantizer::train(&vecs, 2, 16, 20, &mut rng).unwrap());
+    let pq = Arc::new(
+        PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            0xdead_beef,
+            20,
+        )
+        .unwrap(),
+    );
 
     let exact_pipeline = QueryPipeline::builder(Arc::clone(&store), manifest.clone()).build();
     let pq_rerank_pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)

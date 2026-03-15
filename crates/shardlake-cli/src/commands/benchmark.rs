@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use shardlake_core::types::VectorRecord;
+use shardlake_core::{config::FanOutPolicy, types::VectorRecord};
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -23,15 +23,30 @@ pub struct BenchmarkArgs {
     /// Number of top results to retrieve.
     #[arg(long, default_value_t = 10)]
     pub k: usize,
-    /// Number of shards to probe.
+    /// Number of nearest centroids to select per query (candidate_centroids).
     #[arg(long, default_value_t = 2)]
-    pub nprobe: usize,
+    pub nprobe: u32,
+    /// Maximum number of shards to probe after centroid-to-shard deduplication.
+    /// `0` means no cap.
+    #[arg(long, default_value_t = 0)]
+    pub candidate_shards: u32,
+    /// Maximum number of vectors to evaluate per probed shard.
+    /// `0` means no limit.
+    #[arg(long, default_value_t = 0)]
+    pub max_vectors_per_shard: u32,
     /// Maximum number of query vectors to use (0 = up to 100).
     #[arg(long, default_value_t = 0)]
     pub max_queries: usize,
 }
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
+    let policy = FanOutPolicy {
+        candidate_centroids: args.nprobe,
+        candidate_shards: args.candidate_shards,
+        max_vectors_per_shard: args.max_vectors_per_shard,
+    };
+    policy.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
+
     let store = Arc::new(LocalObjectStore::new(&storage)?);
     let manifest = Manifest::load_alias(&*store, &args.alias)?;
     let metric = manifest.distance_metric;
@@ -57,7 +72,9 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
     info!(
         n_queries = queries.len(),
         k = args.k,
-        nprobe = args.nprobe,
+        candidate_centroids = policy.candidate_centroids,
+        candidate_shards = policy.candidate_shards,
+        max_vectors_per_shard = policy.max_vectors_per_shard,
         "Running benchmark"
     );
 
@@ -67,13 +84,7 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
     );
     let store_arc: Arc<dyn shardlake_storage::ObjectStore> = store;
     let report = shardlake_bench::run_benchmark(
-        &searcher,
-        &store_arc,
-        &queries,
-        &corpus,
-        args.k,
-        args.nprobe,
-        metric,
+        &searcher, &store_arc, &queries, &corpus, args.k, &policy, metric,
     );
 
     println!("=== Benchmark Report ===");
