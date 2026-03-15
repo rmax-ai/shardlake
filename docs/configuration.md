@@ -63,7 +63,7 @@ A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 shard.  At search time:
 
 1. **Centroid lookup** — each shard's centroid is read directly from the in-memory
-   manifest (`ShardDef.centroid`, present in manifest v2 and v3).  No shard bodies
+   manifest (`ShardDef.centroid`, present in manifest v2 and later).  No shard bodies
    are loaded during this phase.
 2. **Top-`nprobe` selection** — the `nprobe` shards whose centroids are nearest to the
    query vector (by squared Euclidean distance) are selected.
@@ -74,8 +74,8 @@ shard.  At search time:
 
 For indexes built from a legacy manifest v1 (no `centroid` field in `ShardDef`) the
 searcher falls back to loading every shard body to extract its centroid on first use.
-Rebuilding the index with the current builder produces a v3 manifest (which includes
-the `centroid` field introduced in v2), restoring the zero-I/O routing path.
+Rebuilding the index with the current builder produces a v4 manifest (which still
+includes the `centroid` field introduced in v2), restoring the zero-I/O routing path.
 
 The routing centroids are stored in the manifest and verified by
 `shardlake validate` (check `ShardCentroidMismatch` in the validation report).
