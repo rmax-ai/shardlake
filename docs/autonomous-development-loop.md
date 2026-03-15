@@ -89,7 +89,7 @@ Current labels defined by the orchestrator:
 | `ready-for-open-review` | An open non-draft PR is ready for review handling |
 | `ready-to-merge` | An open PR has completed review handling and is ready for a final merge pass |
 | `has-merge-conflicts` | The PR currently has merge conflicts and should not be advanced until the conflicts are resolved |
-| `needs-human` | A PR is blocked on manual intervention and must not be advanced automatically |
+| `needs-human` | An issue or PR is blocked on a needed human decision or manual intervention and must not be advanced automatically |
 
 This gives operators a visible state machine in GitHub instead of hidden in local process memory.
 
@@ -347,7 +347,7 @@ The loop attempts at most one merge candidate per iteration: the lowest-numbered
 
 The merge pass must not advance a PR while blocking checks, unresolved blocking feedback, merge conflicts, or policy blockers remain.
 
-If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. Stages that already escalate merge conflicts to `needs-human` should continue doing that when human intervention is required.
+If any stage detects merge conflicts on a PR, the loop should add the `has-merge-conflicts` label so the conflict is explicit in GitHub state. If the conflict or any other blocker requires a human decision or manual intervention, the loop should also add `needs-human` and leave a concise comment on the affected issue or PR describing the decision needed and the next action.
 
 ## Dedicated Worktree Rule
 

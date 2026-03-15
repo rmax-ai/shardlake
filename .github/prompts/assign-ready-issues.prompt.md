@@ -47,6 +47,7 @@ Execution guidance:
 - Use `gh issue edit <issue-number> --remove-label ready-to-implement --add-label implementation-in-progress` only after the issue is verified to be assigned to `copilot-swe-agent`.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
+- If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 REST fallback payload:
 

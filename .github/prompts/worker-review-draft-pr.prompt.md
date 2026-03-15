@@ -73,7 +73,9 @@ Requirements:
 17. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
 18. Do not inspect or modify any other PR.
 
-If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` label exists, add that label to the PR, do not advance the PR state in this run, and report the conflict clearly as the blocker.
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, leave a concise evidence-based PR comment describing the conflict and the required human resolution, do not advance the PR state in this run, and report the conflict clearly as the blocker.
+
+If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
@@ -92,8 +94,9 @@ Merge-conflict handling:
 
 - When you need to verify whether the PR is merge-conflicted, use `gh pr view <pr-number> --json mergeable` or another `gh` read that exposes the same state.
 - Treat `mergeable` values that indicate conflicts as authoritative for applying `has-merge-conflicts`.
-- Ensure the `has-merge-conflicts` label exists before adding it.
-- Use `gh pr edit <pr-number> --add-label has-merge-conflicts` to record the blocker.
+- Ensure the `has-merge-conflicts` and `needs-human` labels exist before adding them.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts --add-label needs-human` to record a merge-conflict blocker.
+- Use `gh pr edit <pr-number> --add-label needs-human` and `gh pr comment <pr-number> --body-file <file>` when a human decision is required.
 
 Output format:
 

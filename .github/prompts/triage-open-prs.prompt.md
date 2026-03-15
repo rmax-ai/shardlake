@@ -53,6 +53,7 @@ Execution guidance:
 - Use `gh pr edit <pr-number> --add-label ready-for-open-review`, `gh pr edit <pr-number> --remove-label ready-for-open-review`, and `gh pr edit <pr-number> --remove-label ready-to-merge` for reconciliation.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, do not process the PR further in this stage.
+- If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 Output format:
 

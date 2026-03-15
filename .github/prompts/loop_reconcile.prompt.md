@@ -37,7 +37,8 @@ Workflow labels:
 - `ready-for-draft-check`: draft PR has completed agent work and can be reviewed for leaving draft
 - `ready-for-open-review`: open non-draft PR has Copilot or Codex review comments ready for handling
 - `ready-to-merge`: open PR has completed review handling and is ready for a final merge pass
-- `needs-human`: PR is blocked on manual intervention and must not be advanced automatically
+- `has-merge-conflicts`: PR currently has merge conflicts and should not be advanced until resolved
+- `needs-human`: issue or PR is blocked on a needed human decision or manual intervention and must not be advanced automatically
 
 Workflow actor guard rail:
 
@@ -52,7 +53,7 @@ Deterministic operating rules:
 3. Each stage prompt has exactly one goal. Do not merge stage responsibilities.
 4. This prompt publishes queues only. It must not claim or process a single issue or PR on behalf of a worker.
 5. Never label a PR ready for a later stage while blocking checks or unresolved blocking feedback remain.
-6. If any stage detects that a PR has merge conflicts, add the `needs-human` label to that PR and do not advance it automatically this iteration.
+6. If any stage detects that a PR has merge conflicts, add the `has-merge-conflicts` label to that PR, add `needs-human` when human resolution or judgment is required, leave a concise PR comment describing the blocker, and do not advance it automatically this iteration.
 7. If eligibility is ambiguous, do not advance the item this iteration.
 8. For draft PR triage, the only positive readiness signal is `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; do not substitute weaker heuristics such as “no visible pending state” or “same pattern as another draft.”
 9. If a new draft PR appears after the initial stage snapshot, refresh that stage's snapshot and reapply the same helper-backed rule instead of labeling it ad hoc.
@@ -82,7 +83,8 @@ Execution guidance:
 - Use ascending numeric order whenever reporting queue members.
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full reconciliation report, invoke a subagent that follows `.github/prompts/loop_reconcile_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
-- If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
+- If a merge-conflicted PR needs `has-merge-conflicts` or `needs-human`, ensure those labels exist before adding them.
+- If a stage determines that an issue or PR is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the relevant issue or PR, and leave a concise evidence-based comment describing the decision needed and the minimum next action.
 - Treat the repository's primary checkout as read-only operational state on `main`: it may be fetched for updated refs, but it must not be used for PR branch commands.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 

@@ -55,6 +55,10 @@ Requirements:
 15. Do not merge the PR in this prompt.
 16. Do not inspect or modify any other PR.
 
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, leave a concise evidence-based PR comment describing the conflict and the required human resolution, do not label the PR `ready-to-merge` in this run, and report the conflict clearly as the blocker.
+
+If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
 Worktree guidance:
@@ -66,6 +70,14 @@ Worktree guidance:
 - Use the prepared worktree as the current directory first, then run a standard checkout command there, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
 - After push and final verification, remove the worktree with `git -C "$SHARDLAKE_PRIMARY_ROOT" worktree remove --force <worktree-path>` when the tree is clean.
+
+Merge-conflict and human-decision handling:
+
+- When you need to verify whether the PR is merge-conflicted, use `gh pr view <pr-number> --json mergeable` or another `gh` read that exposes the same state.
+- Treat `mergeable` values that indicate conflicts as authoritative for applying `has-merge-conflicts`.
+- Ensure the `has-merge-conflicts` and `needs-human` labels exist before adding them.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts --add-label needs-human` to record a merge-conflict blocker.
+- Use `gh pr edit <pr-number> --add-label needs-human` and `gh pr comment <pr-number> --body-file <file>` when a human decision is required.
 
 Output format:
 

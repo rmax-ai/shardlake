@@ -23,7 +23,7 @@ Deterministic rules:
 3. Only issues with a parent epic are eligible for `ready-to-implement`.
 4. A child issue is eligible only when it is open, not already assigned to `copilot-swe-agent`, not already labeled `implementation-in-progress`, its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`), and it has no open blockers.
 5. Keep at most 5 open unassigned issues labeled `ready-to-implement` across the repository.
-6. Do not add comments, assignments, or new issues in this prompt.
+6. Do not add comments, assignments, or new issues in this prompt unless you are explicitly escalating a needed human decision on an issue.
 
 Requirements:
 
@@ -68,6 +68,7 @@ Execution guidance:
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, treat the issue as not ready for this iteration.
 - If blocker state is ambiguous, treat the issue as not ready for this iteration.
+- If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 Output format:
 

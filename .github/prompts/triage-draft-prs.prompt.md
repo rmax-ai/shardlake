@@ -58,6 +58,7 @@ Execution guidance:
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, do not process the PR further in this stage.
 - If agent state cannot be determined safely, remove or avoid the label and treat the PR as not ready this iteration.
+- If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 Output format:
 

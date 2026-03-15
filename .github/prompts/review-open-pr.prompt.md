@@ -83,6 +83,10 @@ Requirements:
 17. Do not make code changes unless explicitly asked. This prompt is for checkout, validation, and reporting.
 18. If any command fails, continue gathering as much context as possible and report the failure clearly.
 
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, and leave a concise evidence-based PR comment describing the conflict and the required human resolution.
+
+If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+
 Execution guidance:
 - Use `gh pr view <input> --json number,title,isDraft,state,baseRefName,headRefName,author,body,labels,milestone,closingIssuesReferences,files,statusCheckRollup,reviews,comments,reviewDecision` to resolve the PR and gather metadata when structured output is useful.
 - Use `gh api graphql -f query='query($owner:String!,$repo:String!,$number:Int!){ repository(owner:$owner,name:$repo){ pullRequest(number:$number){ reviewThreads(first:50){ nodes { isResolved isOutdated comments(first:20){ nodes { author { login } body path outdated originalPosition diffHunk createdAt } } } } } } }' -F owner=<owner> -F repo=<repo> -F number=<pr-number>` when you need review thread resolution state; do not ask `gh pr view --json` for `reviewThreads`.
@@ -101,6 +105,7 @@ Execution guidance:
 - Be explicit about whether the branch was actually checked out.
 - Leave the repository on the checked-out PR branch unless the user asks otherwise.
 - Use a final decision checklist before the recommendation: checks pass, blocking feedback resolved, must-fix list empty, docs adequate, tests adequate, and deferred work is captured if needed.
+- Use `gh pr view <input> --json mergeable` or another `gh` read that exposes the same state when you need to determine whether the PR is merge-conflicted.
 
 Output format:
 1. PR summary
