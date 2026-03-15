@@ -290,9 +290,11 @@ At a high level this stage should:
 
 - inspect open draft PRs from a repository snapshot
 - skip PRs whose author login fails the actor guard rail
-- determine whether agent work appears complete enough for readiness review
+- determine whether agent work appears complete enough for readiness review, using GitHub issue events as the primary completion signal
 - reconcile the `ready-for-draft-check` label
 - record skipped items and why they remain waiting
+
+In practice, the loop should treat the PR issue event `copilot_work_finished`, emitted via the `copilot-swe-agent` GitHub App, as the authoritative GitHub-visible signal that Copilot has finished its current work on that draft PR. Standard PR metadata such as Copilot-authored commits or review requests may support the decision, but should not replace the explicit issue event when deciding whether to add `ready-for-draft-check`.
 
 ### 4. Open PR triage
 

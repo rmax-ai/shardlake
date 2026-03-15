@@ -24,7 +24,7 @@ Definitions:
   - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
   - it has no GitHub-visible agent task pending
   - pending-agent state can be determined safely
-- A completed Copilot coding job for the same PR counts as safe, GitHub-visible evidence that agent work is no longer pending.
+- A `copilot_work_finished` issue event for the same PR, emitted via the `copilot-swe-agent` GitHub App, counts as safe, GitHub-visible evidence that agent work is no longer pending.
 
 Requirements:
 
@@ -32,8 +32,9 @@ Requirements:
 2. Retrieve all open draft PRs in ascending PR-number order.
 3. Skip any PR whose author login falls outside the workflow actor guard rail or cannot be determined safely.
 4. Determine whether each PR still has a pending agent task using GitHub-visible agent state.
-  - treat a Copilot job status of `completed` for that PR as definitive evidence that the PR is eligible for `ready-for-draft-check`
-  - do not keep a PR in the ambiguous bucket when GitHub shows a completed Copilot job for that PR
+  - treat a `copilot_work_finished` issue event for that PR, with `performed_via_github_app.slug == "copilot-swe-agent"`, as definitive evidence that the PR is eligible for `ready-for-draft-check`
+  - if both `copilot_work_started` and `copilot_work_finished` events are present for the current work cycle, treat the finished event as authoritative
+  - do not keep a PR in the ambiguous bucket when GitHub shows the matching `copilot_work_finished` event for that PR
 5. Reconcile the `ready-for-draft-check` label deterministically:
    - add it to each eligible draft PR missing the label
    - remove it from any draft PR with agent work still pending or ambiguous state
@@ -48,8 +49,10 @@ Execution guidance:
 - Use `gh label list` and `gh label create` to ensure the label exists.
 - Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
 - Use `gh pr list` and `gh pr view --json author` to inspect draft PR metadata.
-- Use GitHub-visible agent state, including Copilot job status or equivalent PR metadata, to decide pending vs completed.
-- Prefer explicit Copilot job status for certainty. If the Copilot job for a PR is `completed`, treat that PR as eligible even if other PR metadata is sparse.
+- Use `gh api repos/<owner>/<repo>/issues/<pr-number>/events` to inspect draft-PR agent state.
+- Treat a `copilot_work_finished` event with `performed_via_github_app.slug == "copilot-swe-agent"` as the primary completion signal.
+- If only `copilot_work_started` is visible and no matching `copilot_work_finished` event is present yet, treat the PR as still pending or ambiguous for this iteration.
+- Treat standard PR metadata such as Copilot-authored commits, review requests, or title updates as corroborating context, not as a substitute for the explicit issue event.
 - Treat PR UI signals such as the completed Copilot banner as corroborating context, not as a reason to override an explicit completed job state.
 - Use `gh pr edit <pr-number> --add-label ready-for-draft-check` and `gh pr edit <pr-number> --remove-label ready-for-draft-check` for reconciliation.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
