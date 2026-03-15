@@ -58,6 +58,10 @@ Requirements:
    - `cargo doc --no-deps`
 12. If changes were made:
    - commit and push only the changes needed for this PR
+   - immediately refresh the PR head SHA with `gh pr view <pr-number> --json headRefOid`
+   - renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id> --head-sha <new-head-sha>` so the lease tracks the pushed commit
+   - treat that renewed lease metadata and refreshed PR head SHA as the new expected head SHA for all remaining checks and writes
+   - stop immediately if the push, head refresh, or lease renewal fails or disagrees about the new head SHA
 13. Before changing labels or leaving a durable summary comment, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 14. Add or update a concise PR comment when maintainers need a durable summary of what was fixed, what was deferred, and whether the PR is now merge-ready.
 15. If the PR is ready to merge:
@@ -78,7 +82,7 @@ Worktree guidance:
 - Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
 
-Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run pushes a new commit, renew again with `--head-sha <new-head-sha>` before any later PR comment, label, or other durable GitHub write.
 
 Output format:
 

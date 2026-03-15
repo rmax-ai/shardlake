@@ -57,6 +57,10 @@ Requirements:
 13. If changes were made:
    - rerun the affected quality gates until they pass or a hard blocker remains
    - commit and push only the changes needed for this PR
+   - immediately refresh the PR head SHA with `gh pr view <pr-number> --json headRefOid`
+   - renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id> --head-sha <new-head-sha>` so the lease tracks the pushed commit
+   - treat that renewed lease metadata and refreshed PR head SHA as the new expected head SHA for all remaining checks and writes
+   - stop immediately if the push, head refresh, or lease renewal fails or disagrees about the new head SHA
 14. Before changing PR state, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 15. If the PR is ready for review:
    - mark it ready with `gh pr ready <pr-number>`
@@ -69,7 +73,7 @@ Requirements:
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
-Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close.
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run pushes a new commit, renew again with `--head-sha <new-head-sha>` before any later PR state change, comment, or other durable GitHub write.
 
 Worktree guidance:
 

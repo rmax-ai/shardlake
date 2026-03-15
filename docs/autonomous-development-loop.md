@@ -225,10 +225,12 @@ The checked-in lease helper is `tools/loop_claim.sh`. It uses one remote ref per
 Protocol rules:
 
 - `acquire` creates a new lease or steals an expired lease by pushing a new synthetic commit to the lane ref
-- `renew` extends an active lease owned by the same worker by pushing a child commit to the same ref
+- `renew` extends an active lease owned by the same worker by pushing a child commit to the same ref; when `--head-sha <sha>` is provided it also advances the lease's recorded expected head SHA to that new commit
 - `release` deletes the ref with compare-and-swap semantics using the currently observed ref tip
 - `inspect` reads the remote ref and reports whether the lease is `active`, `expired`, or `missing`
 - acquire and renew are compare-and-swap updates because they only succeed when the observed ref tip is still current at push time
+
+When a worker pushes a commit to the claimed PR branch, it must immediately refresh the PR head SHA from GitHub and renew the lease with that new head SHA before any later durable GitHub write such as labels, comments, PR state changes, or merge attempts.
 
 ### Control blocks
 
