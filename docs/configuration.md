@@ -270,3 +270,56 @@ RUST_LOG=off shardlake benchmark
 
 Default filter when `RUST_LOG` is unset: `shardlake=info` (shows Shardlake crates at
 INFO, everything else at WARN).
+
+## Cache metrics
+
+`CachedShardLoader` (the default shard-load stage in the query pipeline) maintains
+in-process observability counters accessible through the
+`shardlake_index::CacheMetrics` type.
+
+### What is tracked
+
+| Counter | Description |
+|---------|-------------|
+| `hits` | Cumulative number of shard-load requests that were served from cache. |
+| `misses` | Cumulative number of shard-load requests that resolved to a known shard and required a storage fetch attempt. |
+| `total_load_count` | Total number of storage fetch attempts after cache misses (matches `misses`). |
+| `total_load_latency_ns` | Cumulative wall-clock time spent in storage fetch attempts, in nanoseconds, including fetches whose bytes later fail to decode. |
+| `retained_bytes` | Total raw artifact bytes successfully inserted into cache after successful decode/load. |
+
+### Accessing metrics
+
+```rust
+use std::sync::Arc;
+use shardlake_index::{pipeline::CachedShardLoader, CacheMetrics};
+use shardlake_manifest::Manifest;
+use shardlake_storage::ObjectStore;
+
+fn inspect(store: Arc<dyn ObjectStore>, manifest: Manifest) {
+    let loader = CachedShardLoader::new(store, manifest);
+    let metrics: Arc<CacheMetrics> = loader.metrics();
+
+    // … run queries through the pipeline …
+
+    let snap = metrics.snapshot();
+    println!("hit rate:           {:.1}%", snap.hit_rate() * 100.0);
+    println!("mean load latency:  {:.0} µs", snap.mean_load_latency_ns() / 1_000.0);
+    println!("retained bytes:     {} B", snap.retained_bytes);
+}
+```
+
+### Derived statistics
+
+`CacheMetricsSnapshot` exposes two derived statistics:
+
+| Method | Formula | Description |
+|--------|---------|-------------|
+| `hit_rate()` | `hits / (hits + misses)` | Cache hit rate in `[0.0, 1.0]`. Returns `0.0` when no requests have been observed. |
+| `mean_load_latency_ns()` | `total_load_latency_ns / total_load_count` | Mean wall-clock time per storage fetch attempt, in nanoseconds. Returns `0.0` when no loads have occurred. |
+
+### Transport independence
+
+`CacheMetrics` deliberately uses atomic counters rather than emitting to any specific
+metrics backend (e.g. Prometheus, StatsD, OpenTelemetry).  Applications that need to
+export metrics can poll `CacheMetrics::snapshot()` on a timer and push the values to
+whatever collection system they use.

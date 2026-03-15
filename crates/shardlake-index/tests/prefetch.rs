@@ -319,21 +319,25 @@ fn loader_bounded_cache_does_not_exceed_capacity() {
         CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
             .with_capacity(2);
 
-    // Load all 4 shards; the cache must contain at most 2 at any time.
-    // We cannot inspect `cache.len()` directly from the test, but we can
-    // verify that re-loading earlier shards after filling the cache causes
-    // additional store reads (the shards were evicted).
-    for shard_def in &manifest.shards {
-        loader.load(shard_def.shard_id).unwrap();
-    }
+    let s0 = manifest.shards[0].shard_id;
+    let s1 = manifest.shards[1].shard_id;
+    let s2 = manifest.shards[2].shard_id;
+    let s3 = manifest.shards[3].shard_id;
 
-    // After loading 4 shards into a capacity-2 cache, shards[0] and shards[1]
-    // should have been evicted. Loading shard[0] must now be a miss.
+    // Make shard 0 hot so later LFU evictions are deterministic.
+    loader.load(s0).unwrap();
+    loader.load(s0).unwrap();
+    loader.load(s1).unwrap();
+    loader.load(s2).unwrap();
+    loader.load(s3).unwrap();
+
+    // With capacity=2 and shard 0 accessed twice, shard 1 must have been
+    // evicted once shards 2 and 3 were inserted.
     let first_count = store.shard_loads.load(Ordering::SeqCst);
-    loader.load(manifest.shards[0].shard_id).unwrap();
+    loader.load(s1).unwrap();
     let second_count = store.shard_loads.load(Ordering::SeqCst);
     assert!(
         second_count > first_count,
-        "shard 0 must have been evicted from the bounded cache"
+        "cold shard 1 must have been evicted from the bounded cache"
     );
 }
