@@ -12,12 +12,12 @@ pub mod validator;
 
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
+pub use ivf::IvfQuantizer;
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
     IdentityEmbedder, LoadShardStage, MergeStage, NoopReranker, QueryPipeline,
     QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge,
 };
-pub use ivf::IvfQuantizer;
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
