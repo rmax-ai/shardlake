@@ -32,6 +32,9 @@ Requirements:
    - review comments / review threads
    - general PR comments
    - identify unresolved or still-relevant feedback when possible
+   - use `gh pr view --json ...` for supported pull request fields such as `reviews`, `comments`, `latestReviews`, `files`, `commits`, `statusCheckRollup`, and `reviewDecision`
+   - do not request `reviewThreads` via `gh pr view --json`; that field is not supported by the GitHub CLI JSON view output
+   - when thread-level state is needed, use `gh api graphql` to query `pullRequest { reviewThreads(...) { nodes { isResolved isOutdated comments(...) { nodes { author { login } body path outdated originalPosition diffHunk createdAt } } } } }`
 5. Check out the PR locally with `gh pr checkout`.
 6. Review the scope of the diff against the PR summary and any linked issue acceptance criteria.
 7. Run the repository quality gates from the checked-out PR branch:
@@ -82,6 +85,7 @@ Requirements:
 
 Execution guidance:
 - Use `gh pr view <input> --json number,title,isDraft,state,baseRefName,headRefName,author,body,labels,milestone,closingIssuesReferences,files,statusCheckRollup,reviews,comments,reviewDecision` to resolve the PR and gather metadata when structured output is useful.
+- Use `gh api graphql -f query='query($owner:String!,$repo:String!,$number:Int!){ repository(owner:$owner,name:$repo){ pullRequest(number:$number){ reviewThreads(first:50){ nodes { isResolved isOutdated comments(first:20){ nodes { author { login } body path outdated originalPosition diffHunk createdAt } } } } } } }' -F owner=<owner> -F repo=<repo> -F number=<pr-number>` when you need review thread resolution state; do not ask `gh pr view --json` for `reviewThreads`.
 - Use `gh pr checkout <input>` to switch to the PR branch.
 - Use `gh pr edit <input> --title <title> --body-file <file>` when the title or body should be corrected.
 - Use `gh pr comment <input> --body-file <file>` when a reviewer-facing summary comment would add value.

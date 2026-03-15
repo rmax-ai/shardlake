@@ -44,6 +44,9 @@ Requirements:
 4. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 5. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
 6. Fetch PR metadata, including author identity, changed files, labels, linked issues, CI/status checks, reviews, review comments, and general comments.
+   - use `gh pr view --json ...` only for supported pull request fields such as `reviews`, `comments`, `latestReviews`, `files`, `commits`, `statusCheckRollup`, and `reviewDecision`
+   - do not request `reviewThreads` via `gh pr view --json`; that field is not supported by the GitHub CLI JSON view output
+   - when thread-level state is needed, use `gh api graphql` to query `pullRequest { reviewThreads(...) { nodes { isResolved isOutdated comments(...) { nodes { author { login } body path outdated originalPosition diffHunk createdAt } } } } }`
 7. Create or refresh a dedicated git worktree for this PR by running `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>`.
 8. Inside that worktree, check out the PR branch and do all branch edits there. Do not modify files from the repository's primary checkout or the iteration worktree.
 9. Separate must-fix items from safe deferrals using actual review feedback and direct code, doc, and test observations.
