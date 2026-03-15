@@ -21,6 +21,9 @@ pub struct QueryRequest {
     /// Number of nearest centroids to select (overrides the server default).
     /// Alias for `candidate_centroids`; kept for backward compatibility.
     pub nprobe: Option<usize>,
+    /// When `true`, rerank the ANN candidates by exact distance before
+    /// returning results. Defaults to `false`.
+    pub rerank: Option<bool>,
     /// Number of nearest centroids to select for shard routing.
     /// When present, takes precedence over `nprobe`.
     pub candidate_centroids: Option<u32>,
@@ -116,7 +119,18 @@ async fn query_handler(
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    match tokio::task::spawn_blocking(move || searcher.search(&vector, req.k, &policy)).await {
+    let k = req.k;
+    let rerank = req.rerank.unwrap_or(false);
+    match tokio::task::spawn_blocking(move || {
+        let ann_results = searcher.search(&vector, k, &policy)?;
+        if rerank {
+            searcher.rerank(&vector, ann_results)
+        } else {
+            Ok(ann_results)
+        }
+    })
+    .await
+    {
         Ok(Ok(results)) => Json(QueryResponse {
             results,
             index_version: version,
@@ -370,5 +384,30 @@ mod tests {
             .expect("body bytes");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
         assert_eq!(payload["error"], format!("nprobe must be <= {}", u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn query_route_with_rerank_returns_correct_top_result() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"candidate_centroids":1,"rerank":true}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("query response json");
+        assert_eq!(payload.index_version, "idx-test");
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].id, VectorId(1));
     }
 }

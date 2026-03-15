@@ -35,6 +35,9 @@ enum Commands {
     Benchmark(commands::benchmark::BenchmarkArgs),
     /// Validate dataset and/or index manifests against stored artifacts.
     ValidateManifest(commands::validate_manifest::ValidateManifestArgs),
+    /// Evaluate partition quality: shard size distribution, routing accuracy,
+    /// recall impact, and shard hotness.
+    EvaluatePartitioning(commands::evaluate_partitioning::EvaluatePartitioningArgs),
 }
 
 #[tokio::main]
@@ -54,6 +57,9 @@ async fn main() -> Result<()> {
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
         Commands::ValidateManifest(args) => {
             commands::validate_manifest::run(cli.storage, args).await
+        }
+        Commands::EvaluatePartitioning(args) => {
+            commands::evaluate_partitioning::run(cli.storage, args).await
         }
     }
 }

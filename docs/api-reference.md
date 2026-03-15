@@ -37,8 +37,8 @@ curl -s http://localhost:8080/health
 
 ## `POST /query`
 
-Performs approximate nearest-neighbour (ANN) search and returns the top-k most similar
-vector ids with their scores.
+Performs approximate nearest-neighbour (ANN) search and optionally reranks
+the top candidates by exact distance computation before returning results.
 
 ### Request body
 
@@ -48,7 +48,8 @@ vector ids with their scores.
   "k": 10,
   "candidate_centroids": 3,
   "candidate_shards": 2,
-  "max_vectors_per_shard": 500
+  "max_vectors_per_shard": 500,
+  "rerank": true
 }
 ```
 
@@ -60,6 +61,7 @@ vector ids with their scores.
 | `candidate_centroids` | integer | No | Number of nearest IVF centroids to select for shard routing. Must be ≥ 1 when provided. Takes precedence over `nprobe`. Defaults to the server's `--nprobe` value. |
 | `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
 | `max_vectors_per_shard` | integer | No | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Defaults to the server's `--max-vectors-per-shard` value. |
+| `rerank` | boolean | No | When `true`, the ANN candidates are re-scored against their raw vectors using exact distance computation before the final ranking is returned. Defaults to `false`. See [Exact reranking](#exact-reranking) below. |
 
 ### Success response — `200 OK`
 
@@ -109,6 +111,40 @@ curl -s -X POST http://localhost:8080/query \
     "nprobe": 3
   }' | python3 -m json.tool
 ```
+
+### Example with exact reranking
+
+```bash
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vector": [0.5, 0.3, 0.8, 0.1],
+    "k": 5,
+    "candidate_centroids": 3,
+    "rerank": true
+  }' | python3 -m json.tool
+```
+
+## Exact reranking
+
+When `"rerank": true` is set, the server applies a two-stage pipeline:
+
+1. **ANN stage** – routes the query through the configured fan-out policy and
+   retrieves the top-k candidate vectors from the probed shards.
+2. **Rerank stage** – fetches the raw float vectors for the ANN candidates
+   already loaded in the in-memory raw-shard cache, recomputes exact distances,
+   and returns the candidates sorted by those exact scores.
+
+This ensures that the final ordering reflects the true distance metric even
+when the ANN stage is only an approximate first pass.
+
+**When to use reranking:**
+- When ranking accuracy matters more than raw throughput.
+- When you want exact final scores after an approximate routing stage.
+
+**Performance note:** reranking reads the raw vectors for the returned
+candidates from the in-memory shard cache, so the extra cost is proportional to
+the number of candidates reranked and their dimensionality.
 
 ## Notes on scoring
 

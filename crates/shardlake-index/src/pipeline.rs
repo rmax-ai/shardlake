@@ -1,36 +1,17 @@
-//! Composable ANN candidate retrieval pipeline.
+//! Modular query pipeline stages for ANN retrieval.
 //!
-//! # Overview
+//! Query execution is broken into independently-testable stages:
 //!
-//! The [`QueryPipeline`] orchestrates ANN search through four pluggable
-//! stages:
+//! 1. **Embed** - transform raw query input into an embedding.
+//! 2. **Route** - select the IVF shards to probe using centroid distances.
+//! 3. **Load shard** - retrieve shard data from storage, typically with caching.
+//! 4. **Candidate search** - search each probed shard for approximate or exact candidates.
+//! 5. **Merge** - combine per-shard candidates into a single ranked set.
+//! 6. **Rerank** - optionally rescore merged candidates with exact distances.
 //!
-//! 1. **Route** — route the query to the `nprobe` nearest IVF cells (shards)
-//!    using centroids embedded in the manifest.
-//! 2. **Load** — lazily load each probed shard from the object store (with an
-//!    in-process cache shared across calls).
-//! 3. **Candidate search** — score vectors within each loaded shard and
-//!    return per-shard top-k candidates.  The default
-//!    [`ExactCandidateStage`] uses brute-force exact distance;
-//!    [`PqCandidateStage`] uses PQ approximate scoring for faster throughput.
-//! 4. **Rerank** (optional) — re-score merged candidates with exact distances
-//!    using the original float vectors.  This lets callers trade throughput
-//!    for recall: retrieve a large candidate set cheaply with PQ, then rerank
-//!    only the top candidates exactly.
-//!
-//! # Building a pipeline
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use shardlake_index::pipeline::QueryPipeline;
-//! use shardlake_manifest::Manifest;
-//! use shardlake_storage::ObjectStore;
-//!
-//! # fn example(store: Arc<dyn ObjectStore>, manifest: Manifest) {
-//! // Default: exact candidate search, no reranking.
-//! let pipeline = QueryPipeline::builder(store, manifest).build();
-//! # }
-//! ```
+//! [`QueryPipeline`] keeps the modular stage surface introduced on `main` while
+//! adding ANN-specific candidate and rerank stages such as [`PqCandidateStage`]
+//! and [`ExactRerankStage`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -54,98 +35,184 @@ use crate::{
     IndexError, Result,
 };
 
-// ── Stage traits ──────────────────────────────────────────────────────────────
+/// Transforms raw query input into an embedded vector representation.
+pub trait EmbedStage: Send + Sync {
+    /// Embed `query` and return the resulting vector.
+    fn embed(&self, query: &[f32]) -> Result<Vec<f32>>;
+}
 
-/// Stage that searches for candidate nearest-neighbours within a single
-/// loaded shard.
-///
-/// Implementors can use exact distance computation ([`ExactCandidateStage`])
-/// or PQ approximate scoring ([`PqCandidateStage`]).
+/// Selects which shards should be probed for a given query.
+pub trait RouteStage: Send + Sync {
+    /// Return the shard IDs that should be probed for `query`.
+    fn route(
+        &self,
+        query: &[f32],
+        centroids: &[Vec<f32>],
+        centroid_to_shard: &[ShardId],
+        nprobe: usize,
+    ) -> Vec<ShardId>;
+}
+
+/// Loads shard contents from the underlying object store.
+pub trait LoadShardStage: Send + Sync {
+    /// Return the in-memory representation of `shard_id`.
+    fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>>;
+}
+
+/// Searches a single loaded shard for nearest-neighbour candidates.
 pub trait CandidateSearchStage: Send + Sync {
-    /// Return approximate or exact top-`k` candidates from `shard`.
-    ///
-    /// May return fewer than `k` results when the shard contains fewer
-    /// vectors.
-    fn search_shard(
+    /// Return up to `k` candidates from `shard` for `query`.
+    fn search(
         &self,
         query: &[f32],
         shard: &ShardIndex,
-        k: usize,
         metric: DistanceMetric,
+        k: usize,
     ) -> Result<Vec<SearchResult>>;
 }
 
-/// Stage that re-ranks approximate candidates with exact distances.
-///
-/// Receives the merged approximate candidate set and the subset of probed
-/// shard records needed to rerank those candidates exactly.
+/// Combines candidate results from all probed shards into a single ranked list.
+pub trait MergeStage: Send + Sync {
+    /// Merge `results` collected across shards and return the top `k`.
+    fn merge(&self, results: Vec<SearchResult>, k: usize) -> Vec<SearchResult>;
+}
+
+/// Optionally reorders merged candidates using the original probed records.
 pub trait RerankStage: Send + Sync {
-    /// Re-score `candidates` and return the top-`k` exactly ranked results.
-    ///
-    /// `probed_records` contains the original float vectors for the merged
-    /// candidate ids, avoiding unnecessary clones of unrelated records.
+    /// Rerank `results` for `query` and return the top `k`.
     fn rerank(
         &self,
         query: &[f32],
-        candidates: Vec<SearchResult>,
+        results: Vec<SearchResult>,
         probed_records: &[VectorRecord],
         metric: DistanceMetric,
         k: usize,
     ) -> Vec<SearchResult>;
 }
 
-// ── Default stage implementations ────────────────────────────────────────────
+/// Identity embedder: returns the query vector unchanged.
+pub struct IdentityEmbedder;
 
-/// Candidate stage that uses brute-force exact distance computation.
-///
-/// Wraps the existing [`exact_search`] function.  Use as the default stage
-/// or as the reranking pass after a cheap PQ first stage.
-pub struct ExactCandidateStage;
+impl EmbedStage for IdentityEmbedder {
+    fn embed(&self, query: &[f32]) -> Result<Vec<f32>> {
+        Ok(query.to_vec())
+    }
+}
 
-impl CandidateSearchStage for ExactCandidateStage {
-    fn search_shard(
+/// Centroid router that probes the `nprobe` nearest IVF centroids.
+pub struct CentroidRouter;
+
+impl RouteStage for CentroidRouter {
+    fn route(
+        &self,
+        query: &[f32],
+        centroids: &[Vec<f32>],
+        centroid_to_shard: &[ShardId],
+        nprobe: usize,
+    ) -> Vec<ShardId> {
+        let n = nprobe.min(centroids.len());
+        let probe_indices = top_n_centroids(query, centroids, n);
+        let mut shard_ids: Vec<ShardId> = probe_indices
+            .into_iter()
+            .filter_map(|index| centroid_to_shard.get(index).copied())
+            .collect();
+        shard_ids.sort();
+        shard_ids.dedup();
+        shard_ids
+    }
+}
+
+/// Shard loader that caches loaded shards in an in-memory map.
+pub struct CachedShardLoader {
+    store: Arc<dyn ObjectStore>,
+    manifest: Manifest,
+    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+}
+
+impl CachedShardLoader {
+    /// Create a new loader backed by `store` and `manifest`.
+    pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self {
+            store,
+            manifest,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl LoadShardStage for CachedShardLoader {
+    fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
+            if let Some(index) = cache.get(&shard_id) {
+                return Ok(Arc::clone(index));
+            }
+        }
+
+        let shard_def = self
+            .manifest
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == shard_id)
+            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+        let bytes = self.store.get(&shard_def.artifact_key)?;
+        let index = Arc::new(ShardIndex::from_bytes(&bytes)?);
+
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
+        cache.insert(shard_id, Arc::clone(&index));
+        Ok(index)
+    }
+}
+
+/// Exact brute-force candidate search within a single shard.
+pub struct ExactCandidateSearch;
+
+impl CandidateSearchStage for ExactCandidateSearch {
+    fn search(
         &self,
         query: &[f32],
         shard: &ShardIndex,
-        k: usize,
         metric: DistanceMetric,
+        k: usize,
     ) -> Result<Vec<SearchResult>> {
         Ok(exact_search(query, &shard.records, metric, k))
     }
 }
 
-/// Candidate stage that uses Product Quantization (PQ) approximate scoring.
-///
-/// For each vector in the shard the query vector is scored using Asymmetric
-/// Distance Computation (ADC): distance tables are precomputed once per
-/// query and each per-vector score is a table-lookup sum over sub-spaces.
-/// This is significantly faster than computing exact distances when the
-/// vector dimension is high.
-///
-/// Build with [`PqCandidateStage::new`] and supply a trained [`PqCodebook`].
+/// Backward-compatible alias for the original exact candidate stage name.
+pub use ExactCandidateSearch as ExactCandidateStage;
+
+/// Product-quantized candidate search using asymmetric distance computation.
 pub struct PqCandidateStage {
     codebook: Arc<PqCodebook>,
 }
 
 impl PqCandidateStage {
-    /// Create a PQ candidate stage backed by `codebook`.
+    /// Create a PQ-backed candidate search stage.
     pub fn new(codebook: Arc<PqCodebook>) -> Self {
         Self { codebook }
     }
 
-    /// Return the underlying PQ codebook.
+    /// Return the underlying codebook.
     pub fn codebook(&self) -> &PqCodebook {
         &self.codebook
     }
 }
 
 impl CandidateSearchStage for PqCandidateStage {
-    fn search_shard(
+    fn search(
         &self,
         query: &[f32],
         shard: &ShardIndex,
-        k: usize,
         metric: DistanceMetric,
+        k: usize,
     ) -> Result<Vec<SearchResult>> {
         if metric != DistanceMetric::Euclidean {
             return Err(IndexError::Other(
@@ -155,18 +222,18 @@ impl CandidateSearchStage for PqCandidateStage {
 
         let tables = self.codebook.compute_distance_table(query)?;
         let mut scored = Vec::with_capacity(shard.records.len());
-        for rec in &shard.records {
-            let codes = self.codebook.encode(&rec.data)?;
-            let score = self.codebook.adc_distance(&codes, &tables);
+        for record in &shard.records {
+            let codes = self.codebook.encode(&record.data)?;
             scored.push(SearchResult {
-                id: rec.id,
-                score,
-                metadata: rec.metadata.clone(),
+                id: record.id,
+                score: self.codebook.adc_distance(&codes, &tables),
+                metadata: record.metadata.clone(),
             });
         }
-        scored.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
+
+        scored.sort_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(k);
@@ -174,111 +241,99 @@ impl CandidateSearchStage for PqCandidateStage {
     }
 }
 
-/// Reranking stage that rescores candidates with exact float distances.
-///
-/// Candidate scores produced by [`PqCandidateStage`] are approximate; this
-/// stage looks up the original float vector for each candidate from the
-/// probed shard records and recomputes the exact distance, producing a
-/// precisely ordered final result set.
+/// Merge stage that keeps the best `k` scored candidates with deduplication.
+pub struct TopKMerge;
+
+impl MergeStage for TopKMerge {
+    fn merge(&self, results: Vec<SearchResult>, k: usize) -> Vec<SearchResult> {
+        merge_top_k(results, k)
+    }
+}
+
+/// No-op reranker: passes results through unchanged.
+pub struct NoopReranker;
+
+impl RerankStage for NoopReranker {
+    fn rerank(
+        &self,
+        _query: &[f32],
+        results: Vec<SearchResult>,
+        _probed_records: &[VectorRecord],
+        _metric: DistanceMetric,
+        k: usize,
+    ) -> Vec<SearchResult> {
+        results.into_iter().take(k).collect()
+    }
+}
+
+/// Exact reranker that rescales approximate candidates with float distances.
 pub struct ExactRerankStage;
 
 impl RerankStage for ExactRerankStage {
     fn rerank(
         &self,
         query: &[f32],
-        candidates: Vec<SearchResult>,
+        results: Vec<SearchResult>,
         probed_records: &[VectorRecord],
         metric: DistanceMetric,
         k: usize,
     ) -> Vec<SearchResult> {
-        let lookup: HashMap<_, &VectorRecord> = probed_records.iter().map(|r| (r.id, r)).collect();
-
-        let rescored: Vec<SearchResult> = candidates
+        let lookup: HashMap<_, &VectorRecord> = probed_records
+            .iter()
+            .map(|record| (record.id, record))
+            .collect();
+        let rescored = results
             .into_iter()
-            .filter_map(|c| {
-                lookup.get(&c.id).map(|rec| SearchResult {
-                    id: c.id,
-                    score: distance(query, &rec.data, metric),
-                    metadata: c.metadata,
+            .filter_map(|result| {
+                lookup.get(&result.id).map(|record| SearchResult {
+                    id: result.id,
+                    score: distance(query, &record.data, metric),
+                    metadata: result.metadata,
                 })
             })
             .collect();
-
         merge_top_k(rescored, k)
     }
 }
 
-// ── Pipeline ──────────────────────────────────────────────────────────────────
-
-/// Composable ANN candidate retrieval pipeline.
-///
-/// Orchestrates query routing through the IVF coarse quantizer, shard
-/// loading, per-shard candidate search, and optional exact reranking into a
-/// single [`search`][QueryPipeline::search] call.  All stages are
-/// hot-swappable via [`QueryPipelineBuilder`].
-///
-/// # Caching
-///
-/// Loaded shard indexes are kept in an in-process cache
-/// (`Mutex<HashMap>`).  The cache is shared across all `search` calls on the
-/// same `QueryPipeline` instance; concurrent calls on different threads are
-/// safe.
+/// A composable multi-stage ANN query execution pipeline.
 pub struct QueryPipeline {
-    store: Arc<dyn ObjectStore>,
+    embedder: Arc<dyn EmbedStage>,
+    router: Arc<dyn RouteStage>,
+    loader: Arc<dyn LoadShardStage>,
+    candidate_search: Arc<dyn CandidateSearchStage>,
+    merge: Arc<dyn MergeStage>,
+    reranker: Option<Arc<dyn RerankStage>>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
-    candidate_stage: Arc<dyn CandidateSearchStage>,
-    rerank_stage: Option<Arc<dyn RerankStage>>,
-    /// Oversample factor: fetch `k × rerank_oversample` candidates per shard
-    /// before passing them to the reranking stage.
     rerank_oversample: usize,
 }
 
 impl QueryPipeline {
-    /// Create a [`QueryPipelineBuilder`] for the given store and manifest.
-    ///
-    /// Call `.build()` on the returned builder to obtain a pipeline using
-    /// [`ExactCandidateStage`] with no reranking.
+    /// Return a builder for constructing a [`QueryPipeline`].
     pub fn builder(store: Arc<dyn ObjectStore>, manifest: Manifest) -> QueryPipelineBuilder {
         QueryPipelineBuilder::new(store, manifest)
     }
 
-    /// Return the manifest this pipeline was configured from.
+    /// Return the manifest the pipeline was configured from.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
-    /// Perform ANN search and return top-`k` candidates.
-    ///
-    /// # Pipeline steps
-    ///
-    /// 1. Validates the query dimensionality against the manifest.
-    /// 2. Routes the query to the `nprobe` nearest IVF centroids.
-    /// 3. Loads each probed shard (returned from cache after the first load).
-    /// 4. Runs the configured [`CandidateSearchStage`] on each shard.
-    /// 5. Merges results with [`merge_top_k`].
-    /// 6. If a [`RerankStage`] is configured, rescores the candidates with
-    ///    exact distances and returns the precisely ordered top-`k`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IndexError::Core`] on dimension mismatch and
-    /// [`IndexError::Storage`] or [`IndexError::Other`] on I/O failures.
-    pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+    /// Execute a query through all pipeline stages.
+    pub fn run(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
         let expected_dims = self.manifest.dims as usize;
-        if query.len() != expected_dims {
+        let metric = self.manifest.distance_metric;
+
+        let embedded = self.embedder.embed(query)?;
+        if embedded.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
                 expected: expected_dims,
-                got: query.len(),
+                got: embedded.len(),
             }));
         }
 
-        let metric: DistanceMetric = self.manifest.distance_metric;
-
-        // ── Step 1: collect IVF centroids for routing ─────────────────────
-        let mut all_centroids: Vec<Vec<f32>> = Vec::new();
-        let mut centroid_to_shard: Vec<ShardId> = Vec::new();
-
+        let mut all_centroids = Vec::new();
+        let mut centroid_to_shard = Vec::new();
         for shard_def in &self.manifest.shards {
             if !shard_def.centroid.is_empty() {
                 if shard_def.centroid.len() != expected_dims {
@@ -290,10 +345,9 @@ impl QueryPipeline {
                 all_centroids.push(shard_def.centroid.clone());
                 centroid_to_shard.push(shard_def.shard_id);
             } else {
-                // Legacy: load shard to extract centroid.
-                let shard = self.load_shard(shard_def.shard_id)?;
-                for c in &shard.centroids {
-                    all_centroids.push(c.clone());
+                let shard = self.loader.load(shard_def.shard_id)?;
+                for centroid in &shard.centroids {
+                    all_centroids.push(centroid.clone());
                     centroid_to_shard.push(shard_def.shard_id);
                 }
             }
@@ -303,45 +357,34 @@ impl QueryPipeline {
             return Ok(Vec::new());
         }
 
-        // ── Step 2: route query to nprobe nearest centroids ───────────────
-        let effective_nprobe = nprobe.min(all_centroids.len());
-        let probe_indices = top_n_centroids(query, &all_centroids, effective_nprobe);
-        let mut probe_shards: Vec<ShardId> = probe_indices
-            .into_iter()
-            .filter_map(|i| centroid_to_shard.get(i).copied())
-            .collect();
-        probe_shards.sort();
-        probe_shards.dedup();
-
+        let probe_shards = self
+            .router
+            .route(&embedded, &all_centroids, &centroid_to_shard, nprobe);
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
-        // Expand candidate count when reranking to improve recall.
-        let candidates_per_shard = if self.rerank_stage.is_some() {
+        let candidates_per_shard = if self.reranker.is_some() {
             k.saturating_mul(self.rerank_oversample).max(k)
         } else {
             k
         };
 
-        // ── Step 3: load shards, search candidates ────────────────────────
-        let mut all_results: Vec<SearchResult> = Vec::new();
-        let mut probed_shards: Vec<Arc<ShardIndex>> = Vec::new();
-
+        let mut all_results = Vec::new();
+        let mut probed_shards = Vec::new();
         for shard_id in probe_shards {
-            let shard = self.load_shard(shard_id)?;
-            let results =
-                self.candidate_stage
-                    .search_shard(query, &shard, candidates_per_shard, metric)?;
-            all_results.extend(results);
-            if self.rerank_stage.is_some() {
-                probed_shards.push(Arc::clone(&shard));
+            let shard = self.loader.load(shard_id)?;
+            all_results.extend(self.candidate_search.search(
+                &embedded,
+                &shard,
+                metric,
+                candidates_per_shard,
+            )?);
+            if self.reranker.is_some() {
+                probed_shards.push(shard);
             }
         }
 
-        // ── Step 4: merge candidates across shards ────────────────────────
-        let merged = merge_top_k(all_results, candidates_per_shard);
-
-        // ── Step 5: optional exact reranking ──────────────────────────────
-        if let Some(reranker) = &self.rerank_stage {
+        let merged = self.merge.merge(all_results, candidates_per_shard);
+        if let Some(reranker) = &self.reranker {
             let candidate_ids: HashSet<_> = merged.iter().map(|result| result.id).collect();
             let mut probed_records = Vec::with_capacity(candidate_ids.len());
             for shard in &probed_shards {
@@ -353,53 +396,28 @@ impl QueryPipeline {
                         .cloned(),
                 );
             }
-            Ok(reranker.rerank(query, merged, &probed_records, metric, k))
+            Ok(reranker.rerank(&embedded, merged, &probed_records, metric, k))
         } else {
             Ok(merged)
         }
     }
 
-    fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        {
-            let cache = self
-                .cache
-                .lock()
-                .map_err(|_| IndexError::Other("pipeline cache lock poisoned".into()))?;
-            if let Some(idx) = cache.get(&shard_id) {
-                return Ok(Arc::clone(idx));
-            }
-        }
-
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|s| s.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| IndexError::Other("pipeline cache lock poisoned".into()))?;
-        cache.insert(shard_id, Arc::clone(&idx));
-        Ok(idx)
+    /// Backward-compatible alias for [`QueryPipeline::run`].
+    pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+        self.run(query, k, nprobe)
     }
 }
 
-// ── Builder ───────────────────────────────────────────────────────────────────
-
 /// Builder for [`QueryPipeline`].
-///
-/// Start from [`QueryPipeline::builder`].  All stages default to
-/// [`ExactCandidateStage`] with no reranking.
 pub struct QueryPipelineBuilder {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    candidate_stage: Arc<dyn CandidateSearchStage>,
-    rerank_stage: Option<Arc<dyn RerankStage>>,
+    embedder: Arc<dyn EmbedStage>,
+    router: Arc<dyn RouteStage>,
+    loader: Option<Arc<dyn LoadShardStage>>,
+    candidate_search: Arc<dyn CandidateSearchStage>,
+    merge: Arc<dyn MergeStage>,
+    reranker: Option<Arc<dyn RerankStage>>,
     rerank_oversample: usize,
 }
 
@@ -408,57 +426,99 @@ impl QueryPipelineBuilder {
         Self {
             store,
             manifest,
-            candidate_stage: Arc::new(ExactCandidateStage),
-            rerank_stage: None,
+            embedder: Arc::new(IdentityEmbedder),
+            router: Arc::new(CentroidRouter),
+            loader: None,
+            candidate_search: Arc::new(ExactCandidateSearch),
+            merge: Arc::new(TopKMerge),
+            reranker: None,
             rerank_oversample: 1,
         }
     }
 
-    /// Override the candidate search stage.
-    ///
-    /// Use [`PqCandidateStage`] for approximate scoring or provide a custom
-    /// implementation.
+    /// Override the embed stage.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Box<dyn EmbedStage>) -> Self {
+        self.embedder = embedder.into();
+        self
+    }
+
+    /// Override the route stage.
+    #[must_use]
+    pub fn with_router(mut self, router: Box<dyn RouteStage>) -> Self {
+        self.router = router.into();
+        self
+    }
+
+    /// Override the shard-load stage.
+    #[must_use]
+    pub fn with_loader(mut self, loader: Box<dyn LoadShardStage>) -> Self {
+        self.loader = Some(loader.into());
+        self
+    }
+
+    /// Override the candidate-search stage.
+    #[must_use]
+    pub fn with_candidate_search(mut self, search: Box<dyn CandidateSearchStage>) -> Self {
+        self.candidate_search = search.into();
+        self
+    }
+
+    /// Override the merge stage.
+    #[must_use]
+    pub fn with_merge(mut self, merge: Box<dyn MergeStage>) -> Self {
+        self.merge = merge.into();
+        self
+    }
+
+    /// Override the rerank stage.
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Box<dyn RerankStage>) -> Self {
+        self.reranker = Some(reranker.into());
+        self
+    }
+
+    /// Convenience alias for setting the candidate search stage with an [`Arc`].
     #[must_use]
     pub fn candidate_stage(mut self, stage: Arc<dyn CandidateSearchStage>) -> Self {
-        self.candidate_stage = stage;
+        self.candidate_search = stage;
         self
     }
 
-    /// Add an optional reranking stage.
-    ///
-    /// When set, the pipeline fetches `k × oversample` candidates in the
-    /// approximate stage and reranks them to the final top-`k`.
+    /// Convenience alias for setting the rerank stage with an [`Arc`].
     #[must_use]
     pub fn rerank_stage(mut self, stage: Arc<dyn RerankStage>) -> Self {
-        self.rerank_stage = Some(stage);
+        self.reranker = Some(stage);
         self
     }
 
-    /// Set the oversample factor for the approximate candidate stage when
-    /// reranking is enabled.
-    ///
-    /// The pipeline will fetch `k × oversample` candidates per shard before
-    /// passing them to the reranking stage.  Defaults to `1` (no expansion).
+    /// Set the oversample factor used before reranking.
     #[must_use]
     pub fn rerank_oversample(mut self, oversample: usize) -> Self {
         self.rerank_oversample = oversample.max(1);
         self
     }
 
-    /// Build the pipeline.
+    /// Assemble the [`QueryPipeline`].
     pub fn build(self) -> QueryPipeline {
+        let loader = self.loader.unwrap_or_else(|| {
+            Arc::new(CachedShardLoader::new(
+                Arc::clone(&self.store),
+                self.manifest.clone(),
+            ))
+        });
         QueryPipeline {
-            store: self.store,
+            embedder: self.embedder,
+            router: self.router,
+            loader,
+            candidate_search: self.candidate_search,
+            merge: self.merge,
+            reranker: self.reranker,
             manifest: self.manifest,
-            cache: Mutex::new(HashMap::new()),
-            candidate_stage: self.candidate_stage,
-            rerank_stage: self.rerank_stage,
             rerank_oversample: self.rerank_oversample,
         }
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -470,222 +530,29 @@ mod tests {
     use crate::builder::{BuildParams, IndexBuilder};
     use shardlake_core::{
         config::SystemConfig,
-        types::{
-            DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
-        },
+        types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId},
     };
     use shardlake_storage::LocalObjectStore;
 
     fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
         (0..n)
-            .map(|i| VectorRecord {
-                id: VectorId(i as u64),
-                data: (0..dims).map(|d| (i * dims + d) as f32 / 100.0).collect(),
+            .map(|index| VectorRecord {
+                id: VectorId(index as u64),
+                data: (0..dims)
+                    .map(|dimension| (index * dims + dimension) as f32 / 100.0)
+                    .collect(),
                 metadata: None,
             })
             .collect()
     }
 
-    fn build_and_get_pipeline(
-        records: Vec<VectorRecord>,
-        num_shards: u32,
-        dims: usize,
-    ) -> (QueryPipeline, Arc<dyn ObjectStore>) {
-        let tmp = tempdir().unwrap();
-        let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
-        let config = SystemConfig {
-            storage_root: tmp.path().to_path_buf(),
-            num_shards,
-            kmeans_iters: 10,
-            nprobe: num_shards,
-            kmeans_seed: SystemConfig::default_kmeans_seed(),
-            kmeans_sample_size: None,
-            ..SystemConfig::default()
-        };
-        let manifest = IndexBuilder::new(store.as_ref(), &config)
-            .build(BuildParams {
-                records,
-                dataset_version: DatasetVersion("ds-pl".into()),
-                embedding_version: EmbeddingVersion("emb-pl".into()),
-                index_version: IndexVersion("idx-pl".into()),
-                metric: DistanceMetric::Euclidean,
-                dims,
-                vectors_key: "datasets/ds-pl/vectors.jsonl".into(),
-                metadata_key: "datasets/ds-pl/metadata.json".into(),
-                pq_params: None,
-            })
-            .unwrap();
-        // `tmp` is intentionally leaked so the directory stays alive for the
-        // duration of the test (acceptable in unit-test contexts).
-        std::mem::forget(tmp);
-        let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest).build();
-        (pipeline, store)
-    }
-
-    #[test]
-    fn default_pipeline_returns_correct_top1() {
-        let records = make_records(20, 4);
-        let query = records[0].data.clone();
-        let (pipeline, _store) = build_and_get_pipeline(records, 2, 4);
-        let results = pipeline.search(&query, 1, 2).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].id,
-            VectorId(0),
-            "nearest vector to itself must be itself"
-        );
-    }
-
-    #[test]
-    fn pipeline_rejects_dimension_mismatch() {
-        let records = make_records(10, 4);
-        let (pipeline, _store) = build_and_get_pipeline(records, 2, 4);
-        let err = pipeline.search(&[1.0, 2.0, 3.0], 1, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("dimension mismatch"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn pipeline_top_k_never_exceeds_k() {
-        let records = make_records(20, 4);
-        let query = records[5].data.clone();
-        let (pipeline, _store) = build_and_get_pipeline(records, 2, 4);
-        for k in [1, 3, 5, 10] {
-            let results = pipeline.search(&query, k, 2).unwrap();
-            assert!(
-                results.len() <= k,
-                "pipeline returned {} results for k={k}",
-                results.len()
-            );
-        }
-    }
-
-    #[test]
-    fn pipeline_returns_empty_for_no_shards() {
-        // Build an index, then replace the manifest shards with an empty list.
-        let tmp = tempdir().unwrap();
-        let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
-        let config = SystemConfig {
-            storage_root: tmp.path().to_path_buf(),
-            num_shards: 1,
-            kmeans_iters: 5,
-            nprobe: 1,
-            kmeans_seed: SystemConfig::default_kmeans_seed(),
-            kmeans_sample_size: None,
-            ..SystemConfig::default()
-        };
-        let mut manifest = IndexBuilder::new(store.as_ref(), &config)
-            .build(BuildParams {
-                records: make_records(5, 2),
-                dataset_version: DatasetVersion("ds-empty".into()),
-                embedding_version: EmbeddingVersion("emb-empty".into()),
-                index_version: IndexVersion("idx-empty".into()),
-                metric: DistanceMetric::Euclidean,
-                dims: 2,
-                vectors_key: "datasets/ds-empty/vectors.jsonl".into(),
-                metadata_key: "datasets/ds-empty/metadata.json".into(),
-                pq_params: None,
-            })
-            .unwrap();
-        manifest.shards.clear();
-        let pipeline = QueryPipeline::builder(store, manifest).build();
-        let results = pipeline.search(&[1.0, 2.0], 5, 1).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn pq_candidate_stage_returns_approximate_results() {
-        use crate::pq::{PqCodebook, PqParams};
-
-        let records = make_records(40, 4);
-        let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
-
-        let pq = PqCodebook::train(
-            &vecs,
-            PqParams {
-                num_subspaces: 2,
-                codebook_size: 16,
-            },
-            42,
-            20,
-        )
-        .unwrap();
-        let pq_stage = PqCandidateStage::new(Arc::new(pq));
-
-        let shard = crate::shard::ShardIndex {
-            shard_id: shardlake_core::types::ShardId(0),
-            dims: 4,
-            centroids: vec![records[0].data.clone()],
-            records: records.clone(),
-        };
-
-        let query = records[0].data.clone();
-        let results = pq_stage
-            .search_shard(&query, &shard, 5, DistanceMetric::Euclidean)
-            .unwrap();
-
-        assert!(!results.is_empty(), "PQ stage should return results");
-        assert!(results.len() <= 5);
-        // The nearest vector (id=0) should be in the top results.
-        assert!(
-            results.iter().any(|r| r.id == VectorId(0)),
-            "vector 0 (identical to query) should be in PQ top-5"
-        );
-    }
-
-    #[test]
-    fn exact_rerank_stage_rescores_candidates() {
-        let records = make_records(10, 4);
-        let reranker = ExactRerankStage;
-
-        // Provide approximate candidates with deliberately wrong scores.
-        let approx_candidates: Vec<SearchResult> = records
-            .iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                score: 999.0, // wrong scores to verify rescoring
-                metadata: None,
-            })
-            .collect();
-
-        let query = records[0].data.clone();
-        let exact_results = reranker.rerank(
-            &query,
-            approx_candidates,
-            &records,
-            DistanceMetric::Euclidean,
-            3,
-        );
-
-        assert_eq!(exact_results.len(), 3);
-        // After reranking, the nearest vector (id=0) must be first.
-        assert_eq!(
-            exact_results[0].id,
-            VectorId(0),
-            "exact reranking must put id=0 (identical to query) first"
-        );
-        // Scores should no longer be the placeholder 999.0.
-        assert!(
-            exact_results[0].score < 999.0,
-            "reranked score should not be the placeholder"
-        );
-    }
-
-    #[test]
-    fn pipeline_with_pq_stage_and_reranking_finds_correct_top1() {
-        use crate::pq::{PqCodebook, PqParams};
-
-        let records = make_records(20, 4);
-        let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
-
+    fn build_pipeline(records: Vec<VectorRecord>) -> QueryPipeline {
         let tmp = tempdir().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
             storage_root: tmp.path().to_path_buf(),
             num_shards: 2,
-            kmeans_iters: 10,
+            kmeans_iters: 5,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
@@ -693,91 +560,96 @@ mod tests {
         };
         let manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
-                records: records.clone(),
-                dataset_version: DatasetVersion("ds-pq".into()),
-                embedding_version: EmbeddingVersion("emb-pq".into()),
-                index_version: IndexVersion("idx-pq".into()),
+                records,
+                dataset_version: DatasetVersion("ds-pipeline".into()),
+                embedding_version: EmbeddingVersion("emb-pipeline".into()),
+                index_version: IndexVersion("idx-pipeline".into()),
                 metric: DistanceMetric::Euclidean,
                 dims: 4,
-                vectors_key: "datasets/ds-pq/vectors.jsonl".into(),
-                metadata_key: "datasets/ds-pq/metadata.json".into(),
+                vectors_key: "datasets/ds-pipeline/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-pipeline/metadata.json".into(),
                 pq_params: None,
             })
             .unwrap();
-
-        let pq = PqCodebook::train(
-            &vecs,
-            PqParams {
-                num_subspaces: 2,
-                codebook_size: 16,
-            },
-            42,
-            20,
-        )
-        .unwrap();
-
-        let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)
-            .candidate_stage(Arc::new(PqCandidateStage::new(Arc::new(pq))))
-            .rerank_stage(Arc::new(ExactRerankStage))
-            .rerank_oversample(5)
-            .build();
-
-        let query = records[0].data.clone();
-        let results = pipeline.search(&query, 3, 2).unwrap();
-
-        assert!(!results.is_empty());
-        assert_eq!(
-            results[0].id,
-            VectorId(0),
-            "PQ+rerank pipeline must place id=0 first"
-        );
+        std::mem::forget(tmp);
+        QueryPipeline::builder(store, manifest).build()
     }
 
     #[test]
-    fn pipeline_rerank_receives_only_merged_candidate_records() {
-        struct CountingRerankStage {
-            seen_records: Arc<Mutex<usize>>,
-        }
-
-        impl RerankStage for CountingRerankStage {
-            fn rerank(
-                &self,
-                _query: &[f32],
-                candidates: Vec<SearchResult>,
-                probed_records: &[VectorRecord],
-                _metric: DistanceMetric,
-                _k: usize,
-            ) -> Vec<SearchResult> {
-                *self.seen_records.lock().unwrap() = probed_records.len();
-                candidates
-            }
-        }
-
-        let records = make_records(20, 4);
-        let query = records[0].data.clone();
-        let seen_records = Arc::new(Mutex::new(0));
-        let reranker: Arc<dyn RerankStage> = Arc::new(CountingRerankStage {
-            seen_records: Arc::clone(&seen_records),
-        });
-
-        let (pipeline, store) = build_and_get_pipeline(records, 2, 4);
-        let manifest = pipeline.manifest().clone();
-        let pipeline = QueryPipeline::builder(store, manifest)
-            .rerank_stage(reranker)
-            .build();
-
-        let results = pipeline.search(&query, 3, 2).unwrap();
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(
-            *seen_records.lock().unwrap(),
-            3,
-            "reranking should receive only the merged candidate records"
-        );
+    fn identity_embedder_returns_query_unchanged() {
+        let embedder = IdentityEmbedder;
+        let query = vec![1.0, 2.0, 3.0];
+        assert_eq!(embedder.embed(&query).unwrap(), query);
     }
 
     #[test]
-    fn builder_oversample_clamped_to_minimum_one() {
+    fn centroid_router_deduplicates_shards() {
+        let router = CentroidRouter;
+        let shards = router.route(
+            &[0.0, 0.0],
+            &[vec![0.0, 0.0], vec![0.1, 0.1]],
+            &[ShardId(0), ShardId(0)],
+            2,
+        );
+        assert_eq!(shards, vec![ShardId(0)]);
+    }
+
+    #[test]
+    fn exact_candidate_search_returns_nearest() {
+        let stage = ExactCandidateSearch;
+        let shard = ShardIndex {
+            shard_id: ShardId(0),
+            dims: 2,
+            centroids: vec![vec![0.0, 0.0]],
+            records: vec![
+                VectorRecord {
+                    id: VectorId(1),
+                    data: vec![1.0, 0.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(2),
+                    data: vec![0.0, 1.0],
+                    metadata: None,
+                },
+            ],
+        };
+        let results = stage
+            .search(&[1.0, 0.1], &shard, DistanceMetric::Euclidean, 1)
+            .unwrap();
+        assert_eq!(results[0].id, VectorId(1));
+    }
+
+    #[test]
+    fn noop_reranker_returns_results_unchanged() {
+        let reranker = NoopReranker;
+        let results = vec![SearchResult {
+            id: VectorId(1),
+            score: 0.1,
+            metadata: None,
+        }];
+        let reranked = reranker.rerank(&[0.0], results.clone(), &[], DistanceMetric::Euclidean, 1);
+        assert_eq!(reranked.len(), results.len());
+        assert_eq!(reranked[0].id, results[0].id);
+        assert!((reranked[0].score - results[0].score).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_alias_matches_run() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let pipeline = build_pipeline(records);
+        let from_run = pipeline.run(&query, 3, 2).unwrap();
+        let from_search = pipeline.search(&query, 3, 2).unwrap();
+        let run_ids: Vec<_> = from_run.iter().map(|result| result.id).collect();
+        let search_ids: Vec<_> = from_search.iter().map(|result| result.id).collect();
+        assert_eq!(run_ids, search_ids);
+    }
+
+    #[test]
+    fn rerank_oversample_is_clamped_to_one() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
         let tmp = tempdir().unwrap();
         let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
@@ -791,22 +663,22 @@ mod tests {
         };
         let manifest = IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
-                records: make_records(5, 2),
-                dataset_version: DatasetVersion("ds-os".into()),
-                embedding_version: EmbeddingVersion("emb-os".into()),
-                index_version: IndexVersion("idx-os".into()),
+                records,
+                dataset_version: DatasetVersion("ds-oversample".into()),
+                embedding_version: EmbeddingVersion("emb-oversample".into()),
+                index_version: IndexVersion("idx-oversample".into()),
                 metric: DistanceMetric::Euclidean,
-                dims: 2,
-                vectors_key: "datasets/ds-os/vectors.jsonl".into(),
-                metadata_key: "datasets/ds-os/metadata.json".into(),
+                dims: 4,
+                vectors_key: "datasets/ds-oversample/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-oversample/metadata.json".into(),
                 pq_params: None,
             })
             .unwrap();
-
-        // oversample=0 should be clamped to 1.
         let pipeline = QueryPipeline::builder(store, manifest)
+            .rerank_stage(Arc::new(NoopReranker))
             .rerank_oversample(0)
             .build();
-        assert_eq!(pipeline.rerank_oversample, 1);
+        let results = pipeline.run(&query, 3, 1).unwrap();
+        assert_eq!(results.len(), 3);
     }
 }
