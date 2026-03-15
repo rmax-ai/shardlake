@@ -877,6 +877,7 @@ dependencies = [
  "shardlake-index",
  "shardlake-manifest",
  "shardlake-storage",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

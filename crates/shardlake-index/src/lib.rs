@@ -4,6 +4,7 @@ pub mod builder;
 pub mod exact;
 pub mod ivf;
 pub mod kmeans;
+pub mod pipeline;
 pub mod pq;
 pub mod searcher;
 pub mod shard;
@@ -12,6 +13,11 @@ pub mod validator;
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
+pub use pipeline::{
+    CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
+    IdentityEmbedder, LoadShardStage, MergeStage, NoopReranker, QueryPipeline,
+    QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge,
+};
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};

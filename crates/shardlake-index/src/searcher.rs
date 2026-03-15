@@ -10,13 +10,13 @@ use tracing::{debug, info};
 use shardlake_core::{
     config::FanOutPolicy,
     error::CoreError,
-    types::{DistanceMetric, SearchResult, ShardId},
+    types::{DistanceMetric, SearchResult, ShardId, VectorId},
 };
 use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    exact::{exact_search, merge_top_k},
+    exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
     pq::PqCodebook,
     shard::{PqShard, ShardIndex},
@@ -226,6 +226,92 @@ impl IndexSearcher {
         }
 
         Ok(merge_top_k(all_results, k))
+    }
+
+    /// Rerank ANN candidates using exact distance to `query`.
+    ///
+    /// Fetches the raw vectors for each candidate from the in-memory shard
+    /// cache and recomputes exact distances, returning the candidates sorted by
+    /// their true distances. Call this after [`IndexSearcher::search`] when a
+    /// more accurate final ranking is required.
+    ///
+    /// Candidates whose vectors are not found in the raw-shard cache (for
+    /// example, when they were produced by a different searcher instance or a
+    /// PQ-only search path) retain their original score.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query dimensions do not match the index or if
+    /// the shard cache lock is poisoned.
+    pub fn rerank(
+        &self,
+        query: &[f32],
+        mut candidates: Vec<SearchResult>,
+    ) -> Result<Vec<SearchResult>> {
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+
+        let expected_dims = self.manifest.dims as usize;
+        if query.len() != expected_dims {
+            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                expected: expected_dims,
+                got: query.len(),
+            }));
+        }
+
+        let metric = self.manifest.distance_metric;
+        let mut remaining_ids: HashSet<VectorId> =
+            candidates.iter().map(|result| result.id).collect();
+
+        let vector_lookup: HashMap<VectorId, Vec<f32>> = {
+            let cache = self.cache.lock().map_err(|_| {
+                IndexError::Other(
+                    "shard cache lock poisoned during rerank: a previous thread panicked \
+                         while holding the cache lock"
+                        .into(),
+                )
+            })?;
+
+            let mut vectors = HashMap::with_capacity(remaining_ids.len());
+            for shard in cache.values() {
+                for record in &shard.records {
+                    if remaining_ids.remove(&record.id) {
+                        if record.data.len() != expected_dims {
+                            return Err(IndexError::Core(CoreError::DimensionMismatch {
+                                expected: expected_dims,
+                                got: record.data.len(),
+                            }));
+                        }
+
+                        vectors.insert(record.id, record.data.clone());
+                        if remaining_ids.is_empty() {
+                            break;
+                        }
+                    }
+                }
+
+                if remaining_ids.is_empty() {
+                    break;
+                }
+            }
+
+            vectors
+        };
+
+        for result in &mut candidates {
+            if let Some(raw_vec) = vector_lookup.get(&result.id) {
+                result.score = distance(query, raw_vec, metric);
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(candidates)
     }
 
     /// Load (or return from cache) the PQ codebook for this index.
