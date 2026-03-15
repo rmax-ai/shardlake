@@ -13,7 +13,7 @@ use shardlake_core::{
 };
 use shardlake_index::{
     exact::{exact_search, precision_at_k, recall_at_k},
-    IndexSearcher,
+    IndexSearcher, Result as IndexResult,
 };
 use shardlake_storage::{paths, ObjectStore};
 
@@ -84,9 +84,7 @@ pub fn run_benchmark(
 
     let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
     let mean_latency = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
-    latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99_idx = ((latencies_us.len() as f64 * 0.99) as usize).min(latencies_us.len() - 1);
-    let p99_latency = latencies_us.get(p99_idx).copied().unwrap_or(0.0);
+    let p99_latency = nearest_rank_percentile(&mut latencies_us, 0.99);
 
     let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
     let artifact_size_bytes: u64 = keys
@@ -128,27 +126,23 @@ pub fn run_benchmark(
 /// * `queries` – Query vectors (ids are ignored for search; used only for ground-truth lookup).
 /// * `corpus` – Full corpus used to compute the exact ground-truth top-k per query.
 /// * `k` – Number of nearest neighbours to retrieve.
-/// * `nprobe` – Number of shards to probe per query.
+/// * `policy` – Query-time fan-out policy for centroid, shard, and per-shard limits.
 /// * `metric` – Distance metric used to compute the ground-truth.
 pub fn run_eval_ann(
     searcher: &IndexSearcher,
     queries: &[VectorRecord],
     corpus: &[VectorRecord],
     k: usize,
-    nprobe: usize,
+    policy: &FanOutPolicy,
     metric: DistanceMetric,
-) -> EvalAnnReport {
+) -> IndexResult<EvalAnnReport> {
     if queries.is_empty() {
-        return EvalAnnReport {
-            num_queries: 0,
-            k,
-            nprobe,
-            recall_at_k: 0.0,
-            precision_at_k: 0.0,
-            mean_latency_us: 0.0,
-            p99_latency_us: 0.0,
-        };
+        return Err(shardlake_index::IndexError::Other(
+            "eval-ann requires at least one query vector".to_string(),
+        ));
     }
+
+    let nprobe = policy.candidate_centroids as usize;
 
     let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
     let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
@@ -159,7 +153,7 @@ pub fn run_eval_ann(
         let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
 
         let t0 = Instant::now();
-        let approx = searcher.search(&query.data, k, nprobe).unwrap_or_default();
+        let approx = searcher.search(&query.data, k, policy)?;
         let elapsed_us = t0.elapsed().as_micros() as f64;
 
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
@@ -171,9 +165,7 @@ pub fn run_eval_ann(
     let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
     let mean_precision = precisions.iter().sum::<f64>() / precisions.len() as f64;
     let mean_latency = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
-    latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p99_idx = ((latencies_us.len() as f64 * 0.99) as usize).min(latencies_us.len() - 1);
-    let p99_latency = latencies_us.get(p99_idx).copied().unwrap_or(0.0);
+    let p99_latency = nearest_rank_percentile(&mut latencies_us, 0.99);
 
     let report = EvalAnnReport {
         num_queries: queries.len(),
@@ -193,11 +185,23 @@ pub fn run_eval_ann(
         "ANN evaluation complete"
     );
 
-    report
+    Ok(report)
+}
+
+fn nearest_rank_percentile(values: &mut [f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let rank = ((values.len() as f64) * percentile).ceil() as usize;
+    let index = rank.saturating_sub(1).min(values.len() - 1);
+    values[index]
 }
 
 #[cfg(test)]
 mod tests {
+    use super::nearest_rank_percentile;
     use shardlake_core::types::VectorId;
     use shardlake_index::exact::{precision_at_k, recall_at_k};
 
@@ -228,5 +232,17 @@ mod tests {
         let ret = vec![VectorId(1), VectorId(4), VectorId(5)];
         let p = precision_at_k(&gt, &ret);
         assert!((p - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nearest_rank_percentile_uses_explicit_rank() {
+        let mut values: Vec<f64> = (1..=101).map(f64::from).collect();
+        assert_eq!(nearest_rank_percentile(&mut values, 0.99), 100.0);
+    }
+
+    #[test]
+    fn test_nearest_rank_percentile_handles_single_value() {
+        let mut values = vec![42.0];
+        assert_eq!(nearest_rank_percentile(&mut values, 0.99), 42.0);
     }
 }

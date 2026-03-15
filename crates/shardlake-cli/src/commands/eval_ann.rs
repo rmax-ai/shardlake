@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use tracing::info;
 
-use shardlake_core::types::VectorRecord;
+use shardlake_core::{config::FanOutPolicy, types::VectorRecord};
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -47,6 +47,13 @@ pub async fn run(storage: PathBuf, args: EvalAnnArgs) -> Result<()> {
     anyhow::ensure!(args.k >= 1, "--k must be at least 1");
     anyhow::ensure!(args.nprobe >= 1, "--nprobe must be at least 1");
 
+    let policy = FanOutPolicy {
+        candidate_centroids: args.nprobe as u32,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    policy.validate().map_err(|err| anyhow::anyhow!(err))?;
+
     let store = Arc::new(LocalObjectStore::new(&storage)?);
     let manifest = Manifest::load_alias(&*store, &args.alias)?;
     let metric = manifest.distance_metric;
@@ -79,7 +86,7 @@ pub async fn run(storage: PathBuf, args: EvalAnnArgs) -> Result<()> {
     let searcher = IndexSearcher::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest);
 
     let report =
-        shardlake_bench::run_eval_ann(&searcher, &queries, &corpus, args.k, args.nprobe, metric);
+        shardlake_bench::run_eval_ann(&searcher, &queries, &corpus, args.k, &policy, metric)?;
 
     match args.output {
         OutputFormat::Text => {
