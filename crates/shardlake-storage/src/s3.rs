@@ -51,11 +51,11 @@ use crate::{ObjectStore, Result, StorageError};
 ///
 /// All fields are plain strings so that the type is easy to construct from
 /// environment variables, config files, or CLI flags without pulling in extra
-/// dependencies.  Sensitive fields (access key, secret key) are stored in
+/// dependencies. Sensitive fields (access key, secret key) are stored in
 /// memory only; callers are responsible for not logging these values.
 ///
-/// A custom [`Debug`] implementation is provided that redacts
-/// `secret_access_key` to prevent accidental credential leaks in logs.
+/// A custom [`Debug`] implementation is provided that redacts both credential
+/// fields to prevent accidental leaks in logs.
 #[derive(Clone)]
 pub struct S3Config {
     /// HTTP(S) endpoint URL, e.g. `https://s3.amazonaws.com` or a MinIO base
@@ -68,6 +68,8 @@ pub struct S3Config {
     /// For MinIO or other S3-compatible services that do not use AWS regions,
     /// this may be set to any non-empty string.
     pub region: String,
+    ///
+    /// **Keep this value out of logs and traces.**
     /// AWS access key ID (or equivalent credential for S3-compatible services).
     pub access_key_id: String,
     /// AWS secret access key (or equivalent credential).
@@ -82,7 +84,7 @@ impl std::fmt::Debug for S3Config {
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("region", &self.region)
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &"<redacted>")
             .field("secret_access_key", &"<redacted>")
             .finish()
     }
@@ -210,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_redacts_secret_access_key() {
+    fn debug_output_redacts_credentials() {
         let cfg = S3Config {
             endpoint: "https://s3.example.com".into(),
             bucket: "test-bucket".into(),
@@ -219,7 +221,8 @@ mod tests {
             secret_access_key: "super-secret".into(),
         };
         let debug_str = format!("{cfg:?}");
+        assert!(!debug_str.contains("AKIATEST"));
         assert!(!debug_str.contains("super-secret"));
-        assert!(debug_str.contains("<redacted>"));
+        assert_eq!(debug_str.matches("<redacted>").count(), 2);
     }
 }

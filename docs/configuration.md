@@ -67,9 +67,11 @@ used instead of hand-constructed strings (see *Artifact storage layout* in
 
 ### Local filesystem backend (`LocalObjectStore`)
 
-The default, production-ready backend.  All keys map to paths under the configured
-`--storage` root.  Enabled automatically whenever Shardlake is started without explicit
-backend selection.
+The default, production-ready backend. All keys map to paths under the configured
+`--storage` root.
+
+Today, the CLI and server always construct `LocalObjectStore` at runtime; there is
+not yet a user-facing flag or config setting to select a different backend.
 
 ### S3-compatible backend (`S3CompatibleBackend`) — **stub / not yet functional**
 
@@ -84,7 +86,7 @@ backend selection.
 | `endpoint` | string | HTTP(S) endpoint URL, e.g. `https://s3.amazonaws.com` or a MinIO base URL such as `http://localhost:9000`. |
 | `bucket` | string | Target bucket name. |
 | `region` | string | AWS-style region identifier (e.g. `us-east-1`). For non-AWS S3-compatible services this may be any non-empty string. |
-| `access_key_id` | string | AWS access key ID (or equivalent credential). |
+| `access_key_id` | string | AWS access key ID (or equivalent credential). **Do not log this value.** |
 | `secret_access_key` | string | AWS secret access key (or equivalent credential). **Do not log this value.** |
 
 **Non-goals for the current stub** (will be addressed in follow-up work):
