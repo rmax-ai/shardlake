@@ -21,12 +21,16 @@ Definitions:
 - An open PR is eligible for `ready-for-open-review` only when:
   - it is open
   - it is not in draft state
+  - it is not labeled `needs-human`
+  - it is not labeled `has-merge-conflicts`
   - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
   - it has Copilot or Codex review comments available for inspection
   - it does not already carry `ready-to-merge`
 - A PR may keep `ready-to-merge` only when:
   - it is open
   - it is not in draft state
+  - it is not labeled `needs-human`
+  - it is not labeled `has-merge-conflicts`
   - its author login passes the workflow actor guard rail
 
 Requirements:
@@ -38,10 +42,11 @@ Requirements:
 5. Reconcile the `ready-for-open-review` label deterministically:
    - add it to each eligible PR missing the label
    - remove it from any draft, closed, or merge-ready PR
+   - remove it from any PR labeled `needs-human` or `has-merge-conflicts`
    - remove it from any open PR that has no Copilot or Codex review comments yet
   - remove it from any PR whose author login falls outside the workflow actor guard rail or cannot be determined safely
 6. Reconcile obviously stale `ready-to-merge` labels:
-  - remove the label from any draft, closed, or workflow-guard-rail-blocked PR still carrying it
+  - remove the label from any draft, closed, workflow-guard-rail-blocked, `needs-human`, or `has-merge-conflicts` PR still carrying it
 7. Do not decide merge readiness from local code checks in this prompt.
 
 Execution guidance:

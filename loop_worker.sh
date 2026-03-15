@@ -170,6 +170,8 @@ with open(payload_file, encoding="utf-8") as handle:
 labels = {label["name"] for label in pr.get("labels", [])}
 
 def eligible(item: dict) -> bool:
+  if "needs-human" in labels or "has-merge-conflicts" in labels:
+    return False
     if item.get("state") != "OPEN":
         return False
     if lane == "draft-review":
@@ -203,6 +205,8 @@ with open(payload_file, encoding="utf-8") as handle:
 
 def eligible(item: dict) -> bool:
     labels = {label["name"] for label in item.get("labels", [])}
+  if "needs-human" in labels or "has-merge-conflicts" in labels:
+    return False
     if item.get("state") != "OPEN":
         return False
     if lane == "draft-review":
@@ -268,6 +272,12 @@ if payload.get("headRefOid") != expected_head_sha:
 
 if author_login not in allowed_logins:
     errors.append(f"author login {author_login!r} fails the workflow actor guard rail")
+
+if "needs-human" in labels:
+  errors.append("PR is labeled needs-human")
+
+if "has-merge-conflicts" in labels:
+  errors.append("PR is labeled has-merge-conflicts")
 
 if lane == "draft-review":
     if not payload.get("isDraft"):

@@ -38,6 +38,8 @@ Requirements:
    - open
    - still in draft state
    - labeled `ready-for-draft-check`
+   - not labeled `needs-human`
+   - not labeled `has-merge-conflicts`
    - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
    - still backed by `python3 tools/copilot_pr_state.py --repo <owner>/<repo> --pr <number>` reporting `ready_for_draft_check: true`; stop if the latest Copilot work event is no longer `copilot_work_finished`
@@ -76,6 +78,8 @@ Requirements:
 If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, leave a concise evidence-based PR comment describing the conflict and the required human resolution, do not advance the PR state in this run, and report the conflict clearly as the blocker.
 
 If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+
+If the PR already carries `needs-human` or `has-merge-conflicts`, stop immediately, report that the PR is excluded from draft review, and do not perform review work in this run.
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 

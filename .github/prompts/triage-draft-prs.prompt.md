@@ -21,6 +21,8 @@ Definitions:
 - A draft PR is eligible for `ready-for-draft-check` only when:
   - it is open
   - it is still in draft state
+  - it is not labeled `needs-human`
+  - it is not labeled `has-merge-conflicts`
   - its author login passes the normalized workflow actor guard rail (`copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`)
   - the latest GitHub-visible Copilot work event for that PR is `copilot_work_finished`
   - pending-agent state can be determined safely from GitHub issue events
@@ -39,6 +41,7 @@ Requirements:
 5. Reconcile the `ready-for-draft-check` label deterministically:
    - add it to each eligible draft PR missing the label
    - remove it from any draft PR with agent work still pending or ambiguous state
+  - remove it from any PR labeled `needs-human` or `has-merge-conflicts`
    - remove it from any PR whose author login falls outside the workflow actor guard rail or cannot be determined safely
    - remove it from any non-draft or closed PR that still carries it
 6. Do not inspect code quality gates or modify PR body/title in this prompt.

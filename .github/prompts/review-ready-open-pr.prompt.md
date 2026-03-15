@@ -28,6 +28,8 @@ Requirements:
    - open
    - not in draft state
    - labeled `ready-for-open-review`
+   - not labeled `needs-human`
+   - not labeled `has-merge-conflicts`
    - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
 3. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 4. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
@@ -58,6 +60,8 @@ Requirements:
 If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` and `needs-human` labels exist, add both labels to the PR, leave a concise evidence-based PR comment describing the conflict and the required human resolution, do not label the PR `ready-to-merge` in this run, and report the conflict clearly as the blocker.
 
 If automation is blocked on a needed human decision, policy call, or other manual judgment, ensure the `needs-human` label exists, add it to the PR, and leave a concise evidence-based PR comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
+
+If the PR already carries `needs-human` or `has-merge-conflicts`, stop immediately, report that the PR is excluded from open review, and do not perform review work in this run.
 
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
