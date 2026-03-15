@@ -1,5 +1,7 @@
 //! Benchmark harness: recall@k vs exact baseline, latency, artifact size.
 
+pub mod generate;
+
 use std::{sync::Arc, time::Instant};
 
 use serde::{Deserialize, Serialize};

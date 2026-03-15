@@ -63,6 +63,63 @@ shardlake ingest \
 
 ---
 
+## `shardlake generate`
+
+Generates a reproducible synthetic benchmark dataset and writes versioned
+dataset artifacts to storage.  Cluster centroids are drawn uniformly from
+`[-1, 1]^dims`; each vector is a randomly selected centroid perturbed by
+uniform noise in `[-cluster-spread, cluster-spread]^dims`.  Identical
+arguments and `--seed` values always produce identical stored artifacts, making
+repeated benchmark evaluations reproducible.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] generate [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--num-vectors <N>` | usize | `1000` | Total number of vectors to generate |
+| `--dims <N>` | usize | `128` | Dimensionality of each generated vector |
+| `--num-clusters <N>` | usize | `10` | Number of synthetic clusters |
+| `--seed <N>` | u64 | `3735928559` | RNG seed; the same seed always produces the same dataset |
+| `--cluster-spread <F>` | f32 | `0.1` | Half-range of uniform noise added per dimension around each cluster centroid |
+| `--dataset-version <STRING>` | string | `ds-<timestamp>` | Version tag for the generated dataset |
+| `--embedding-version <STRING>` | string | same as `--dataset-version` | Version tag for the embedding artifact |
+
+### Output
+
+Writes to `<storage>/datasets/<dataset-version>/`:
+
+| File | Description |
+|------|-------------|
+| `vectors.jsonl` | Generated vector records (id + data, no metadata) |
+| `metadata.json` | Empty JSON object `{}` (no per-record metadata) |
+| `info.json` | Dataset manifest with `dims`, `vector_count`, and storage keys |
+
+### Example
+
+```bash
+# Generate a 10,000-vector, 64-dimensional corpus with 8 clusters
+shardlake generate \
+  --num-vectors 10000 \
+  --dims 64 \
+  --num-clusters 8 \
+  --seed 3735928559 \
+  --dataset-version bench-ds-v1
+
+# Then build an index directly from it
+shardlake build-index \
+  --dataset-version bench-ds-v1 \
+  --index-version bench-idx-v1 \
+  --num-shards 8
+```
+
+---
+
 ## `shardlake build-index`
 
 Builds a K-means shard-based ANN index from a previously ingested dataset.
