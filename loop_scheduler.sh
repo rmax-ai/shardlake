@@ -10,15 +10,16 @@ WAIT_SECONDS="${WAIT_SECONDS:-300}"
 RUN_DRAFT_REVIEW="${RUN_DRAFT_REVIEW:-yes}"
 RUN_OPEN_REVIEW="${RUN_OPEN_REVIEW:-yes}"
 RUN_MERGE="${RUN_MERGE:-yes}"
+RUN_RECONCILE="${RUN_RECONCILE:-yes}"
 COPILOT_BIN="${COPILOT_BIN:-copilot}"
 LOG_DIR="${LOOP_SCHEDULER_LOG_DIR:-$REPO_ROOT/tmp/loop_scheduler}"
 
 usage() {
   cat >&2 <<'EOF'
-usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--skip-draft-review] [--skip-open-review] [--skip-merge]
+usage: loop_scheduler.sh [--once] [--max-cycles <count>] [--wait-seconds <seconds>] [--skip-reconcile] [--skip-draft-review] [--skip-open-review] [--skip-merge]
 
 Runs the concurrent local loop as:
-  1. one reconcile pass
+  1. one reconcile pass unless --skip-reconcile is set
   2. zero or more worker lanes
   3. optional sleep and repeat
 
@@ -75,6 +76,16 @@ elif isinstance(value, bool):
 else:
     print(value)
 PY
+}
+
+skip_reconcile_cycle() {
+  local cycle="$1"
+
+  CLAIMABLE_WORK_EXISTS="yes"
+  ALL_WAITING_ON_OTHER_AGENTS="no"
+  SLEEP_NEXT_ITERATION="yes"
+
+  echo "[loop_scheduler] skipping reconcile cycle ${cycle}/${MAX_CYCLES}; dispatching workers directly"
 }
 
 run_reconcile_cycle() {
@@ -201,6 +212,10 @@ while [[ $# -gt 0 ]]; do
       WAIT_SECONDS="$2"
       shift 2
       ;;
+    --skip-reconcile)
+      RUN_RECONCILE="no"
+      shift
+      ;;
     --skip-draft-review)
       RUN_DRAFT_REVIEW="no"
       shift
@@ -233,14 +248,17 @@ fi
 RUN_DRAFT_REVIEW="$(normalize_bool "$RUN_DRAFT_REVIEW")"
 RUN_OPEN_REVIEW="$(normalize_bool "$RUN_OPEN_REVIEW")"
 RUN_MERGE="$(normalize_bool "$RUN_MERGE")"
+RUN_RECONCILE="$(normalize_bool "$RUN_RECONCILE")"
 
 require_command "$COPILOT_BIN"
 require_command git
 require_command gh
-require_command python3
-require_command awk
+if [[ "$RUN_RECONCILE" == "yes" ]]; then
+  require_command python3
+  require_command awk
+fi
 
-if [[ ! -f "$REPO_ROOT/$RECONCILE_PROMPT_PATH" ]]; then
+if [[ "$RUN_RECONCILE" == "yes" && ! -f "$REPO_ROOT/$RECONCILE_PROMPT_PATH" ]]; then
   die "reconcile prompt file not found: $RECONCILE_PROMPT_PATH"
 fi
 
@@ -250,12 +268,17 @@ cd "$REPO_ROOT"
 echo "[loop_scheduler] reconcile prompt: $RECONCILE_PROMPT_PATH"
 echo "[loop_scheduler] max_cycles: $MAX_CYCLES"
 echo "[loop_scheduler] wait_seconds: $WAIT_SECONDS"
+echo "[loop_scheduler] run_reconcile: $RUN_RECONCILE"
 echo "[loop_scheduler] run_draft_review: $RUN_DRAFT_REVIEW"
 echo "[loop_scheduler] run_open_review: $RUN_OPEN_REVIEW"
 echo "[loop_scheduler] run_merge: $RUN_MERGE"
 
 for ((cycle = 1; cycle <= MAX_CYCLES; cycle++)); do
-  run_reconcile_cycle "$cycle"
+  if [[ "$RUN_RECONCILE" == "yes" ]]; then
+    run_reconcile_cycle "$cycle"
+  else
+    skip_reconcile_cycle "$cycle"
+  fi
   dispatch_workers "$cycle"
 
   if [[ "$ONCE" == "yes" || "$cycle" -eq "$MAX_CYCLES" ]]; then

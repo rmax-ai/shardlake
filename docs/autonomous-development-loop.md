@@ -210,7 +210,7 @@ The concurrent worker prompts are:
 
 The checked-in worker launcher is `loop_worker.sh`. It resolves the next eligible PR for a single lane with `gh`, acquires a lease, revalidates the claimed PR's current state and head SHA with `gh`, runs the matching worker prompt with explicit inputs, and then releases the lease.
 
-The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles.
+The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles. When started with `--skip-reconcile`, it bypasses that reconcile pass and dispatches the worker lanes directly on every cycle instead.
 
 Each worker prompt assumes a target item has already been claimed. It must:
 
@@ -429,6 +429,12 @@ To disable selected lanes during supervised operation:
 
 ```bash
 ./loop_scheduler.sh --skip-draft-review --skip-merge
+```
+
+To bypass the reconcile pass and force direct worker dispatch for each cycle:
+
+```bash
+./loop_scheduler.sh --skip-reconcile
 ```
 
 ### Single-pass usage
