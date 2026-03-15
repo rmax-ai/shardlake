@@ -45,6 +45,26 @@ fn build_index(
     shardlake_manifest::Manifest,
     tempfile::TempDir,
 ) {
+    build_index_with_metric(
+        records,
+        num_shards,
+        dims,
+        dataset_tag,
+        DistanceMetric::Euclidean,
+    )
+}
+
+fn build_index_with_metric(
+    records: Vec<VectorRecord>,
+    num_shards: u32,
+    dims: usize,
+    dataset_tag: &str,
+    metric: DistanceMetric,
+) -> (
+    Arc<dyn ObjectStore>,
+    shardlake_manifest::Manifest,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let config = SystemConfig {
@@ -62,7 +82,7 @@ fn build_index(
             dataset_version: DatasetVersion(dataset_tag.into()),
             embedding_version: EmbeddingVersion("emb".into()),
             index_version: IndexVersion("idx".into()),
-            metric: DistanceMetric::Euclidean,
+            metric,
             dims,
             vectors_key: format!("datasets/{dataset_tag}/vectors.jsonl"),
             metadata_key: format!("datasets/{dataset_tag}/metadata.json"),
@@ -305,6 +325,40 @@ fn pq_candidate_stage_has_reasonable_recall() {
         avg_recall >= 0.4,
         "PQ recall@{k} should be ≥ 0.4 over {num_queries} queries; got {avg_recall:.3}"
     );
+}
+
+/// PQ-backed pipelines must reject non-Euclidean metrics explicitly.
+#[test]
+fn pipeline_with_pq_stage_rejects_non_euclidean_metrics() {
+    let records = make_records(30, 4);
+    let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
+    let pq = Arc::new(
+        PqCodebook::train(
+            &vecs,
+            PqParams {
+                num_subspaces: 2,
+                codebook_size: 16,
+            },
+            0xdead_beef,
+            20,
+        )
+        .unwrap(),
+    );
+
+    for metric in [DistanceMetric::Cosine, DistanceMetric::InnerProduct] {
+        let (store, manifest, _tmp) =
+            build_index_with_metric(records.clone(), 2, 4, "ds-pq-metric", metric);
+        let pipeline = QueryPipeline::builder(store, manifest)
+            .candidate_stage(Arc::new(PqCandidateStage::new(Arc::clone(&pq))))
+            .build();
+
+        let err = pipeline.search(&records[0].data, 5, 2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("PQ search currently supports only euclidean distance"),
+            "expected explicit PQ metric rejection for {metric:?}, got {err}"
+        );
+    }
 }
 
 // ── Reranking correctness ─────────────────────────────────────────────────────

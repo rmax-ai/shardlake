@@ -33,7 +33,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -77,14 +77,13 @@ pub trait CandidateSearchStage: Send + Sync {
 
 /// Stage that re-ranks approximate candidates with exact distances.
 ///
-/// Receives the merged approximate candidate set and the union of all probed
-/// shard records so that the original float vectors are available for exact
-/// rescoring.
+/// Receives the merged approximate candidate set and the subset of probed
+/// shard records needed to rerank those candidates exactly.
 pub trait RerankStage: Send + Sync {
     /// Re-score `candidates` and return the top-`k` exactly ranked results.
     ///
-    /// `probed_records` is the concatenation of all records from every probed
-    /// shard, providing the original float vectors needed for rescoring.
+    /// `probed_records` contains the original float vectors for the merged
+    /// candidate ids, avoiding unnecessary clones of unrelated records.
     fn rerank(
         &self,
         query: &[f32],
@@ -325,7 +324,7 @@ impl QueryPipeline {
 
         // ── Step 3: load shards, search candidates ────────────────────────
         let mut all_results: Vec<SearchResult> = Vec::new();
-        let mut probed_records: Vec<VectorRecord> = Vec::new();
+        let mut probed_shards: Vec<Arc<ShardIndex>> = Vec::new();
 
         for shard_id in probe_shards {
             let shard = self.load_shard(shard_id)?;
@@ -334,7 +333,7 @@ impl QueryPipeline {
                     .search_shard(query, &shard, candidates_per_shard, metric)?;
             all_results.extend(results);
             if self.rerank_stage.is_some() {
-                probed_records.extend(shard.records.iter().cloned());
+                probed_shards.push(Arc::clone(&shard));
             }
         }
 
@@ -343,6 +342,17 @@ impl QueryPipeline {
 
         // ── Step 5: optional exact reranking ──────────────────────────────
         if let Some(reranker) = &self.rerank_stage {
+            let candidate_ids: HashSet<_> = merged.iter().map(|result| result.id).collect();
+            let mut probed_records = Vec::with_capacity(candidate_ids.len());
+            for shard in &probed_shards {
+                probed_records.extend(
+                    shard
+                        .records
+                        .iter()
+                        .filter(|record| candidate_ids.contains(&record.id))
+                        .cloned(),
+                );
+            }
             Ok(reranker.rerank(query, merged, &probed_records, metric, k))
         } else {
             Ok(merged)
@@ -720,6 +730,49 @@ mod tests {
             results[0].id,
             VectorId(0),
             "PQ+rerank pipeline must place id=0 first"
+        );
+    }
+
+    #[test]
+    fn pipeline_rerank_receives_only_merged_candidate_records() {
+        struct CountingRerankStage {
+            seen_records: Arc<Mutex<usize>>,
+        }
+
+        impl RerankStage for CountingRerankStage {
+            fn rerank(
+                &self,
+                _query: &[f32],
+                candidates: Vec<SearchResult>,
+                probed_records: &[VectorRecord],
+                _metric: DistanceMetric,
+                _k: usize,
+            ) -> Vec<SearchResult> {
+                *self.seen_records.lock().unwrap() = probed_records.len();
+                candidates
+            }
+        }
+
+        let records = make_records(20, 4);
+        let query = records[0].data.clone();
+        let seen_records = Arc::new(Mutex::new(0));
+        let reranker: Arc<dyn RerankStage> = Arc::new(CountingRerankStage {
+            seen_records: Arc::clone(&seen_records),
+        });
+
+        let (pipeline, store) = build_and_get_pipeline(records, 2, 4);
+        let manifest = pipeline.manifest().clone();
+        let pipeline = QueryPipeline::builder(store, manifest)
+            .rerank_stage(reranker)
+            .build();
+
+        let results = pipeline.search(&query, 3, 2).unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            *seen_records.lock().unwrap(),
+            3,
+            "reranking should receive only the merged candidate records"
         );
     }
 
