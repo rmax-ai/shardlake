@@ -15,6 +15,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use shardlake_core::{
@@ -27,6 +28,7 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    metrics::CacheMetrics,
     shard::ShardIndex,
     IndexError, Result,
 };
@@ -139,10 +141,15 @@ impl RouteStage for CentroidRouter {
 /// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
 /// to resolve the artifact key for each shard ID before fetching bytes from
 /// the store.
+///
+/// Cache observability is available via [`CachedShardLoader::metrics`]: a
+/// shared [`CacheMetrics`] instance that tracks hits, misses, load latency,
+/// and retained bytes for every shard loaded through this loader.
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
     cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    metrics: Arc<CacheMetrics>,
 }
 
 impl CachedShardLoader {
@@ -152,7 +159,16 @@ impl CachedShardLoader {
             store,
             manifest,
             cache: Mutex::new(HashMap::new()),
+            metrics: Arc::new(CacheMetrics::new()),
         }
+    }
+
+    /// Return a shared reference to the cache metrics for this loader.
+    ///
+    /// The returned [`Arc`] is the same instance used internally, so callers
+    /// observe live counter updates without any extra synchronisation cost.
+    pub fn metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
@@ -166,9 +182,12 @@ impl LoadShardStage for CachedShardLoader {
                 )
             })?;
             if let Some(idx) = cache.get(&shard_id) {
+                self.metrics.record_hit();
                 return Ok(Arc::clone(idx));
             }
         }
+
+        self.metrics.record_miss();
 
         let shard_def = self
             .manifest
@@ -177,8 +196,12 @@ impl LoadShardStage for CachedShardLoader {
             .find(|s| s.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
+        let t0 = Instant::now();
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+
+        self.metrics.record_load(elapsed_ns, bytes.len() as u64);
 
         let mut cache = self.cache.lock().map_err(|_| {
             IndexError::Other(
