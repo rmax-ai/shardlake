@@ -2,11 +2,11 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use shardlake_core::{
-    config::SystemConfig,
+    config::{FanOutPolicy, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
     },
@@ -39,6 +39,51 @@ impl CountingStore {
             shard_get_count: Arc::clone(&counter),
         });
         (store, counter)
+    }
+}
+
+/// Wraps an [`ObjectStore`] and records which shard artifact keys are fetched.
+struct RecordingStore {
+    inner: Arc<dyn ObjectStore>,
+    shard_keys: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        let shard_keys = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(Self {
+            inner,
+            shard_keys: Arc::clone(&shard_keys),
+        });
+        (store, shard_keys)
+    }
+}
+
+impl ObjectStore for RecordingStore {
+    fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
+        self.inner.put(key, data)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        if key.ends_with(".sidx") {
+            self.shard_keys
+                .lock()
+                .expect("recording store lock poisoned")
+                .push(key.to_string());
+        }
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, StorageError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.inner.delete(key)
     }
 }
 
@@ -116,7 +161,12 @@ fn test_build_and_search() {
         manifest,
     );
     let query = records[0].data.clone();
-    let results = searcher.search(&query, 5, 2).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
     assert!(!results.is_empty());
     // The closest vector to itself should be id 0.
     assert_eq!(results[0].id, VectorId(0));
@@ -163,15 +213,102 @@ fn test_search_does_not_load_non_probed_shards() {
 
     let searcher = IndexSearcher::new(counting_store, manifest);
 
-    // nprobe=1: only 1 of the 4 shards should be loaded.
+    // candidate_centroids=1: only 1 of the 4 shards should be loaded.
     let query = records[0].data.clone();
-    let results = searcher.search(&query, 5, 1).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 1,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
     assert!(!results.is_empty());
 
     let loads = counter.load(Ordering::Relaxed);
     assert_eq!(
         loads, 1,
-        "expected exactly 1 shard load with nprobe=1, got {loads}"
+        "expected exactly 1 shard load with candidate_centroids=1, got {loads}"
+    );
+}
+
+#[test]
+fn test_candidate_shards_cap_keeps_nearest_shard_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let records = vec![
+        VectorRecord {
+            id: VectorId(1),
+            data: vec![0.0, 0.0],
+            metadata: None,
+        },
+        VectorRecord {
+            id: VectorId(2),
+            data: vec![0.1, 0.0],
+            metadata: None,
+        },
+        VectorRecord {
+            id: VectorId(3),
+            data: vec![10.0, 10.0],
+            metadata: None,
+        },
+        VectorRecord {
+            id: VectorId(4),
+            data: vec![10.1, 10.0],
+            metadata: None,
+        },
+    ];
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
+        ..SystemConfig::default()
+    };
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-order".into()),
+            embedding_version: EmbeddingVersion("emb-order".into()),
+            index_version: IndexVersion("idx-order".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 2,
+            vectors_key: paths::dataset_vectors_key("ds-order"),
+            metadata_key: paths::dataset_metadata_key("ds-order"),
+            pq_params: None,
+        })
+        .unwrap();
+
+    let expected_shard = manifest
+        .shards
+        .iter()
+        .max_by_key(|shard| shard.shard_id)
+        .expect("expected at least one shard");
+    let expected_artifact_key = expected_shard.artifact_key.clone();
+    let query = expected_shard.centroid.clone();
+    assert!(
+        !query.is_empty(),
+        "manifest should embed shard centroids for routing"
+    );
+
+    let (recording_store, shard_keys) =
+        RecordingStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>);
+    let searcher = IndexSearcher::new(recording_store, manifest);
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 1,
+        max_vectors_per_shard: 0,
+    };
+
+    let results = searcher.search(&query, 1, &policy).unwrap();
+    assert!(!results.is_empty());
+
+    let loaded_keys = shard_keys.lock().expect("recording store lock poisoned");
+    assert_eq!(loaded_keys.len(), 1, "expected exactly one shard load");
+    assert_eq!(
+        loaded_keys[0], expected_artifact_key,
+        "candidate_shards cap should keep the nearest shard rather than the lowest shard id"
     );
 }
 
@@ -337,7 +474,12 @@ fn test_pq_build_and_search() {
         manifest,
     );
     let query = records[0].data.clone();
-    let results = searcher.search(&query, 5, 2).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
     assert!(
         !results.is_empty(),
         "PQ search must return at least one result"
@@ -404,6 +546,8 @@ fn test_pq_build_is_deterministic() {
             kmeans_iters: 10,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
+            // Train centroids on 20 of the 60 vectors.
+            kmeans_sample_size: Some(20),
             ..SystemConfig::default()
         };
         IndexBuilder::new(store.as_ref(), &config)
@@ -446,6 +590,7 @@ fn test_pq_search_preserves_metadata() {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: Some(100),
         ..SystemConfig::default()
     };
 
@@ -495,7 +640,12 @@ fn test_pq_search_preserves_metadata() {
         .unwrap();
 
     let searcher = IndexSearcher::new(store as Arc<dyn shardlake_storage::ObjectStore>, manifest);
-    let results = searcher.search(&records[0].data, 3, 2).unwrap();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&records[0].data, 3, &policy).unwrap();
     assert_eq!(results[0].id, records[0].id);
     assert_eq!(results[0].metadata, records[0].metadata);
 }

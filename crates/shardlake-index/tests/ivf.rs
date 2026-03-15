@@ -32,6 +32,8 @@ fn default_config(tmp: &std::path::Path, num_shards: u32) -> SystemConfig {
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
         kmeans_sample_size: None,
         ..SystemConfig::default()
     }

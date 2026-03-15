@@ -45,6 +45,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         pq_codebook_size: SystemConfig::default_pq_codebook_size(),
         kmeans_seed: SystemConfig::default_kmeans_seed(),
         kmeans_sample_size: None,
+        ..SystemConfig::default()
     }
 }
 

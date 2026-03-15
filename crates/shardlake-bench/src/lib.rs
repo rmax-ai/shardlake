@@ -5,7 +5,10 @@ use std::{sync::Arc, time::Instant};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use shardlake_core::types::{DistanceMetric, VectorId, VectorRecord};
+use shardlake_core::{
+    config::FanOutPolicy,
+    types::{DistanceMetric, VectorId, VectorRecord},
+};
 use shardlake_index::{
     exact::{exact_search, recall_at_k},
     IndexSearcher,
@@ -34,7 +37,7 @@ pub fn run_benchmark(
     queries: &[VectorRecord],
     corpus: &[VectorRecord],
     k: usize,
-    nprobe: usize,
+    policy: &FanOutPolicy,
     metric: DistanceMetric,
 ) -> BenchmarkReport {
     let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
@@ -45,7 +48,7 @@ pub fn run_benchmark(
         let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
 
         let t0 = Instant::now();
-        let approx = searcher.search(&query.data, k, nprobe).unwrap_or_default();
+        let approx = searcher.search(&query.data, k, policy).unwrap_or_default();
         let elapsed_us = t0.elapsed().as_micros() as f64;
 
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
@@ -71,7 +74,7 @@ pub fn run_benchmark(
     let report = BenchmarkReport {
         num_queries: queries.len(),
         k,
-        nprobe,
+        nprobe: policy.candidate_centroids as usize,
         recall_at_k: mean_recall,
         mean_latency_us: mean_latency,
         p99_latency_us: p99_latency,
