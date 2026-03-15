@@ -127,7 +127,7 @@ launch_worker() {
   local lane="$1"
   local log_file="$2"
 
-  echo "[loop_scheduler] launching worker lane=${lane}"
+  echo "[loop_scheduler] launching worker lane=${lane}" >&2
   (
     cd "$REPO_ROOT"
     COPILOT_BIN="$COPILOT_BIN" ./loop_worker.sh --lane "$lane"
