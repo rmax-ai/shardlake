@@ -19,6 +19,9 @@ pub struct QueryRequest {
     pub vector: Vec<f32>,
     pub k: usize,
     pub nprobe: Option<usize>,
+    /// When `true`, rerank the ANN candidates by exact distance before
+    /// returning results.  Defaults to `false`.
+    pub rerank: Option<bool>,
 }
 
 /// Query response envelope.
@@ -63,10 +66,21 @@ async fn query_handler(
             .into_response();
     }
     let nprobe = req.nprobe.unwrap_or(state.nprobe);
+    let rerank = req.rerank.unwrap_or(false);
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    match tokio::task::spawn_blocking(move || searcher.search(&vector, req.k, nprobe)).await {
+    let k = req.k;
+    match tokio::task::spawn_blocking(move || {
+        let ann_results = searcher.search(&vector, k, nprobe)?;
+        if rerank {
+            searcher.rerank(&vector, ann_results)
+        } else {
+            Ok(ann_results)
+        }
+    })
+    .await
+    {
         Ok(Ok(results)) => Json(QueryResponse {
             results,
             index_version: version,
@@ -225,5 +239,29 @@ mod tests {
             payload["error"],
             "query vector dimensions do not match the index"
         );
+    }
+
+    #[tokio::test]
+    async fn query_route_with_rerank_returns_correct_top_result() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1,"rerank":true}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("query response json");
+        assert_eq!(payload.index_version, "idx-test");
+        assert_eq!(payload.results.len(), 1);
+        // Vector [1.0, 0.0] is ID 1; it must still be the top result after reranking.
+        assert_eq!(payload.results[0].id, VectorId(1));
     }
 }

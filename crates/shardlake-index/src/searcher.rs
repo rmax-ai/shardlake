@@ -1,7 +1,7 @@
 //! Query-time shard searcher with lazy loading and in-memory cache.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -9,13 +9,13 @@ use tracing::{debug, info};
 
 use shardlake_core::{
     error::CoreError,
-    types::{DistanceMetric, SearchResult, ShardId},
+    types::{DistanceMetric, SearchResult, ShardId, VectorId},
 };
 use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    exact::{exact_search, merge_top_k},
+    exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
     shard::ShardIndex,
     IndexError, Result,
@@ -111,6 +111,64 @@ impl IndexSearcher {
         }
 
         Ok(merge_top_k(all_results, k))
+    }
+
+    /// Rerank ANN candidates using exact distance to `query`.
+    ///
+    /// Fetches the raw vectors for each candidate from the in-memory shard
+    /// cache and recomputes exact distances, returning the candidates sorted
+    /// by their true distances.  Call this after [`IndexSearcher::search`] when a more
+    /// accurate final ranking is required.
+    ///
+    /// Candidates whose vectors are not found in the cache (e.g. they were
+    /// returned by a different searcher instance) retain their original score.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard cache lock is poisoned.
+    pub fn rerank(
+        &self,
+        query: &[f32],
+        mut candidates: Vec<SearchResult>,
+    ) -> Result<Vec<SearchResult>> {
+        let metric = self.manifest.distance_metric;
+
+        // Collect candidate IDs so we only clone the vectors we need.
+        let candidate_ids: HashSet<VectorId> = candidates.iter().map(|r| r.id).collect();
+
+        // Build a lookup: VectorId -> raw f32 vector from the shard cache.
+        // The lock is released before we iterate over candidates.
+        let vector_lookup: HashMap<VectorId, Vec<f32>> = {
+            let cache = self.cache.lock().map_err(|_| {
+                IndexError::Other(
+                    "shard cache lock poisoned during rerank: a previous thread panicked \
+                         while holding the cache lock"
+                        .into(),
+                )
+            })?;
+            cache
+                .values()
+                .flat_map(|shard| shard.records.iter())
+                .filter(|record| candidate_ids.contains(&record.id))
+                .map(|record| (record.id, record.data.clone()))
+                .collect()
+        };
+
+        // Re-score each candidate with the exact distance function.
+        for result in &mut candidates {
+            if let Some(raw_vec) = vector_lookup.get(&result.id) {
+                result.score = distance(query, raw_vec, metric);
+            }
+        }
+
+        // Sort ascending (lower score = better) by exact distance.
+        candidates.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(candidates)
     }
 
     /// Load a shard from cache or store.
