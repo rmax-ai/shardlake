@@ -1,7 +1,7 @@
 # CLI Reference
 
 `shardlake` is the single binary that drives the entire pipeline: ingest → build-index →
-publish → serve → benchmark.
+publish → serve → benchmark → eval-ann.
 
 ## Global flags
 
@@ -222,6 +222,78 @@ Printed to stdout:
 ```bash
 # Full precision benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+```
+
+---
+
+## `shardlake eval-ann`
+
+Evaluates ANN quality by comparing the index output against an exact brute-force baseline
+over a sample of the corpus. Reports recall@k, precision@k, and latency metrics in either
+human-readable text or machine-readable JSON (for regression tracking).
+
+### Usage
+
+```
+shardlake [--storage <PATH>] eval-ann [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--alias <STRING>` | string | `latest` | Alias to evaluate |
+| `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve per query |
+| `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
+| `--max-queries <N>` | usize | `0` | Maximum query vectors to evaluate (0 = min(corpus size, 100)) |
+| `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Precision@k | Fraction of retrieved results that are true top-k neighbours |
+| Mean latency | Average per-query ANN search time in microseconds |
+| P99 latency | 99th-percentile per-query ANN search time in microseconds |
+
+### Output
+
+**Text (default):**
+
+```
+=== ANN Evaluation Report ===
+  Queries:           100
+  k:                 10
+  nprobe:            2
+  Recall@10:         0.9400
+  Precision@10:      0.9400
+  Mean latency:      42.3 µs
+  P99  latency:      210.0 µs
+```
+
+**JSON (`--output json`):**
+
+```json
+{
+  "num_queries": 100,
+  "k": 10,
+  "nprobe": 2,
+  "recall_at_k": 0.94,
+  "precision_at_k": 0.94,
+  "mean_latency_us": 42.3,
+  "p99_latency_us": 210.0
+}
+```
+
+### Example
+
+```bash
+# Default text output
+shardlake eval-ann --k 10 --nprobe 4 --max-queries 500
+
+# Machine-readable JSON for CI regression tracking
+shardlake eval-ann --k 10 --nprobe 4 --max-queries 500 --output json
 ```
 
 ---

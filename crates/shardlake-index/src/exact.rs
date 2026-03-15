@@ -85,6 +85,23 @@ pub fn recall_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
     hits as f64 / k as f64
 }
 
+/// Precision@k: fraction of retrieved ids that are in the ground-truth top-k.
+///
+/// Returns `1.0` when `retrieved` is empty, consistent with the convention used by
+/// [`recall_at_k`] for empty ground-truth sets (i.e., the vacuous case is scored
+/// as perfect).  In practice the caller should ensure `retrieved` is non-empty
+/// before interpreting this value.
+pub fn precision_at_k(ground_truth: &[VectorId], retrieved: &[VectorId]) -> f64 {
+    if retrieved.is_empty() {
+        return 1.0;
+    }
+    let hits = retrieved
+        .iter()
+        .filter(|id| ground_truth.contains(id))
+        .count();
+    hits as f64 / retrieved.len() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +142,27 @@ mod tests {
         let ret = vec![VectorId(1), VectorId(2), VectorId(5)];
         let r = recall_at_k(&gt, &ret);
         assert!((r - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_precision_at_k_partial() {
+        let gt = vec![VectorId(1), VectorId(2), VectorId(3)];
+        let ret = vec![VectorId(1), VectorId(4), VectorId(5)];
+        let p = precision_at_k(&gt, &ret);
+        assert!((p - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_precision_at_k_perfect() {
+        let gt = vec![VectorId(1), VectorId(2)];
+        let ret = vec![VectorId(2), VectorId(1)];
+        assert_eq!(precision_at_k(&gt, &ret), 1.0);
+    }
+
+    #[test]
+    fn test_precision_at_k_empty_retrieved() {
+        let gt = vec![VectorId(1)];
+        assert_eq!(precision_at_k(&gt, &[]), 1.0);
     }
 
     #[test]
