@@ -63,6 +63,50 @@ trade-off:
 A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 `shardlake benchmark` and increase `nprobe` until the recall target is met.
 
+## Storage backends
+
+Shardlake uses the `shardlake_storage::ObjectStore` trait to abstract artifact
+persistence.  All storage-key layout helpers live in
+[`shardlake_storage::paths`](../crates/shardlake-storage/src/paths.rs) and must be
+used instead of hand-constructed strings (see *Artifact storage layout* in
+[`data-formats.md`](data-formats.md)).
+
+### Local filesystem backend (`LocalObjectStore`)
+
+The default, production-ready backend. All keys map to paths under the configured
+`--storage` root.
+
+Today, the CLI and server always construct `LocalObjectStore` at runtime; there is
+not yet a user-facing flag or config setting to select a different backend.
+
+### S3-compatible backend (`S3CompatibleBackend`) — **stub / not yet functional**
+
+> **⚠ This backend is a compile-time stub only.**  Every operation returns an error.
+> It exists so that downstream code can target the `ObjectStore` abstraction and compile;
+> real S3 network I/O will be added in a follow-up PR.
+
+`S3Config` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `endpoint` | string | HTTP(S) endpoint URL, e.g. `https://s3.amazonaws.com` or a MinIO base URL such as `http://localhost:9000`. |
+| `bucket` | string | Target bucket name. |
+| `region` | string | AWS-style region identifier (e.g. `us-east-1`). For non-AWS S3-compatible services this may be any non-empty string. |
+| `access_key_id` | string | AWS access key ID (or equivalent credential). **Do not log this value.** |
+| `secret_access_key` | string | AWS secret access key (or equivalent credential). **Do not log this value.** |
+
+**Non-goals for the current stub** (will be addressed in follow-up work):
+
+- Actual HTTP requests to any S3-compatible service
+- Authentication / credential refresh
+- Multipart upload for large objects
+- Presigned URL generation
+- Streaming / range-request `get`
+- List pagination beyond a single response
+- Server-side encryption (SSE)
+- Object versioning
+- Retry / back-off logic
+
 ## Query-time centroid shard routing
 
 `IndexSearcher` implements centroid-based routing rather than a naive fan-out to every
