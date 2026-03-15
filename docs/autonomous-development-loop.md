@@ -230,7 +230,7 @@ Protocol rules:
 - `inspect` reads the remote ref and reports whether the lease is `active`, `expired`, or `missing`
 - acquire and renew are compare-and-swap updates because they only succeed when the observed ref tip is still current at push time
 
-When a worker pushes a commit to the claimed PR branch, it must immediately refresh the PR head SHA from GitHub and renew the lease with that new head SHA before any later durable GitHub write such as labels, comments, PR state changes, or merge attempts.
+When a worker pushes a commit to the claimed PR branch, it must immediately refresh the PR head SHA from GitHub with an exact `headRefOid` read, verify that SHA matches `git rev-parse HEAD` in the dedicated PR worktree, and renew the lease with that same SHA before any later durable GitHub write such as labels, comments, PR state changes, or merge attempts.
 
 ### Control blocks
 

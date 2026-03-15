@@ -58,8 +58,10 @@ Requirements:
    - `cargo doc --no-deps`
 12. If changes were made:
    - commit and push only the changes needed for this PR
-   - immediately refresh the PR head SHA with `gh pr view <pr-number> --json headRefOid`
+   - immediately refresh the PR head SHA with the exact command `gh pr view <pr-number> --json headRefOid --jq .headRefOid`
+   - confirm that refreshed SHA exactly matches `git rev-parse HEAD` in the dedicated PR worktree; if it does not, stop and report both SHAs
    - renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id> --head-sha <new-head-sha>` so the lease tracks the pushed commit
+   - inspect the lease again and confirm its recorded expected head SHA exactly matches that same refreshed SHA before any later durable write
    - treat that renewed lease metadata and refreshed PR head SHA as the new expected head SHA for all remaining checks and writes
    - stop immediately if the push, head refresh, or lease renewal fails or disagrees about the new head SHA
 13. Before changing labels or leaving a durable summary comment, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
@@ -82,7 +84,7 @@ Worktree guidance:
 - Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
 
-Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run pushes a new commit, renew again with `--head-sha <new-head-sha>` before any later PR comment, label, or other durable GitHub write.
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run pushes a new commit, refresh the new head with `gh pr view <pr-number> --json headRefOid --jq .headRefOid`, verify it matches `git rev-parse HEAD`, then renew again with `--head-sha <new-head-sha>` before any later PR comment, label, or other durable GitHub write.
 
 Output format:
 

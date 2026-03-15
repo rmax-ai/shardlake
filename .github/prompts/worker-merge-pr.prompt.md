@@ -68,7 +68,7 @@ Worktree guidance:
 - Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
 
-Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run ever pushes a new commit before merging, renew again with `--head-sha <new-head-sha>` before any later merge attempt or other durable GitHub write.
+Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run ever pushes a new commit before merging, refresh the new head with `gh pr view <pr-number> --json headRefOid --jq .headRefOid`, verify it matches `git rev-parse HEAD`, then renew again with `--head-sha <new-head-sha>` before any later merge attempt or other durable GitHub write.
 
 Output format:
 
