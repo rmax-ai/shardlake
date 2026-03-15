@@ -9,6 +9,7 @@ COPILOT_BIN="${COPILOT_BIN:-copilot}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
 LOG_DIR="$REPO_ROOT/tmp/loop_iterations"
+ITERATION_WORKTREE_DIR="${ITERATION_WORKTREE_DIR:-$REPO_ROOT/tmp/iteration_worktrees}"
 PRIMARY_REMOTE="${PRIMARY_REMOTE:-origin}"
 PRIMARY_BRANCH="${PRIMARY_BRANCH:-main}"
 GH_PAGER_VALUE="${GH_PAGER:-cat}"
@@ -94,10 +95,16 @@ normalize_bool() {
 run_prompt() {
   local prompt_text="$1"
   local output_file="$2"
+  local iteration_worktree="$3"
   local command_status=0
 
   set +e
-  "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "$prompt_text" | tee "$output_file"
+  (
+    cd "$iteration_worktree"
+    export SHARDLAKE_PRIMARY_ROOT="$REPO_ROOT"
+    export SHARDLAKE_ITERATION_WORKTREE="$iteration_worktree"
+    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "$prompt_text"
+  ) | tee "$output_file"
   command_status=${PIPESTATUS[0]}
   set -e
 
@@ -119,10 +126,8 @@ ensure_clean_primary_checkout() {
   fi
 }
 
-sync_primary_checkout() {
+prepare_primary_checkout() {
   local branch
-  local local_head
-  local remote_head
 
   branch="$(current_branch)"
   if [[ "$branch" != "$PRIMARY_BRANCH" ]]; then
@@ -133,14 +138,51 @@ sync_primary_checkout() {
   ensure_clean_primary_checkout
 
   git fetch "$PRIMARY_REMOTE" "$PRIMARY_BRANCH"
-  git pull --ff-only "$PRIMARY_REMOTE" "$PRIMARY_BRANCH"
-
-  local_head="$(current_head)"
-  remote_head="$(git rev-parse "${PRIMARY_REMOTE}/${PRIMARY_BRANCH}")"
-  if [[ "$local_head" != "$remote_head" ]]; then
-    echo "[loop_iteration] primary checkout is not synchronized with ${PRIMARY_REMOTE}/${PRIMARY_BRANCH}" >&2
+  if ! git rev-parse "${PRIMARY_REMOTE}/${PRIMARY_BRANCH}" >/dev/null 2>&1; then
+    echo "[loop_iteration] unable to resolve ${PRIMARY_REMOTE}/${PRIMARY_BRANCH} after fetch" >&2
     exit 1
   fi
+}
+
+create_iteration_worktree() {
+  local iteration="$1"
+  local timestamp="$2"
+  local worktree_path="$ITERATION_WORKTREE_DIR/iteration_${iteration}_${timestamp}"
+  local remote_head
+  local worktree_head
+
+  mkdir -p "$ITERATION_WORKTREE_DIR"
+
+  if [[ -e "$worktree_path" ]]; then
+    git worktree remove --force "$worktree_path" >/dev/null 2>&1 || true
+    rm -rf "$worktree_path"
+  fi
+
+  git worktree add --detach "$worktree_path" "${PRIMARY_REMOTE}/${PRIMARY_BRANCH}" >/dev/null
+
+  remote_head="$(git rev-parse "${PRIMARY_REMOTE}/${PRIMARY_BRANCH}")"
+  worktree_head="$(git -C "$worktree_path" rev-parse HEAD)"
+  if [[ "$worktree_head" != "$remote_head" ]]; then
+    echo "[loop_iteration] iteration worktree HEAD ${worktree_head} did not match ${PRIMARY_REMOTE}/${PRIMARY_BRANCH} ${remote_head}" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$worktree_path"
+}
+
+cleanup_iteration_worktree() {
+  local worktree_path="$1"
+
+  if [[ -z "$worktree_path" || ! -d "$worktree_path" ]]; then
+    return
+  fi
+
+  if [[ -n "$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)" ]]; then
+    echo "[loop_iteration] preserving dirty iteration worktree at ${worktree_path}" >&2
+    return
+  fi
+
+  git worktree remove --force "$worktree_path"
 }
 
 assert_primary_checkout_unchanged() {
@@ -296,23 +338,26 @@ export NO_COLOR="$NO_COLOR_VALUE"
 export CLICOLOR="$CLICOLOR_VALUE"
 
 for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
-  sync_primary_checkout
+  prepare_primary_checkout
   primary_branch_before="$(current_branch)"
   primary_head_before="$(current_head)"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   log_file="$LOG_DIR/iteration_${iteration}_${timestamp}.log"
   json_file="$LOG_DIR/iteration_${iteration}_${timestamp}.json"
+  iteration_worktree="$(create_iteration_worktree "$iteration" "$timestamp")"
 
   echo "[loop_iteration] starting iteration ${iteration}/${MAX_ITERATIONS}"
   echo "[loop_iteration] log: $log_file"
+  echo "[loop_iteration] iteration worktree: $iteration_worktree"
 
-  if run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file"; then
+  if run_prompt "follow instructions in ${PROMPT_PATH}" "$log_file" "$iteration_worktree"; then
     command_status=0
   else
     command_status=$?
   fi
 
   if [[ $command_status -ne 0 ]]; then
+    cleanup_iteration_worktree "$iteration_worktree"
     echo "[loop_iteration] copilot command failed with status $command_status" >&2
     exit "$command_status"
   fi
@@ -343,6 +388,7 @@ for ((iteration = 1; iteration <= MAX_ITERATIONS; iteration++)); do
   write_iteration_json "$iteration" "$timestamp" "$log_file" "$json_file"
 
   assert_primary_checkout_unchanged "$primary_branch_before" "$primary_head_before"
+  cleanup_iteration_worktree "$iteration_worktree"
 
   echo "[loop_iteration] prs_processed=$prs_processed waiting_on_other_agents=$waiting sleep_next=$sleep_next"
   echo "[loop_iteration] json: $json_file"

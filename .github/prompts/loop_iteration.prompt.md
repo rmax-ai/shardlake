@@ -9,7 +9,8 @@ This prompt is the orchestrator. It should call the stage-specific prompts in or
 Execution constraints:
 
 - Export `GH_PAGER=cat`, `NO_COLOR=1`, and `CLICOLOR=0` before any `gh` command.
-- Start each iteration from the repository's primary checkout on `main`, synced with `origin/main` via pull only.
+- The operator's current checkout is safety state only: it must stay on `main`, remain clean, and must not be used for iteration work or PR branch commands.
+- Before every iteration, create a fresh dedicated iteration worktree from `origin/main` and run the orchestrator from inside that worktree.
 - Never push commits from the repository's primary checkout on `main`.
 - Do not inspect `gh --help`, GraphQL schema metadata, or unrelated prompts during normal loop execution.
 - Load a stage-specific prompt only when the workflow reaches that stage.
@@ -72,8 +73,9 @@ Execution guidance:
 - Collect and summarize the outputs from each stage prompt.
 - After drafting the full iteration report, invoke a subagent that follows `.github/prompts/loop_control.prompt.md`, provide that subagent the completed report text from this iteration, and use its response as the final machine-readable control block.
 - If a merge-conflicted PR needs the `needs-human` label, ensure the label exists before adding it.
-- Treat the repository's primary checkout as read-only operational state on `main`: it may pull from `origin/main` at the start of an iteration, but must not be left on another branch or used for PR branch commits.
-- Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout.
+- Treat the repository's primary checkout as read-only operational state on `main`: it may be fetched for updated refs, but it must not be used for the iteration run itself or for PR branch commands.
+- Any run of `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, or `merge-ready-pr.prompt.md` must use a dedicated git worktree for the target PR rather than the repository's primary checkout or the iteration worktree.
+- Use `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>` to create the PR worktree under `$SHARDLAKE_PRIMARY_ROOT/tmp/pr_worktrees/`, and do not fall back to the current checkout if that helper fails.
 - If a stage cannot act safely, record the exact reason and continue to later safe stages.
 
 Required final report:
