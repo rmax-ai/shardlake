@@ -22,7 +22,12 @@ use shardlake_core::types::ShardId;
 use shardlake_manifest::{DatasetManifest, Manifest};
 use shardlake_storage::{ObjectStore, StorageError};
 
-use crate::{artifact_fingerprint, ivf::IvfQuantizer, shard::ShardIndex};
+use crate::{
+    artifact_fingerprint,
+    ivf::IvfQuantizer,
+    shard::{PqShard, ShardIndex},
+    PQ8_CODEC,
+};
 
 /// A single structured validation failure returned by the integrity engine.
 ///
@@ -166,6 +171,20 @@ pub fn validate_index(manifest: &Manifest, store: &dyn ObjectStore) -> Validatio
         check_exists(key, &mut report, store);
     }
 
+    // 2b. For PQ indexes, verify that the codebook artifact exists.
+    if manifest.compression.enabled && manifest.compression.codec == PQ8_CODEC {
+        if let Some(cb_key) = &manifest.compression.codebook_key {
+            check_exists(cb_key, &mut report, store);
+        } else {
+            report.failures.push(ValidationFailure::ManifestInvalid(
+                "compression.codec is \"pq8\" but codebook_key is absent".into(),
+            ));
+        }
+    }
+
+    // 3. Per-shard checks.
+    let pq_encoded = manifest.compression.enabled && manifest.compression.codec == PQ8_CODEC;
+
     if let Some(key) = manifest.coarse_quantizer_key.as_deref() {
         match store.get(key) {
             Err(StorageError::NotFound(_)) => {
@@ -285,73 +304,162 @@ pub fn validate_index(manifest: &Manifest, store: &dyn ObjectStore) -> Validatio
                         });
                 }
 
-                // Shard binary integrity (dimension + vector count).
-                match ShardIndex::from_bytes(&bytes) {
-                    Err(e) => {
-                        report.failures.push(ValidationFailure::ShardParseError {
-                            key: key.to_owned(),
-                            message: e.to_string(),
-                        });
-                    }
-                    Ok(shard_index) => {
-                        let actual_dims = shard_index.dims as u32;
-                        if actual_dims != manifest.dims {
-                            report
-                                .failures
-                                .push(ValidationFailure::ShardDimensionMismatch {
-                                    shard_id: shard.shard_id,
-                                    expected: manifest.dims,
-                                    actual: actual_dims,
-                                });
-                        }
-
-                        let actual_count = shard_index.records.len() as u64;
-                        if actual_count != shard.vector_count {
-                            report
-                                .failures
-                                .push(ValidationFailure::ShardVectorCountMismatch {
-                                    shard_id: shard.shard_id,
-                                    expected: shard.vector_count,
-                                    actual: actual_count,
-                                });
-                        }
-
-                        if !shard.centroid.is_empty() {
-                            let actual = shard_index.centroids.first();
-                            let (actual_dims, reason) = match actual {
-                                None => (0, "shard has no centroids".to_string()),
-                                Some(centroid) if centroid.len() != shard.centroid.len() => (
-                                    centroid.len(),
-                                    "centroid dimensionality mismatch".to_string(),
-                                ),
-                                Some(centroid)
-                                    if !centroid
-                                        .iter()
-                                        .zip(shard.centroid.iter())
-                                        .all(|(a, b)| a.to_bits() == b.to_bits()) =>
-                                {
-                                    (centroid.len(), "centroid values differ".to_string())
-                                }
-                                Some(_) => (shard.centroid.len(), String::new()),
-                            };
-                            if !reason.is_empty() {
-                                report
-                                    .failures
-                                    .push(ValidationFailure::ShardCentroidMismatch {
-                                        shard_id: shard.shard_id,
-                                        expected_dims: shard.centroid.len(),
-                                        actual_dims,
-                                        reason,
-                                    });
-                            }
-                        }
-                    }
+                if pq_encoded {
+                    check_pq_shard(&bytes, shard, manifest, &mut report, key);
+                } else {
+                    check_raw_shard(&bytes, shard, manifest, &mut report, key);
                 }
             }
         }
     }
 
     report
+}
+
+// ── per-shard integrity helpers ───────────────────────────────────────────────
+
+/// Validate a format-version-1 (raw vector) shard artifact.
+fn check_raw_shard(
+    bytes: &[u8],
+    shard: &shardlake_manifest::ShardDef,
+    manifest: &Manifest,
+    report: &mut ValidationReport,
+    key: &str,
+) {
+    match ShardIndex::from_bytes(bytes) {
+        Err(e) => {
+            report.failures.push(ValidationFailure::ShardParseError {
+                key: key.to_owned(),
+                message: e.to_string(),
+            });
+        }
+        Ok(shard_index) => {
+            let actual_dims = shard_index.dims as u32;
+            if actual_dims != manifest.dims {
+                report
+                    .failures
+                    .push(ValidationFailure::ShardDimensionMismatch {
+                        shard_id: shard.shard_id,
+                        expected: manifest.dims,
+                        actual: actual_dims,
+                    });
+            }
+
+            let actual_count = shard_index.records.len() as u64;
+            if actual_count != shard.vector_count {
+                report
+                    .failures
+                    .push(ValidationFailure::ShardVectorCountMismatch {
+                        shard_id: shard.shard_id,
+                        expected: shard.vector_count,
+                        actual: actual_count,
+                    });
+            }
+
+            check_centroid_match(shard, &shard_index.centroids, report);
+        }
+    }
+}
+
+/// Validate a format-version-2 (PQ-encoded) shard artifact.
+fn check_pq_shard(
+    bytes: &[u8],
+    shard: &shardlake_manifest::ShardDef,
+    manifest: &Manifest,
+    report: &mut ValidationReport,
+    key: &str,
+) {
+    match PqShard::from_bytes(bytes) {
+        Err(e) => {
+            report.failures.push(ValidationFailure::ShardParseError {
+                key: key.to_owned(),
+                message: e.to_string(),
+            });
+        }
+        Ok(pq_shard) => {
+            let actual_dims = pq_shard.dims as u32;
+            if actual_dims != manifest.dims {
+                report
+                    .failures
+                    .push(ValidationFailure::ShardDimensionMismatch {
+                        shard_id: shard.shard_id,
+                        expected: manifest.dims,
+                        actual: actual_dims,
+                    });
+            }
+
+            let actual_count = pq_shard.entries.len() as u64;
+            if actual_count != shard.vector_count {
+                report
+                    .failures
+                    .push(ValidationFailure::ShardVectorCountMismatch {
+                        shard_id: shard.shard_id,
+                        expected: shard.vector_count,
+                        actual: actual_count,
+                    });
+            }
+
+            let expected_pq_m = manifest.compression.pq_num_subspaces as usize;
+            if pq_shard.pq_m != expected_pq_m {
+                report
+                    .failures
+                    .push(ValidationFailure::ManifestInvalid(format!(
+                        "shard {} pq_m mismatch: expected {}, actual {}",
+                        shard.shard_id, expected_pq_m, pq_shard.pq_m
+                    )));
+            }
+
+            let expected_pq_k = manifest.compression.pq_codebook_size as usize;
+            if pq_shard.pq_k != expected_pq_k {
+                report
+                    .failures
+                    .push(ValidationFailure::ManifestInvalid(format!(
+                        "shard {} pq_k mismatch: expected {}, actual {}",
+                        shard.shard_id, expected_pq_k, pq_shard.pq_k
+                    )));
+            }
+
+            check_centroid_match(shard, &pq_shard.centroids, report);
+        }
+    }
+}
+
+/// Check that the shard's centroid in the manifest matches the binary artifact.
+fn check_centroid_match(
+    shard: &shardlake_manifest::ShardDef,
+    artifact_centroids: &[Vec<f32>],
+    report: &mut ValidationReport,
+) {
+    if shard.centroid.is_empty() {
+        return;
+    }
+    let actual = artifact_centroids.first();
+    let (actual_dims, reason) = match actual {
+        None => (0, "shard has no centroids".to_string()),
+        Some(centroid) if centroid.len() != shard.centroid.len() => (
+            centroid.len(),
+            "centroid dimensionality mismatch".to_string(),
+        ),
+        Some(centroid)
+            if !centroid
+                .iter()
+                .zip(shard.centroid.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()) =>
+        {
+            (centroid.len(), "centroid values differ".to_string())
+        }
+        Some(_) => (shard.centroid.len(), String::new()),
+    };
+    if !reason.is_empty() {
+        report
+            .failures
+            .push(ValidationFailure::ShardCentroidMismatch {
+                shard_id: shard.shard_id,
+                expected_dims: shard.centroid.len(),
+                actual_dims,
+                reason,
+            });
+    }
 }
 
 // ── validate_dataset ──────────────────────────────────────────────────────────

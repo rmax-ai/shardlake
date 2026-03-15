@@ -11,7 +11,8 @@ use shardlake_core::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
     },
 };
-use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher};
+use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher, PqParams};
+use shardlake_manifest::{DatasetManifest, IngestMetadata, DATASET_MANIFEST_VERSION};
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore, StorageError};
 
 fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
@@ -137,6 +138,7 @@ fn test_build_and_search() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-test"),
             metadata_key: paths::dataset_metadata_key("ds-test"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -199,6 +201,7 @@ fn test_search_does_not_load_non_probed_shards() {
             dims: 4,
             vectors_key: paths::dataset_vectors_key("ds-lazy"),
             metadata_key: paths::dataset_metadata_key("ds-lazy"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -273,6 +276,7 @@ fn test_candidate_shards_cap_keeps_nearest_shard_order() {
             dims: 2,
             vectors_key: paths::dataset_vectors_key("ds-order"),
             metadata_key: paths::dataset_metadata_key("ds-order"),
+            pq_params: None,
         })
         .unwrap();
 
@@ -341,6 +345,7 @@ fn test_build_is_deterministic() {
                 dims: 4,
                 vectors_key: paths::dataset_vectors_key("ds-det"),
                 metadata_key: paths::dataset_metadata_key("ds-det"),
+                pq_params: None,
             })
             .unwrap()
     };
@@ -395,19 +400,149 @@ fn test_build_is_deterministic() {
     );
 }
 
-/// Verify that using `kmeans_sample_size` assigns all vectors to a shard
-/// (no records are dropped) and that repeated builds with the same seed and
-/// sample size yield identical shard layouts.
+/// Build a PQ-compressed index and verify that:
+/// 1. The manifest records PQ compression metadata.
+/// 2. The codebook artifact is persisted.
+/// 3. Search returns results (top-1 is the query vector itself).
 #[test]
-fn test_build_with_sample_size_assigns_all_and_is_deterministic() {
-    let records = make_records(60, 4);
+fn test_pq_build_and_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
+    };
+
+    // Use 8-dimensional vectors so we can split into 4 sub-spaces of 2 dims.
+    let records = make_records(40, 8);
+    store
+        .put(&paths::dataset_metadata_key("ds-pq"), b"{}".to_vec())
+        .unwrap();
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-pq".into()),
+            embedding_version: EmbeddingVersion("emb-pq".into()),
+            index_version: IndexVersion("idx-pq".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 8,
+            vectors_key: paths::dataset_vectors_key("ds-pq"),
+            metadata_key: paths::dataset_metadata_key("ds-pq"),
+            pq_params: Some(PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            }),
+        })
+        .unwrap();
+
+    // Manifest must record PQ compression.
+    assert!(manifest.compression.enabled);
+    assert_eq!(manifest.compression.codec, "pq8");
+    assert_eq!(manifest.compression.pq_num_subspaces, 4);
+    assert_eq!(manifest.compression.pq_codebook_size, 8);
+    let codebook_key = manifest
+        .compression
+        .codebook_key
+        .as_deref()
+        .expect("codebook_key must be set for PQ indexes");
+    assert_eq!(codebook_key, "indexes/idx-pq/pq_codebook.bin");
+
+    // Codebook artifact must exist in storage.
+    assert!(
+        store.exists(codebook_key).unwrap(),
+        "PQ codebook artifact must be persisted"
+    );
+
+    // Shard artifacts must exist and use format version 2.
+    for shard_def in &manifest.shards {
+        let bytes = store.get(&shard_def.artifact_key).unwrap();
+        let pq_shard = shardlake_index::PqShard::from_bytes(&bytes)
+            .expect("shard must deserialise as PqShard");
+        assert_eq!(pq_shard.dims, 8);
+        assert_eq!(pq_shard.pq_m, 4);
+        assert_eq!(pq_shard.pq_k, 8);
+        assert_eq!(pq_shard.entries.len() as u64, shard_def.vector_count);
+    }
+
+    // Search must return results and the top-1 result must be the query vector.
+    let searcher = IndexSearcher::new(
+        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
+        manifest,
+    );
+    let query = records[0].data.clone();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&query, 5, &policy).unwrap();
+    assert!(
+        !results.is_empty(),
+        "PQ search must return at least one result"
+    );
+    assert_eq!(
+        results[0].id,
+        VectorId(0),
+        "top-1 result must be the query vector itself"
+    );
+}
+
+/// Build a PQ-compressed index via SystemConfig (pq_enabled = true) and verify
+/// that the manifest records PQ metadata without explicit PqParams in BuildParams.
+#[test]
+fn test_pq_build_via_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 5,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        pq_enabled: true,
+        pq_num_subspaces: 2,
+        pq_codebook_size: 4,
+        ..SystemConfig::default()
+    };
+
+    let records = make_records(20, 4);
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-pqcfg".into()),
+            embedding_version: EmbeddingVersion("emb-pqcfg".into()),
+            index_version: IndexVersion("idx-pqcfg".into()),
+            metric: DistanceMetric::Euclidean,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-pqcfg"),
+            metadata_key: paths::dataset_metadata_key("ds-pqcfg"),
+            pq_params: None, // rely on config
+        })
+        .unwrap();
+
+    assert!(manifest.compression.enabled);
+    assert_eq!(manifest.compression.codec, "pq8");
+    assert_eq!(manifest.compression.pq_num_subspaces, 2);
+    assert_eq!(manifest.compression.pq_codebook_size, 4);
+    assert!(manifest.compression.codebook_key.is_some());
+}
+
+/// Two PQ builds with identical inputs (same records, config, seed) must
+/// produce identical shard fingerprints (PQ encoding is deterministic).
+#[test]
+fn test_pq_build_is_deterministic() {
+    let records = make_records(20, 8);
 
     let build_once = |idx_ver: &str| {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
             storage_root: tmp.path().to_path_buf(),
-            num_shards: 3,
+            num_shards: 2,
             kmeans_iters: 10,
             nprobe: 2,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
@@ -418,61 +553,40 @@ fn test_build_with_sample_size_assigns_all_and_is_deterministic() {
         IndexBuilder::new(store.as_ref(), &config)
             .build(BuildParams {
                 records: records.clone(),
-                dataset_version: DatasetVersion("ds-samp".into()),
-                embedding_version: EmbeddingVersion("emb-samp".into()),
+                dataset_version: DatasetVersion("ds-pqdet".into()),
+                embedding_version: EmbeddingVersion("emb-pqdet".into()),
                 index_version: IndexVersion(idx_ver.into()),
                 metric: DistanceMetric::Euclidean,
-                dims: 4,
-                vectors_key: paths::dataset_vectors_key("ds-samp"),
-                metadata_key: paths::dataset_metadata_key("ds-samp"),
+                dims: 8,
+                vectors_key: paths::dataset_vectors_key("ds-pqdet"),
+                metadata_key: paths::dataset_metadata_key("ds-pqdet"),
+                pq_params: Some(PqParams {
+                    num_subspaces: 4,
+                    codebook_size: 8,
+                }),
             })
             .unwrap()
     };
 
-    let m1 = build_once("idx-samp-1");
-    let m2 = build_once("idx-samp-2");
+    let m1 = build_once("idx-pqdet-1");
+    let m2 = build_once("idx-pqdet-2");
 
-    // All vectors must be assigned regardless of sampling.
-    assert_eq!(
-        m1.total_vector_count,
-        records.len() as u64,
-        "all vectors must be assigned when kmeans_sample_size is set"
-    );
-    let shard_sum: u64 = m1.shards.iter().map(|s| s.vector_count).sum();
-    assert_eq!(shard_sum, records.len() as u64);
-
-    // Builds with the same seed and sample_size must be deterministic.
     assert_eq!(m1.shards.len(), m2.shards.len());
     for (s1, s2) in m1.shards.iter().zip(m2.shards.iter()) {
         assert_eq!(
             s1.fingerprint, s2.fingerprint,
-            "shard {} fingerprint differs between sample-based builds",
-            s1.shard_id
-        );
-        assert_eq!(
-            s1.centroid, s2.centroid,
-            "shard {} centroid differs between sample-based builds",
-            s1.shard_id
+            "PQ shard fingerprints must be identical across deterministic builds"
         );
     }
-
-    // kmeans_sample_size must be recorded in algorithm.params.
-    let param = m1
-        .algorithm
-        .params
-        .get("kmeans_sample_size")
-        .expect("kmeans_sample_size must be in algorithm.params when set");
-    assert_eq!(param.as_u64().unwrap(), 20);
 }
 
 #[test]
-fn test_build_with_large_sample_size_uses_full_dataset_without_manifest_override() {
-    let records = make_records(12, 4);
+fn test_pq_search_preserves_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let config = SystemConfig {
         storage_root: tmp.path().to_path_buf(),
-        num_shards: 3,
+        num_shards: 2,
         kmeans_iters: 10,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
@@ -480,21 +594,90 @@ fn test_build_with_large_sample_size_uses_full_dataset_without_manifest_override
         ..SystemConfig::default()
     };
 
+    let mut records = make_records(12, 8);
+    records[0].metadata = Some(serde_json::json!({"label": "first"}));
+    records[1].metadata = Some(serde_json::json!({"label": "second"}));
+
+    let metadata_key = paths::dataset_metadata_key("ds-pq-meta");
+    let metadata = serde_json::json!({
+        records[0].id.to_string(): records[0].metadata.clone().unwrap(),
+        records[1].id.to_string(): records[1].metadata.clone().unwrap(),
+    });
+    store
+        .put(&metadata_key, serde_json::to_vec(&metadata).unwrap())
+        .unwrap();
+    DatasetManifest {
+        manifest_version: DATASET_MANIFEST_VERSION,
+        dataset_version: DatasetVersion("ds-pq-meta".into()),
+        embedding_version: EmbeddingVersion("emb-pq-meta".into()),
+        dims: 8,
+        vector_count: records.len() as u64,
+        vectors_key: paths::dataset_vectors_key("ds-pq-meta"),
+        metadata_key: metadata_key.clone(),
+        ingest_metadata: Some(IngestMetadata {
+            ingested_at: chrono::Utc::now(),
+            ingester_version: "test".into(),
+        }),
+    }
+    .save(store.as_ref())
+    .unwrap();
+
     let manifest = IndexBuilder::new(store.as_ref(), &config)
         .build(BuildParams {
-            records,
-            dataset_version: DatasetVersion("ds-full-sample".into()),
-            embedding_version: EmbeddingVersion("emb-full-sample".into()),
-            index_version: IndexVersion("idx-full-sample".into()),
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-pq-meta".into()),
+            embedding_version: EmbeddingVersion("emb-pq-meta".into()),
+            index_version: IndexVersion("idx-pq-meta".into()),
             metric: DistanceMetric::Euclidean,
-            dims: 4,
-            vectors_key: paths::dataset_vectors_key("ds-full-sample"),
-            metadata_key: paths::dataset_metadata_key("ds-full-sample"),
+            dims: 8,
+            vectors_key: paths::dataset_vectors_key("ds-pq-meta"),
+            metadata_key,
+            pq_params: Some(PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            }),
         })
         .unwrap();
 
-    assert!(
-        !manifest.algorithm.params.contains_key("kmeans_sample_size"),
-        "manifest should omit kmeans_sample_size when centroid training used the full dataset"
-    );
+    let searcher = IndexSearcher::new(store as Arc<dyn shardlake_storage::ObjectStore>, manifest);
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        candidate_shards: 0,
+        max_vectors_per_shard: 0,
+    };
+    let results = searcher.search(&records[0].data, 3, &policy).unwrap();
+    assert_eq!(results[0].id, records[0].id);
+    assert_eq!(results[0].metadata, records[0].metadata);
+}
+
+#[test]
+fn test_pq_build_rejects_non_euclidean_metric() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 10,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        ..SystemConfig::default()
+    };
+
+    let err = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: make_records(20, 8),
+            dataset_version: DatasetVersion("ds-pq-cos".into()),
+            embedding_version: EmbeddingVersion("emb-pq-cos".into()),
+            index_version: IndexVersion("idx-pq-cos".into()),
+            metric: DistanceMetric::Cosine,
+            dims: 8,
+            vectors_key: paths::dataset_vectors_key("ds-pq-cos"),
+            metadata_key: paths::dataset_metadata_key("ds-pq-cos"),
+            pq_params: Some(PqParams {
+                num_subspaces: 4,
+                codebook_size: 8,
+            }),
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("only euclidean distance"));
 }

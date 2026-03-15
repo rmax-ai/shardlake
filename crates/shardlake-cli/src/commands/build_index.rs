@@ -76,6 +76,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         candidate_shards: 0,
         max_vectors_per_shard: 0,
         kmeans_sample_size: args.kmeans_sample_size,
+        ..SystemConfig::default()
     };
 
     let dm = match DatasetManifest::load(&store, &dataset_ver) {
@@ -121,6 +122,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         dims,
         vectors_key,
         metadata_key,
+        pq_params: None,
     })?;
 
     println!(

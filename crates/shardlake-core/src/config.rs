@@ -108,6 +108,23 @@ pub struct SystemConfig {
     /// See [`FanOutPolicy::max_vectors_per_shard`] for details.
     #[serde(default)]
     pub max_vectors_per_shard: u32,
+    /// Enable product quantisation (PQ) compression for shard artifacts.
+    ///
+    /// When `true`, the builder trains a PQ codebook on the full dataset,
+    /// encodes all vectors as PQ codes, and stores them in format-version-2
+    /// `.sidx` artifacts.  The codebook is persisted as a separate artifact
+    /// alongside the shards.  Defaults to `false`.
+    #[serde(default)]
+    pub pq_enabled: bool,
+    /// Number of PQ sub-spaces (`M`).  Ignored when `pq_enabled` is `false`.
+    ///
+    /// Must be ≥ 1 and must divide `dims` evenly.  Defaults to `8`.
+    #[serde(default = "SystemConfig::default_pq_num_subspaces")]
+    pub pq_num_subspaces: u32,
+    /// PQ codebook size (`K`) per sub-space.  Ignored when `pq_enabled` is
+    /// `false`.  Must be in the range `[1, 256]`.  Defaults to `256`.
+    #[serde(default = "SystemConfig::default_pq_codebook_size")]
+    pub pq_codebook_size: u32,
     /// Maximum number of vectors to use for K-means centroid training.
     ///
     /// When `None` (default), every vector in the dataset is used to train
@@ -143,6 +160,16 @@ impl SystemConfig {
             max_vectors_per_shard: self.max_vectors_per_shard,
         }
     }
+
+    /// Returns the default number of PQ sub-spaces (8).
+    pub fn default_pq_num_subspaces() -> u32 {
+        8
+    }
+
+    /// Returns the default PQ codebook size (256).
+    pub fn default_pq_codebook_size() -> u32 {
+        256
+    }
 }
 
 impl Default for SystemConfig {
@@ -156,6 +183,9 @@ impl Default for SystemConfig {
             candidate_shards: 0,
             max_vectors_per_shard: 0,
             kmeans_sample_size: None,
+            pq_enabled: false,
+            pq_num_subspaces: Self::default_pq_num_subspaces(),
+            pq_codebook_size: Self::default_pq_codebook_size(),
         }
     }
 }

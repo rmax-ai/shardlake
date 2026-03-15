@@ -1,4 +1,4 @@
-.PHONY: all build release test lint clean demo
+.PHONY: all build release test test-shell lint clean demo
 
 BINARY := ./target/debug/shardlake
 DATA_DIR := /tmp/shardlake-demo
@@ -13,7 +13,12 @@ release:
 	cargo build --release
 
 test:
+	$(MAKE) test-shell
 	cargo test
+
+test-shell:
+	./tools/test_loop_scheduler.sh
+	./tools/test_loop_worker.sh
 
 lint:
 	cargo fmt --check
