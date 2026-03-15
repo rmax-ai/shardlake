@@ -209,6 +209,8 @@ The concurrent worker prompts are:
 
 The checked-in worker launcher is `loop_worker.sh`. It resolves the next eligible PR for a single lane with `gh`, acquires a lease, revalidates the claimed PR's current state and head SHA with `gh`, runs the matching worker prompt with explicit inputs, and then releases the lease.
 
+The checked-in scheduler launcher is `loop_scheduler.sh`. It runs one reconcile pass, dispatches `draft-review` and `open-review` workers concurrently when claimable work exists, then runs the `merge` worker as a single lane. It repeats for a bounded number of cycles and respects the reconciler's `SLEEP_NEXT_ITERATION` control signal between cycles.
+
 Each worker prompt assumes a target item has already been claimed. It must:
 
 - operate on exactly one claimed PR
@@ -241,7 +243,7 @@ SLEEP_NEXT_ITERATION: <yes|no>
 END_RECONCILE_CONTROL
 ```
 
-The current checked-in shell driver does not yet orchestrate concurrent workers. It can, however, be pointed at the reconciler prompt via `LOOP_PROMPT_PATH` for supervised experiments while keeping the serialized prompt as the default.
+The concurrent loop now has a thin checked-in shell scheduler in `loop_scheduler.sh`. The serialized driver can still be pointed at the reconciler prompt via `LOOP_PROMPT_PATH` for supervised reconcile-only runs while keeping the serialized prompt as the default.
 
 ## Worktree Isolation Model
 
@@ -401,6 +403,26 @@ For a single repository-wide reconciliation pass without PR execution stages:
 LOOP_PROMPT_PATH=.github/prompts/loop_reconcile.prompt.md MAX_ITERATIONS=1 ./loop_iteration.sh
 ```
 
+### Concurrent scheduler usage
+
+For the full concurrent local loop with shell-level worker dispatch:
+
+```bash
+./loop_scheduler.sh
+```
+
+For one bounded scheduler cycle:
+
+```bash
+./loop_scheduler.sh --once
+```
+
+To disable selected lanes during supervised operation:
+
+```bash
+./loop_scheduler.sh --skip-draft-review --skip-merge
+```
+
 ### Single-pass usage
 
 For one explicit operator-driven pass without a polling wait cycle:
@@ -443,7 +465,7 @@ At the time of writing:
 - `loop_reconcile.prompt.md`, `loop_reconcile_control.prompt.md`, and the `worker-*.prompt.md` files define the concurrent local prompt split
 - `tools/loop_claim.sh` now implements the lease protocol expected by the worker prompts
 - `loop_worker.sh` now implements a lane-aware worker launcher that resolves queue entries, acquires leases, revalidates claimed PRs, and invokes the matching worker prompt with explicit inputs
-- the concurrent path is prompt-complete and lease-protocol-complete, but it is still not scheduler-complete because the repo does not yet include a worker dispatcher that polls queues, claims work, and launches the per-lane workers
+- `loop_scheduler.sh` now implements the thin local scheduler that polls via reconcile cycles and dispatches the per-lane workers
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
 
