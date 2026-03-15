@@ -58,6 +58,8 @@ Requirements:
 15. If the merge fails, report the exact failure clearly and do not guess.
 16. Do not process any other PR.
 
+If any check in this prompt shows the PR has merge conflicts, ensure the `has-merge-conflicts` label exists, add that label to the PR, do not attempt the merge in this run, and report the conflict clearly as the blocker.
+
 If the target PR fails the workflow actor guard rail or its author identity cannot be determined safely, stop immediately, report that it was policy-blocked, and do not prepare a worktree.
 
 Worktree guidance:
@@ -67,6 +69,13 @@ Worktree guidance:
 - Do not pass `--worktree` to `gh pr checkout`; the installed GitHub CLI in this workflow does not support that flag.
 - Use a standard checkout command from inside the prepared worktree, for example: `cd "$WORKTREE_PATH" && gh pr checkout <pr-number> --force`.
 - If the helper cannot prepare the worktree, stop instead of falling back to the current checkout.
+
+Merge-conflict handling:
+
+- When you need to verify whether the PR is merge-conflicted, use `gh pr view <pr-number> --json mergeable` or another `gh` read that exposes the same state.
+- Treat `mergeable` values that indicate conflicts as authoritative for applying `has-merge-conflicts`.
+- Ensure the `has-merge-conflicts` label exists before adding it.
+- Use `gh pr edit <pr-number> --add-label has-merge-conflicts` to record the blocker.
 
 Renew the lease with `tools/loop_claim.sh renew --ref <lease-ref-name> --owner <lease-owner-id>` before long-running quality gates if expiry would otherwise be close. If this run ever pushes a new commit before merging, refresh the new head with `gh pr view <pr-number> --json headRefOid --jq .headRefOid`, verify it matches `git rev-parse HEAD`, then renew again with `--head-sha <new-head-sha>` before any later merge attempt or other durable GitHub write.
 
