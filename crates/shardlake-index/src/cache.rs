@@ -97,8 +97,8 @@ impl ShardCache {
             return;
         }
 
-        // Evict the least-frequently-used shard if the cache is full.
-        if self.capacity > 0 && self.entries.len() >= self.capacity {
+        // Evict the least-frequently-used shard if the cache is at capacity.
+        if self.capacity > 0 && self.entries.len() == self.capacity {
             if let Some(evict_id) = self
                 .entries
                 .keys()

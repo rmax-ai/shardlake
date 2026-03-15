@@ -242,6 +242,16 @@ impl LoadShardStage for CachedShardLoader {
 
         // Step 3: Insert the loaded shard and collect hot-but-uncached shards
         //         to warm (if a prefetch policy is active).
+        //
+        // The threshold is computed once here to avoid the u32→u64 widening
+        // conversion inside the filter closure.
+        let warm_threshold: Option<u64> = self.policy.as_ref().and_then(|p| {
+            if p.enabled {
+                Some(u64::from(p.min_query_count))
+            } else {
+                None
+            }
+        });
         let to_warm: Vec<(ShardId, String)> = {
             let mut cache = self.cache.lock().map_err(|_| {
                 IndexError::Other(
@@ -251,20 +261,17 @@ impl LoadShardStage for CachedShardLoader {
             })?;
             cache.insert(shard_id, Arc::clone(&idx));
 
-            match &self.policy {
-                Some(policy) if policy.enabled => {
-                    let threshold = u64::from(policy.min_query_count);
-                    self.manifest
-                        .shards
-                        .iter()
-                        .filter(|s| {
-                            !cache.contains(s.shard_id)
-                                && cache.access_count(s.shard_id) >= threshold
-                        })
-                        .map(|s| (s.shard_id, s.artifact_key.clone()))
-                        .collect()
-                }
-                _ => Vec::new(),
+            match warm_threshold {
+                Some(threshold) => self
+                    .manifest
+                    .shards
+                    .iter()
+                    .filter(|s| {
+                        !cache.contains(s.shard_id) && cache.access_count(s.shard_id) >= threshold
+                    })
+                    .map(|s| (s.shard_id, s.artifact_key.clone()))
+                    .collect(),
+                None => Vec::new(),
             }
         };
 
