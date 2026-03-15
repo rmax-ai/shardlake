@@ -40,6 +40,7 @@ fn default_config(tmp: &std::path::Path) -> SystemConfig {
         kmeans_iters: 5,
         nprobe: 2,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
     }
 }
 
@@ -134,6 +135,7 @@ fn sample_manifest() -> Manifest {
         }),
         compression: CompressionConfig::default(),
         recall_estimate: None,
+        coarse_quantizer_key: None,
     }
 }
 
@@ -252,6 +254,46 @@ fn test_validate_index_detects_missing_metadata_artifact() {
         missing_keys.contains(&paths::dataset_metadata_key("ds-v1").as_str()),
         "expected metadata_key in missing failures, got: {missing_keys:?}"
     );
+}
+
+/// A missing coarse-quantizer artifact must produce an `ArtifactMissing`
+/// failure for IVF manifests.
+#[test]
+fn test_validate_index_detects_missing_coarse_quantizer_artifact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, manifest) = build_index(tmp.path());
+    store_dataset_artifacts(store.as_ref(), "ds-v1");
+
+    let cq_key = manifest.coarse_quantizer_key.clone().unwrap();
+    store.delete(&cq_key).unwrap();
+
+    let report = validate_index(&manifest, store.as_ref());
+    assert!(!report.is_valid());
+    assert!(report.failures.iter().any(|f| matches!(
+        f,
+        ValidationFailure::ArtifactMissing { key } if key == &cq_key
+    )));
+}
+
+/// Corrupted coarse-quantizer bytes must produce a `CoarseQuantizerInvalid`
+/// failure.
+#[test]
+fn test_validate_index_detects_invalid_coarse_quantizer_artifact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, manifest) = build_index(tmp.path());
+    store_dataset_artifacts(store.as_ref(), "ds-v1");
+
+    let cq_key = manifest.coarse_quantizer_key.clone().unwrap();
+    store
+        .put(&cq_key, b"invalid coarse quantizer".to_vec())
+        .unwrap();
+
+    let report = validate_index(&manifest, store.as_ref());
+    assert!(!report.is_valid());
+    assert!(report.failures.iter().any(|f| matches!(
+        f,
+        ValidationFailure::CoarseQuantizerInvalid { key, .. } if key == &cq_key
+    )));
 }
 
 /// Overwriting a shard with corrupted bytes must produce a `FingerprintMismatch`.
@@ -646,6 +688,13 @@ fn test_validation_failure_display() {
                 actual: 99,
             },
             "shard shard-0001 vector count mismatch: expected 100, actual 99",
+        ),
+        (
+            ValidationFailure::CoarseQuantizerInvalid {
+                key: "indexes/idx-v1/coarse_quantizer.cq".into(),
+                message: "payload length mismatch".into(),
+            },
+            "coarse quantizer invalid for indexes/idx-v1/coarse_quantizer.cq: payload length mismatch",
         ),
     ];
 

@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod exact;
+pub mod ivf;
 pub mod kmeans;
 pub mod pipeline;
 pub mod searcher;
@@ -15,6 +16,7 @@ pub use pipeline::{
     IdentityEmbedder, LoadShardStage, MergeStage, NoopReranker, QueryPipeline,
     QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge,
 };
+pub use ivf::IvfQuantizer;
 pub use searcher::IndexSearcher;
 pub use shard::{ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};

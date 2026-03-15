@@ -17,6 +17,7 @@ individual command flags.
 | `kmeans_iters` | u32 | `20` | Maximum number of K-means iterations. Equivalent to `--kmeans-iters`. |
 | `nprobe` | u32 | `2` | Number of shard centroids to probe during a query. Equivalent to `--nprobe` on both `build-index` (recorded in the manifest) and `serve` (runtime default). |
 | `kmeans_seed` | u64 | `3735928559` (0xdeadbeef) | RNG seed for K-means centroid initialisation. Recorded in `algorithm.params.kmeans_seed` in the manifest. Two builds with the same seed and all other inputs identical produce the same shard layout and fingerprints. Equivalent to `--kmeans-seed`. |
+| `kmeans_sample_size` | u32 or absent | absent (`None`) | Maximum number of vectors used to train K-means centroids. When absent, all vectors are used. When set to a positive `n` smaller than the dataset size, a reproducible random sample of up to `n` vectors is drawn (using `kmeans_seed`) before running K-means. All vectors—including those not in the sample—are still assigned to the nearest centroid after training, so no data is lost. Recorded in `algorithm.params.kmeans_sample_size` in the manifest only when bounded sampling actually occurs. Equivalent to `--kmeans-sample-size`. |
 
 ### `config/default.toml` (reference)
 
@@ -26,6 +27,9 @@ num_shards = 4
 kmeans_iters = 20
 nprobe = 2
 kmeans_seed = 3735928559
+# kmeans_sample_size is absent by default (all vectors used for training).
+# Set to a positive integer to limit centroid training to a sample:
+# kmeans_sample_size = 50000
 ```
 
 ## Choosing `num_shards`
@@ -52,6 +56,29 @@ trade-off:
 
 A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 `shardlake benchmark` and increase `nprobe` until the recall target is met.
+
+## Query-time centroid shard routing
+
+`IndexSearcher` implements centroid-based routing rather than a naive fan-out to every
+shard.  At search time:
+
+1. **Centroid lookup** — each shard's centroid is read directly from the in-memory
+   manifest (`ShardDef.centroid`, present in manifest v2 and later).  No shard bodies
+   are loaded during this phase.
+2. **Top-`nprobe` selection** — the `nprobe` shards whose centroids are nearest to the
+   query vector (by squared Euclidean distance) are selected.
+3. **Lazy shard loading** — only the selected probe shards are deserialized from storage
+   and cached.  Non-selected shards are never touched during a given query.
+4. **Merge** — exact nearest-neighbour search is run within each probed shard and the
+   per-shard top-k results are merged into a single ordered list.
+
+For indexes built from a legacy manifest v1 (no `centroid` field in `ShardDef`) the
+searcher falls back to loading every shard body to extract its centroid on first use.
+Rebuilding the index with the current builder produces a v4 manifest (which still
+includes the `centroid` field introduced in v2), restoring the zero-I/O routing path.
+
+The routing centroids are stored in the manifest and verified by
+`shardlake validate` (check `ShardCentroidMismatch` in the validation report).
 
 ## Logging
 

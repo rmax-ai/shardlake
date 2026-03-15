@@ -24,6 +24,7 @@ The loop is split into three layers.
 `loop_iteration.sh` is the outer control loop. It is responsible for:
 
 - selecting the orchestrator prompt
+- ensuring the operator checkout stays on `main` and clean while each iteration runs from a fresh dedicated worktree created from `origin/main`
 - running one iteration through the Copilot CLI
 - storing iteration logs under `tmp/loop_iterations/`
 - extracting the final numbered report and control block from the iteration log into a JSON sidecar
@@ -31,6 +32,8 @@ The loop is split into three layers.
 - deciding whether to sleep before the next pass
 
 The shell driver is the source of truth for runtime behavior such as iteration count, sleep timing, log naming, and failure handling.
+
+The primary checkout is operational state, not an execution workspace. It must stay on `main`, remain clean, and must not be used for iteration execution or PR branch commands.
 
 ### 2. Orchestrator prompt
 
@@ -147,11 +150,14 @@ The driver reads these variables:
 For each iteration, the shell driver does the following:
 
 1. Creates timestamped log paths under `tmp/loop_iterations/`.
+1. Fetches `origin/main` without changing the operator checkout and creates a fresh detached iteration worktree from that remote ref under `tmp/iteration_worktrees/`.
 1. Runs the orchestrator prompt with:
 
    ```bash
    "$COPILOT_BIN" --model gpt-5.4 --allow-all-tools -p "follow instructions in .github/prompts/loop_iteration.prompt.md"
    ```
+
+   from inside the fresh iteration worktree, with `SHARDLAKE_PRIMARY_ROOT` exported so PR-review stages can create their own dedicated worktrees under the primary repository root.
 
 1. Streams that output to the main iteration log.
 1. If the Copilot command fails, exits immediately with the same status.
@@ -159,9 +165,19 @@ For each iteration, the shell driver does the following:
 1. Extracts `PRS_PROCESSED`, `ALL_WAITING_ON_OTHER_AGENTS`, and `SLEEP_NEXT_ITERATION` from the final control block in the main log.
 1. Normalizes boolean values so only `yes` and `no` are used operationally.
 1. Applies one safety fallback: if `SLEEP_NEXT_ITERATION=no`, `PRS_PROCESSED=0`, and `ALL_WAITING_ON_OTHER_AGENTS=yes`, the shell overrides `SLEEP_NEXT_ITERATION` to `yes`.
+1. Verifies the operator checkout is still on the original `main` HEAD and removes the temporary iteration worktree when it is clean.
 1. Sleeps for `WAIT_SECONDS` before the next pass when the current iteration is not the last allowed iteration and the final sleep decision is `yes`.
 
 The loop does not stop early just because no work was found. It is a polling loop that either runs immediately again or sleeps and tries later, until `MAX_ITERATIONS` is reached or a command fails.
+
+## Worktree Isolation Model
+
+The loop now uses two separate layers of transient worktrees:
+
+1. an iteration worktree created fresh from `origin/main` for every orchestrator run
+2. per-PR worktrees created under `tmp/pr_worktrees/` for draft review, open review, and merge stages
+
+This separation means the operator checkout is never the execution context for either the main loop or PR branch operations.
 
 ## Stage Logic
 
@@ -218,7 +234,7 @@ Its review criteria include:
 - docs coverage is present for user-visible changes
 - obvious implementation gaps are absent
 
-The checked-in prompt closest to this responsibility is `.github/prompts/check-draft-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-draft-pr.prompt.md`.
 
 ### 6. Open PR review
 
@@ -234,7 +250,7 @@ Its review criteria include:
 - docs completeness
 - must-fix versus safe-to-defer follow-up work
 
-The checked-in prompt for this responsibility is `.github/prompts/review-open-pr.prompt.md`.
+The checked-in prompt for this responsibility is `.github/prompts/review-ready-open-pr.prompt.md`.
 
 ### 7. Merge pass
 
@@ -246,13 +262,14 @@ If any stage detects merge conflicts on a PR, the loop should add the `needs-hum
 
 ## Dedicated Worktree Rule
 
-The orchestrator requires any draft-PR or open-PR review that edits branch content to use a dedicated git worktree rather than the repository's main checkout.
+The orchestrator requires any draft-PR review, open-PR review, or merge pass that touches a PR branch to use a dedicated git worktree rather than the repository's main checkout.
 
-This rule exists for three reasons:
+This rule exists for four reasons:
 
 1. it reduces the chance of trampling the operator's main checkout
 2. it isolates per-PR validation runs
 3. it makes cleanup explicit when switching between multiple PRs in one loop cycle
+4. it preserves the invariant that the repository's primary checkout stays on `main` and only pulls from the remote default branch
 
 Human operators should expect review stages to fail or stop early if the local checkout is dirty enough to make branch switching unsafe.
 
@@ -269,7 +286,7 @@ This is important because the next operator, or the next loop pass, needs a conc
 
 ## Loop Control Semantics
 
-The final report contains human-readable loop control, but the shell relies on the separate machine-readable block synthesized by `.github/prompts/loop_control.prompt.md`.
+The final report contains human-readable loop control, and the shell relies on the machine-readable block synthesized by `.github/prompts/loop_control.prompt.md` from inside the main loop iteration session.
 
 The meanings are:
 
@@ -285,6 +302,8 @@ The control prompt is deliberately conservative. If a log is incomplete or ambig
 - `ALL_WAITING_ON_OTHER_AGENTS: no`
 
 That prevents the shell from assuming the loop is safely idle when it is not.
+
+To avoid spending an extra premium request on a second top-level Copilot run, the main loop iteration prompt delegates this synthesis to the loop-control prompt as a subagent and appends the returned block to the same iteration log.
 
 ## How To Run The Loop
 
@@ -322,8 +341,8 @@ Before starting the loop, operators should verify:
 
 - `gh` authentication is valid for this repository
 - the Copilot CLI is installed and can run with tool access
-- the repository checkout is at the expected branch and remote
-- any local changes in the main checkout are intentional
+- the repository checkout is on `main`
+- the main checkout is clean, because the loop will refuse to run otherwise
 - required prompt files in `.github/prompts/` are present and in sync with the orchestrator's stage list
 
 The last point matters because the checked-in orchestrator currently describes some stage-specific prompt filenames that do not exactly match every prompt filename present in `.github/prompts/`.
@@ -337,6 +356,8 @@ At the time of writing:
 - the orchestrator also refers to stage prompt names such as `assign-ready-issues.prompt.md`, `triage-draft-prs.prompt.md`, `triage-open-prs.prompt.md`, `review-ready-draft-pr.prompt.md`, `review-ready-open-pr.prompt.md`, and `merge-ready-pr.prompt.md`
 
 Operators should treat prompt-name drift as an operational risk. Keep the orchestrator and the prompt directory synchronized before relying on unattended loop execution.
+
+The PR-review prompts also assume `tools/prepare_pr_worktree.sh` is present. If that helper is missing or cannot prepare a dedicated worktree, the PR stage should fail rather than fall back to the active checkout.
 
 ## Logs and Auditability
 
