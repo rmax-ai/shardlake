@@ -34,7 +34,13 @@ Requirements:
 Execution guidance:
 
 - Use `gh` as the only supported GitHub access path for this prompt. If a required `gh` read or write fails, stop and report the exact failure instead of switching to other GitHub tools.
-- Retrieve or refresh each candidate issue's author login before assignment when it is not already present in the initial snapshot.
+- Use this fixed verification pipeline:
+  1. Run `gh issue list --state open --label ready-to-implement --limit 200 --json number,title,assignees,labels,author` once to collect candidate issues.
+  2. Run one fixed `gh api graphql` query over the repository's open epic issues to collect each epic's `subIssues` and each child issue's `number`, `state`, and `author { login }`.
+  3. Derive whether each candidate still has a parent epic from that GraphQL sub-issue snapshot instead of from `gh issue view` JSON fields.
+  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints.
+- Retrieve or refresh each candidate issue's author login before assignment only when it is not already present in the initial snapshot.
+- Do not request `parent` from `gh issue view --json`; that field is not supported by the GitHub CLI issue JSON output.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
 
