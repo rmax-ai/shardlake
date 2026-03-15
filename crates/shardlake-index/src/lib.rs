@@ -15,8 +15,9 @@ pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
-    IdentityEmbedder, LoadShardStage, MergeStage, NoopReranker, QueryPipeline,
-    QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge,
+    ExactCandidateStage, ExactRerankStage, IdentityEmbedder, LoadShardStage, MergeStage,
+    NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder, RerankStage, RouteStage,
+    TopKMerge,
 };
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
