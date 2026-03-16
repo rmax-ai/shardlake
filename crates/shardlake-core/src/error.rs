@@ -35,6 +35,9 @@ pub enum CoreError {
     #[error("invalid prefetch policy: {0}")]
     InvalidPrefetchPolicy(String),
 
+    #[error("invalid query config: {0}")]
+    InvalidQueryConfig(String),
+
     #[error("{0}")]
     Other(String),
 }

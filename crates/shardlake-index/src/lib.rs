@@ -14,6 +14,7 @@ pub mod ranking;
 pub mod searcher;
 pub mod shard;
 pub mod validator;
+pub mod worker;
 
 pub use bm25::{tokenize, BM25Params, Bm25Index, BM25_MAGIC};
 pub use builder::{BuildParams, IndexBuilder};
@@ -33,6 +34,10 @@ pub use ranking::{rank_hybrid, HybridRankingPolicy};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};
+pub use worker::{
+    plan_workers, WorkerAssignment, WorkerBuilder, WorkerOutput, WorkerPlan, WorkerPlanParams,
+    WorkerShardOutput,
+};
 
 /// Codec identifier for 8-bit product quantisation.
 ///

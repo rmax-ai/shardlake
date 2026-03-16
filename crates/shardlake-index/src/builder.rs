@@ -1,8 +1,16 @@
 //! Offline index builder: partitions vectors into shards using an IVF coarse
 //! quantizer trained with K-means.
+//!
+//! Shard artifact construction (encoding, serialisation, fingerprinting, and
+//! storage writes) is executed concurrently across shards using Rayon's
+//! work-stealing thread pool. The final [`Manifest`] is assembled from the
+//! collected results in deterministic shard-ID order, so repeated builds with
+//! identical inputs and configuration produce bit-identical shard artifacts and
+//! stable shard definitions even though time-based build metadata still varies.
 
 use chrono::Utc;
 use rand::{seq::SliceRandom, SeedableRng};
+use rayon::prelude::*;
 use tracing::{info, warn};
 
 use shardlake_core::{
@@ -192,7 +200,7 @@ impl<'a> IndexBuilder<'a> {
         } else {
             None
         };
-        let mut non_empty_clusters: Vec<(usize, Vec<VectorRecord>)> = shard_records
+        let non_empty_clusters: Vec<(usize, Vec<VectorRecord>)> = shard_records
             .into_iter()
             .enumerate()
             .filter(|(_, shard_recs)| !shard_recs.is_empty())
@@ -216,57 +224,74 @@ impl<'a> IndexBuilder<'a> {
                 .collect(),
         );
 
-        let mut shard_defs = Vec::new();
+        // Build each shard concurrently.  Each task is independent: it encodes
+        // vectors, serialises the artifact, computes the fingerprint, and
+        // writes the bytes to the object store.  Results are collected in
+        // shard-ID (index) order by rayon's `collect`, preserving determinism.
+        let shard_build_results: Vec<Result<(ShardDef, u64)>> = non_empty_clusters
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, (_, shard_recs))| {
+                let shard_id = ShardId(i as u32);
+                let count = shard_recs.len() as u64;
+                let shard_artifact_key =
+                    shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
+
+                let bytes = if let Some(ref cb) = codebook {
+                    // PQ-encoded shard (format version 2).
+                    let entries: Vec<_> = shard_recs
+                        .iter()
+                        .map(|r| cb.encode(&r.data).map(|codes| (r.id, codes)))
+                        .collect::<Result<Vec<_>>>()?;
+                    let pq_shard = PqShard {
+                        shard_id,
+                        dims,
+                        pq_m: cb.params.num_subspaces,
+                        pq_k: cb.params.codebook_size,
+                        centroids: vec![quantizer.centroids()[i].clone()],
+                        entries,
+                    };
+                    pq_shard.to_bytes()?
+                } else {
+                    // Raw-vector shard (format version 1).
+                    let idx = ShardIndex {
+                        shard_id,
+                        dims,
+                        centroids: vec![quantizer.centroids()[i].clone()],
+                        records: shard_recs,
+                    };
+                    idx.to_bytes()?
+                };
+
+                let sha = crate::artifact_fingerprint(&bytes);
+                self.store.put(&shard_artifact_key, bytes)?;
+                info!(shard = %shard_id, vectors = count, key = %shard_artifact_key, "Shard written");
+                let file_location = shard_artifact_key.clone();
+                Ok((
+                    ShardDef {
+                        shard_id,
+                        artifact_key: shard_artifact_key,
+                        vector_count: count,
+                        fingerprint: sha,
+                        centroid: quantizer.centroids()[i].clone(),
+                        routing: Some(RoutingMetadata {
+                            centroid_id: format!("shard-{:04}", shard_id.0),
+                            index_type: "flat".into(),
+                            file_location,
+                        }),
+                    },
+                    count,
+                ))
+            })
+            .collect();
+
+        // Propagate the first error, if any, then unzip the successful results.
+        let mut shard_defs = Vec::with_capacity(shard_build_results.len());
         let mut actual_total: u64 = 0;
-        for (i, (_, shard_recs)) in non_empty_clusters.drain(..).enumerate() {
-            let shard_id = ShardId(i as u32);
-            let count = shard_recs.len() as u64;
-            let shard_artifact_key =
-                shardlake_storage::paths::index_shard_key(&index_version.0, shard_id.0);
-
-            let bytes = if let Some(ref cb) = codebook {
-                // PQ-encoded shard (format version 2).
-                let entries: Vec<_> = shard_recs
-                    .iter()
-                    .map(|r| cb.encode(&r.data).map(|codes| (r.id, codes)))
-                    .collect::<Result<Vec<_>>>()?;
-                let pq_shard = PqShard {
-                    shard_id,
-                    dims,
-                    pq_m: cb.params.num_subspaces,
-                    pq_k: cb.params.codebook_size,
-                    centroids: vec![quantizer.centroids()[i].clone()],
-                    entries,
-                };
-                pq_shard.to_bytes()?
-            } else {
-                // Raw-vector shard (format version 1).
-                let idx = ShardIndex {
-                    shard_id,
-                    dims,
-                    centroids: vec![quantizer.centroids()[i].clone()],
-                    records: shard_recs,
-                };
-                idx.to_bytes()?
-            };
-
-            let sha = crate::artifact_fingerprint(&bytes);
-            self.store.put(&shard_artifact_key, bytes)?;
-            info!(shard = %shard_id, vectors = count, key = %shard_artifact_key, "Shard written");
+        for result in shard_build_results {
+            let (def, count) = result?;
             actual_total += count;
-            let file_location = shard_artifact_key.clone();
-            shard_defs.push(ShardDef {
-                shard_id,
-                artifact_key: shard_artifact_key,
-                vector_count: count,
-                fingerprint: sha,
-                centroid: quantizer.centroids()[i].clone(),
-                routing: Some(RoutingMetadata {
-                    centroid_id: format!("shard-{:04}", shard_id.0),
-                    index_type: "flat".into(),
-                    file_location,
-                }),
-            });
+            shard_defs.push(def);
         }
 
         // Persist the coarse quantizer as a separate artifact.

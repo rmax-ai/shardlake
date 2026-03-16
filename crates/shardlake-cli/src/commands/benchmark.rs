@@ -10,8 +10,8 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use tracing::info;
 
+use shardlake_bench::WorkloadMode;
 use shardlake_core::{config::FanOutPolicy, types::VectorRecord};
-use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
 
@@ -22,6 +22,27 @@ pub enum OutputFormat {
     Text,
     /// Machine-readable JSON object, suitable for regression tracking.
     Json,
+}
+
+/// Workload simulation mode for the benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WorkloadArg {
+    /// Cold workload: fresh shard cache before every query.
+    Cold,
+    /// Warm workload: all shards pre-loaded before the timed run.
+    Warm,
+    /// Mixed workload: cache warms naturally during the run (default).
+    Mixed,
+}
+
+impl From<WorkloadArg> for WorkloadMode {
+    fn from(arg: WorkloadArg) -> Self {
+        match arg {
+            WorkloadArg::Cold => WorkloadMode::Cold,
+            WorkloadArg::Warm => WorkloadMode::Warm,
+            WorkloadArg::Mixed => WorkloadMode::Mixed,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -49,6 +70,13 @@ pub struct BenchmarkArgs {
     /// Output format: `text` (default) or `json`.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
+    /// Workload simulation mode: `cold`, `warm`, or `mixed` (default).
+    ///
+    /// `cold`  – creates a fresh cache before every query to simulate a cold start.
+    /// `warm`  – pre-warms all shards before the timed run.
+    /// `mixed` – no special treatment; cache warms naturally during the run.
+    #[arg(long, value_enum, default_value_t = WorkloadArg::Mixed)]
+    pub workload: WorkloadArg,
 }
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
@@ -81,39 +109,51 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         args.max_queries.min(corpus.len())
     };
     let queries: Vec<VectorRecord> = corpus[..limit].to_vec();
+    let workload: WorkloadMode = args.workload.into();
     info!(
         n_queries = queries.len(),
         k = args.k,
         candidate_centroids = policy.candidate_centroids,
         candidate_shards = policy.candidate_shards,
         max_vectors_per_shard = policy.max_vectors_per_shard,
+        workload = %workload,
         "Running benchmark"
     );
 
-    let searcher = IndexSearcher::new(
-        Arc::clone(&store) as Arc<dyn shardlake_storage::ObjectStore>,
-        manifest,
-    );
-    let store_arc: Arc<dyn shardlake_storage::ObjectStore> = store;
-    let report = shardlake_bench::run_benchmark(
-        &searcher, &store_arc, &queries, &corpus, args.k, &policy, metric,
+    let store_arc: Arc<dyn ObjectStore> = store;
+    let report = shardlake_bench::run_workload_benchmark(
+        &store_arc, &manifest, &queries, &corpus, args.k, &policy, metric, workload,
     );
 
     match args.output {
         OutputFormat::Text => {
             println!("=== Benchmark Report ===");
-            println!("  Queries:           {}", report.num_queries);
-            println!("  k:                 {}", report.k);
-            println!("  nprobe:            {}", report.nprobe);
+            println!("  Workload:          {}", report.workload);
+            println!("  Queries:           {}", report.benchmark.num_queries);
+            println!("  k:                 {}", report.benchmark.k);
+            println!("  nprobe:            {}", report.benchmark.nprobe);
             println!(
                 "  Recall@{k}:         {:.4}",
-                report.recall_at_k,
-                k = report.k
+                report.benchmark.recall_at_k,
+                k = report.benchmark.k
             );
-            println!("  Mean latency:      {:.1} µs", report.mean_latency_us);
-            println!("  P99  latency:      {:.1} µs", report.p99_latency_us);
-            println!("  Throughput:        {:.1} qps", report.throughput_qps);
-            println!("  Artifact size:     {} bytes", report.artifact_size_bytes);
+            println!("  Cache hit rate:    {:.4}", report.cache_hit_rate);
+            println!(
+                "  Mean latency:      {:.1} µs",
+                report.benchmark.mean_latency_us
+            );
+            println!(
+                "  P99  latency:      {:.1} µs",
+                report.benchmark.p99_latency_us
+            );
+            println!(
+                "  Throughput:        {:.1} qps",
+                report.benchmark.throughput_qps
+            );
+            println!(
+                "  Artifact size:     {} bytes",
+                report.benchmark.artifact_size_bytes
+            );
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report)?);

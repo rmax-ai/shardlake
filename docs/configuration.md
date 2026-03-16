@@ -142,6 +142,43 @@ Controls how many probe events are required before a shard is considered hot.
 | `1` | A shard becomes eligible for warming after its first probe |
 | `3` (default) | A shard becomes eligible after three probes |
 
+## Query execution configuration (`QueryConfig`)
+
+`QueryConfig` is the per-query runtime configuration struct that bundles all
+the knobs for a single ANN search.  It is the primary way to express query
+behaviour in library code that calls `QueryPipeline::run` directly.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `top_k` | usize | `10` | Number of results to return. Must be ≥ 1. |
+| `fan_out` | `FanOutPolicy` | See *Fan-out policy* | Controls centroid and shard selection. |
+| `rerank_limit` | usize or absent | absent | Absolute cap on the number of merged candidates passed to the reranker. When absent, falls back to `top_k × rerank_oversample`. Must be ≥ 1 when set. |
+| `distance_metric` | `DistanceMetric` or absent | absent | Per-query distance metric override. When absent, the metric stored in the index manifest is used. |
+
+### `rerank_limit`
+
+`rerank_limit` is an alternative to the pipeline-level `rerank_oversample`
+multiplier.  Where `rerank_oversample` scales the candidate pool by a factor of
+`top_k`, `rerank_limit` sets an absolute ceiling.  When both are configured in
+the pipeline builder, the `rerank_limit` in the per-query `QueryConfig` takes
+precedence at call time.
+
+- Higher values → more vectors evaluated during reranking → better recall
+- Lower values → fewer vectors evaluated → lower reranking latency
+- `None` (default) → use `top_k × rerank_oversample`
+
+### `distance_metric` override
+
+When set, `distance_metric` replaces the metric recorded in the index manifest
+for candidate scoring and reranking within this query.  The IVF routing phase
+(centroid-to-shard assignment) is not affected.
+
+| Value | Distance function |
+|-------|-------------------|
+| `Cosine` | `1 - cosine_similarity(a, b)` |
+| `Euclidean` | `sqrt(sum((a_i - b_i)²))` |
+| `InnerProduct` | `-dot(a, b)` (negated so lower = more similar) |
+
 ## Validation
 
 Invalid fan-out settings are rejected at startup (for `serve` and `benchmark`) and at
@@ -155,6 +192,10 @@ request time (for per-request HTTP overrides).  The following invariants are enf
 - `shard_cache_capacity` must be ≥ 1. A value of `0` is rejected during config
   deserialisation instead of panicking later during cache construction.
 - `prefetch.min_query_count` must be ≥ 1 when `prefetch.enabled = true`.
+- `QueryConfig::top_k` must be ≥ 1. A value of `0` is rejected with:
+  `"invalid query config: top_k must be ≥ 1"`.
+- `QueryConfig::rerank_limit` must be ≥ 1 when set. A value of `0` is rejected with:
+  `"invalid query config: rerank_limit must be ≥ 1 when set"`.
 
 ## Storage backends
 
