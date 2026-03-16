@@ -62,6 +62,14 @@ Execution guidance:
    1. Run `gh issue list --state open --limit 200 --json number,title,labels,assignees,author` once and derive the open `ready-to-implement` set, the open `implementation-in-progress` set, the open `epic` set, open issues without a parent epic, issues already assigned to `copilot-swe-agent`, and issues whose author login is outside the allowed set from that snapshot.
    2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
    3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocking` to determine whether open blockers exist.
+- Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
+
+```bash
+QUERY='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ issues(first:100, states:OPEN, labels:["epic"], orderBy:{field:CREATED_AT,direction:ASC}) { nodes { number title subIssues(first:100) { nodes { number title state author { login } } } } } } }'
+gh api graphql -f query="$QUERY" -F owner=<owner> -F repo=<repo>
+```
+
+- Keep the GraphQL query as raw ASCII text in a shell variable and pass it with `-f query="$QUERY"`; do not wrap the GraphQL document in JSON, do not escape it as a JSON string, and do not synthesize the query with ad hoc nested quoting.
 - Do not grep the repository for field names, probe alternate GraphQL field names, inspect schema metadata, or fall back to ad hoc discovery during normal execution.
 - Do not use `gh api graphql --repo ...` or `gh api --repo ...`; those forms are unsupported here and must be treated as invalid command shapes.
 - Do not use `gh issue view` unless a write operation requires a targeted refresh for one specific issue.

@@ -42,6 +42,14 @@ Execution guidance:
   2. Run one fixed `gh api graphql` query over the repository's open epic issues to collect each epic's `subIssues` and each child issue's `number`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
   3. Derive whether each candidate still has a parent epic from that GraphQL sub-issue snapshot instead of from `gh issue view` JSON fields.
   4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints.
+- Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
+
+```bash
+QUERY='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ issues(first:100, states:OPEN, labels:["epic"], orderBy:{field:CREATED_AT,direction:ASC}) { nodes { number subIssues(first:100) { nodes { number state author { login } } } } } } }'
+gh api graphql -f query="$QUERY" -F owner=<owner> -F repo=<repo>
+```
+
+- Keep the GraphQL query as raw ASCII text in a shell variable and pass it with `-f query="$QUERY"`; do not wrap the GraphQL document in JSON, do not escape it as a JSON string, and do not synthesize the query with ad hoc nested quoting.
 - Retrieve or refresh each candidate issue's author login before assignment only when it is not already present in the initial snapshot.
 - Do not use `gh api graphql --repo ...` or `gh api --repo ...`; `gh api` in this environment does not support that flag, so repository identity must stay inside the GraphQL query variables.
 - Do not request `parent` from `gh issue view --json`; that field is not supported by the GitHub CLI issue JSON output.
