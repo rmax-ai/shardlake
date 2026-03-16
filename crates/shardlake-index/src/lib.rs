@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod plugin;
 pub mod pq;
+pub mod ranking;
 pub mod searcher;
 pub mod shard;
 pub mod validator;
@@ -31,6 +32,7 @@ pub use pipeline::{
 };
 pub use plugin::{AnnPlugin, AnnRegistry, IvfFlatPlugin, IvfPqPlugin};
 pub use pq::{PqCodebook, PqParams};
+pub use ranking::{rank_hybrid, HybridRankingPolicy};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};

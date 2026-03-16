@@ -686,6 +686,43 @@ let loaded = Bm25Index::load(&*store, &key)?;
 let results = loaded.search("quick fox", 10);
 ```
 
+### Hybrid ranking with `rank_hybrid`
+
+When you have both vector search results and BM25 results for the same query
+you can combine them with an explicit weighted policy using
+`shardlake_index::ranking::rank_hybrid`.  The function normalizes both score
+lists independently (min–max, lower-is-better) and then blends them:
+
+```
+hybrid_score =
+  (vector_weight × vector_norm + bm25_weight × bm25_norm)
+  / (vector_weight + bm25_weight)
+```
+
+A candidate that appears in only one list receives a normalized score of `1.0`
+(worst) for the missing signal.  Ties are broken by `VectorId` ascending for
+a fully deterministic order, and the final score stays in `[0, 1]` even when
+the weights do not sum to `1.0`.
+
+```rust
+use shardlake_core::types::{SearchResult, VectorId};
+use shardlake_index::ranking::{HybridRankingPolicy, rank_hybrid};
+
+// Results from ANN / exact vector search (lower score = more similar).
+let vector_results: Vec<SearchResult> = /* ... */;
+
+// Results from BM25 lexical search (negated scores, lower = more relevant).
+let bm25_results: Vec<SearchResult> = /* ... */;
+
+let policy = HybridRankingPolicy {
+    vector_weight: 0.7,
+    bm25_weight: 0.3,
+};
+
+// Returns the top-10 results ranked by blended hybrid score.
+let hybrid = rank_hybrid(vector_results, bm25_results, &policy, 10);
+```
+
 ---
 
 ## Manifest integrity validation
