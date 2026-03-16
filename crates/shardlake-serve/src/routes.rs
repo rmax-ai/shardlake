@@ -360,6 +360,7 @@ mod tests {
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
         let state = AppState {
             searcher,
             fan_out: FanOutPolicy {
@@ -367,6 +368,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            metrics,
         };
         (build_router(state), tmp)
     }
@@ -427,6 +429,7 @@ mod tests {
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
         let state = AppState {
             searcher,
             fan_out: FanOutPolicy {
@@ -434,6 +437,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            metrics,
         };
         (build_router(state), tmp)
     }
