@@ -64,7 +64,7 @@ the top candidates by exact distance computation before returning results.
 | `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
 | `max_vectors_per_shard` | integer | No | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Defaults to the server's `--max-vectors-per-shard` value. |
 | `rerank` | boolean | No | When `true`, the ANN candidates are re-scored against their raw vectors using exact distance computation before the final ranking is returned. Defaults to `false`. See [Exact reranking](#exact-reranking) below. |
-| `rerank_limit` | integer | No | Maximum number of merged candidates passed to the reranker. Must be ≥ 1 when provided. When absent, the server uses its configured `rerank_oversample` factor. Only meaningful when `rerank` is `true`. See [Rerank candidate limit](#rerank-candidate-limit) below. |
+| `rerank_limit` | integer | No | Maximum number of merged candidates passed to the reranker. Must be ≥ 1 when provided. When absent, the server reranks the top `k` ANN candidates. Only meaningful when `rerank` is `true`. See [Rerank candidate limit](#rerank-candidate-limit) below. |
 | `distance_metric` | string | No | Distance metric override for this query. One of `"cosine"`, `"euclidean"`, or `"inner_product"`. When absent, the metric stored in the index manifest is used. See [Per-query distance metric](#per-query-distance-metric) below. |
 
 ### Success response — `200 OK`
@@ -103,6 +103,7 @@ the top candidates by exact distance computation before returning results.
 | `400 Bad Request` | `{"error": "invalid fan-out policy: candidate_centroids must be ≥ 1"}` | `candidate_centroids` (or `nprobe`) is 0 |
 | `400 Bad Request` | `{"error": "invalid query config: rerank_limit must be ≥ 1 when set"}` | `rerank_limit` is 0 |
 | `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
+| `400 Bad Request` | `{"error": "PQ-compressed indexes currently support only euclidean distance queries"}` | Request overrides `distance_metric` to a non-euclidean value against a PQ-compressed index |
 | `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
 ### Example
@@ -153,10 +154,9 @@ the number of candidates reranked and their dimensionality.
 
 ## Rerank candidate limit
 
-By default, when `rerank` is `true`, the server collects `k × rerank_oversample`
-candidates before passing them to the reranker, where `rerank_oversample` is the
-server-side multiplier (typically 2–4×).  The `rerank_limit` field provides an
-alternative absolute cap on the candidate pool.
+By default, when `rerank` is `true`, the server reranks the top `k` ANN
+candidates. The `rerank_limit` field widens that candidate pool to an explicit
+absolute cap.
 
 When `rerank_limit` is set, the server collects `max(k, rerank_limit)` merged
 candidates and passes them all to the reranker, which then returns the final
@@ -165,7 +165,7 @@ improving recall at the cost of reranking more vectors.
 
 | Value | Effect |
 |-------|--------|
-| absent (default) | Candidate pool is `k × rerank_oversample` |
+| absent (default) | Candidate pool is `k` |
 | `n` (≥ 1) | Candidate pool is `max(k, n)` |
 
 **Validation:** `rerank_limit` must be ≥ 1 when provided. A value of `0` is
@@ -189,6 +189,10 @@ one metric but you want to evaluate candidates under another.
 distances, which always use the routing metric baked into the index at build
 time.  Only the per-shard candidate scoring and any subsequent reranking use the
 overridden metric.
+
+**PQ limitation:** PQ-compressed indexes currently support only euclidean
+distance scoring. Requests that override `distance_metric` to `"cosine"` or
+`"inner_product"` against a PQ index are rejected with `400 Bad Request`.
 
 ## Notes on scoring
 

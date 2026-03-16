@@ -123,8 +123,8 @@ impl RouteStage for CentroidRouter {
             .into_iter()
             .filter_map(|index| centroid_to_shard.get(index).copied())
             .collect();
-        shard_ids.sort();
-        shard_ids.dedup();
+        let mut seen = HashSet::new();
+        shard_ids.retain(|shard_id| seen.insert(*shard_id));
         shard_ids
     }
 }
@@ -615,6 +615,7 @@ impl QueryPipeline {
     /// - [`QueryConfig::distance_metric`] — per-query metric override;
     ///   defaults to the manifest metric when `None`.
     pub fn run(&self, query: &[f32], config: &QueryConfig) -> Result<Vec<SearchResult>> {
+        config.validate()?;
         let k = config.top_k;
         let expected_dims = self.manifest.dims as usize;
         let metric = config
@@ -956,6 +957,43 @@ mod tests {
             2,
         );
         assert_eq!(shards, vec![ShardId(0)]);
+    }
+
+    #[test]
+    fn centroid_router_preserves_probe_order_when_deduplicating() {
+        let router = CentroidRouter;
+        let shards = router.route(
+            &[0.0, 0.0],
+            &[
+                vec![10.0, 10.0],
+                vec![0.0, 0.0],
+                vec![0.2, 0.2],
+                vec![0.1, 0.1],
+            ],
+            &[ShardId(9), ShardId(2), ShardId(9), ShardId(1)],
+            4,
+        );
+        assert_eq!(shards, vec![ShardId(2), ShardId(1), ShardId(9)]);
+    }
+
+    #[test]
+    fn run_rejects_invalid_query_config() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let pipeline = build_pipeline(records);
+        let error = pipeline
+            .run(
+                &query,
+                &QueryConfig {
+                    top_k: 0,
+                    ..QueryConfig::default()
+                },
+            )
+            .expect_err("invalid config should be rejected");
+        assert!(matches!(
+            error,
+            IndexError::Core(CoreError::InvalidQueryConfig(_))
+        ));
     }
 
     #[test]
