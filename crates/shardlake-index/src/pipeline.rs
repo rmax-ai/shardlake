@@ -11,7 +11,8 @@
 //!
 //! [`QueryPipeline`] keeps the modular stage surface introduced on `main` while
 //! adding ANN-specific candidate and rerank stages such as [`PqCandidateStage`]
-//! and [`ExactRerankStage`].
+//! and [`ExactRerankStage`]. Stages 3 and 4 can execute concurrently across
+//! probed shards using Rayon.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+use rayon::prelude::*;
 use tracing::debug;
 
 use shardlake_core::{
@@ -30,9 +32,10 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    cache::ShardCache,
+    cache::{CacheAccess, ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    merge::GlobalMerge,
     metrics::CacheMetrics,
     pq::PqCodebook,
     shard::ShardIndex,
@@ -126,88 +129,67 @@ impl RouteStage for CentroidRouter {
     }
 }
 
-/// Shard loader that caches loaded shards in a bounded in-memory cache.
+/// Shard loader that caches loaded shards in a bounded LRU cache.
 ///
 /// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
 /// to resolve the artifact key for each shard ID before fetching bytes from
-/// the store.
+/// the store.  Evicts the least-recently-used shard when the cache is full.
 ///
-/// By default the cache is unbounded (equivalent to the previous
-/// `HashMap`-based implementation).  Call [`with_capacity`] to limit the
-/// number of cached shards; the least-frequently-used entry is evicted when
-/// the limit is reached.
+/// Optional shard warming can be enabled via [`CachedShardLoader::with_prefetch`].
+/// When active, shards whose probe count reaches the configured threshold are
+/// loaded proactively on the next cache-miss event.
 ///
-/// Optionally, a [`PrefetchPolicy`] can be attached via [`with_prefetch`] to
-/// proactively warm "hot" shards into the cache whenever a cache-miss load
-/// occurs.
-///
-/// [`with_capacity`]: CachedShardLoader::with_capacity
-/// [`with_prefetch`]: CachedShardLoader::with_prefetch
 /// Cache observability is available via [`CachedShardLoader::metrics`]: a
 /// shared [`CacheMetrics`] instance that tracks hits, misses, load latency,
 /// and retained bytes for every shard loaded through this loader.
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<ShardCache>,
-    policy: Option<PrefetchPolicy>,
     metrics: Arc<CacheMetrics>,
+    cache: ShardCache<ShardIndex>,
+    access_counts: Mutex<HashMap<ShardId, u64>>,
+    policy: Option<PrefetchPolicy>,
 }
 
 impl CachedShardLoader {
-    /// Create a new loader backed by `store` and `manifest`.
-    ///
-    /// The cache is unbounded and prefetching is disabled.  Use the builder
-    /// methods [`with_capacity`] and [`with_prefetch`] to customise behaviour.
-    ///
-    /// [`with_capacity`]: Self::with_capacity
-    /// [`with_prefetch`]: Self::with_prefetch
+    /// Create a new loader using the [`DEFAULT_SHARD_CACHE_CAPACITY`].
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self::with_cache_capacity(store, manifest, DEFAULT_SHARD_CACHE_CAPACITY)
+    }
+
+    /// Create a new loader with the given LRU cache `capacity`.
+    ///
+    /// Use this constructor when you want to size the cache based on runtime
+    /// configuration, for example from
+    /// [`SystemConfig::shard_cache_capacity`](shardlake_core::config::SystemConfig::shard_cache_capacity).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    pub fn with_cache_capacity(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        capacity: usize,
+    ) -> Self {
+        assert!(
+            capacity > 0,
+            "CachedShardLoader shard cache capacity must be at least 1"
+        );
         Self {
             store,
             manifest,
-            cache: Mutex::new(ShardCache::new(0)),
-            policy: None,
             metrics: Arc::new(CacheMetrics::new()),
+            cache: ShardCache::new(capacity),
+            access_counts: Mutex::new(HashMap::new()),
+            policy: None,
         }
     }
 
-    /// Set the maximum number of shards to hold in the cache.
-    ///
-    /// `capacity` is the upper bound on cached entries.  `0` means no limit
-    /// (the default).  When the limit is reached, the least-frequently-used
-    /// shard is evicted to make room for a new entry.
-    ///
-    /// This method consumes `self` and returns a new instance; it is designed
-    /// to be chained after [`new`](Self::new).
-    pub fn with_capacity(self, capacity: usize) -> Self {
-        CachedShardLoader {
-            store: self.store,
-            manifest: self.manifest,
-            cache: Mutex::new(ShardCache::new(capacity)),
-            policy: self.policy,
-            metrics: self.metrics,
-        }
-    }
-
-    /// Enable prefetch warming with the given policy.
-    ///
-    /// When the policy is enabled and a cache-miss load occurs, any shard
-    /// whose access count has reached
-    /// [`PrefetchPolicy::min_query_count`] but is not currently in the cache
-    /// will be loaded proactively.  Warming errors are logged at `DEBUG` level
-    /// and do not propagate to the caller.
-    ///
-    /// This method consumes `self` and returns a new instance; it is designed
-    /// to be chained after [`new`](Self::new).
-    pub fn with_prefetch(self, policy: PrefetchPolicy) -> Self {
-        CachedShardLoader {
-            store: self.store,
-            manifest: self.manifest,
-            cache: self.cache,
-            policy: Some(policy),
-            metrics: self.metrics,
-        }
+    /// Enable best-effort warming of hot shards after cache misses.
+    #[must_use]
+    pub fn with_prefetch(mut self, policy: PrefetchPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// Return a shared reference to the cache metrics for this loader.
@@ -217,112 +199,102 @@ impl CachedShardLoader {
     pub fn metrics(&self) -> Arc<CacheMetrics> {
         Arc::clone(&self.metrics)
     }
+
+    fn record_access(&self, shard_id: ShardId) -> Result<()> {
+        let mut counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("shard loader access-count lock poisoned".into()))?;
+        *counts.entry(shard_id).or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn prefetch_candidates(&self) -> Result<Vec<(ShardId, String)>> {
+        let Some(policy) = self.policy.as_ref().filter(|policy| policy.enabled) else {
+            return Ok(Vec::new());
+        };
+
+        let threshold = u64::from(policy.min_query_count);
+        let counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("shard loader access-count lock poisoned".into()))?;
+
+        self.manifest
+            .shards
+            .iter()
+            .filter(|shard| counts.get(&shard.shard_id).copied().unwrap_or(0) >= threshold)
+            .filter_map(|shard| match self.cache.contains(shard.shard_id) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok((shard.shard_id, shard.artifact_key.clone()))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    fn warm_hot_shards(&self) -> Result<()> {
+        for (shard_id, artifact_key) in self.prefetch_candidates()? {
+            let mut retained_bytes = None;
+            match self.cache.get_or_load_with_status(shard_id, || {
+                let started = Instant::now();
+                let bytes = self.store.get(&artifact_key);
+                self.metrics
+                    .record_load_attempt(started.elapsed().as_nanos() as u64);
+                let bytes = bytes?;
+                retained_bytes = Some(bytes.len() as u64);
+                Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+            }) {
+                Ok((_, CacheAccess::Miss)) => {
+                    if let Some(bytes) = retained_bytes {
+                        self.metrics.record_retained_bytes(bytes);
+                    }
+                    debug!(?shard_id, "prefetch: warmed hot shard");
+                }
+                Ok((_, CacheAccess::Hit | CacheAccess::Raced)) => {}
+                Err(error) => {
+                    debug!(?shard_id, %error, "prefetch: failed to warm shard");
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        // Step 1: Record access and return early on a cache hit.
-        {
-            let mut cache = self.cache.lock().map_err(|_| {
-                IndexError::Other(
-                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
-                        .into(),
-                )
-            })?;
-            cache.record_access(shard_id);
-            if let Some(idx) = cache.get(shard_id) {
-                self.metrics.record_hit();
-                return Ok(idx);
-            }
-        }
+        self.record_access(shard_id)?;
 
-        // Step 2: Cache miss — load the requested shard from the store.
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|shard| shard.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+        let mut retained_bytes = None;
+        let (shard, access) = self.cache.get_or_load_with_status(shard_id, || {
+            let shard_def = self
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard_id)
+                .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+            self.metrics.record_miss();
+            let started = Instant::now();
+            let bytes = self.store.get(&shard_def.artifact_key);
+            self.metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
+            let bytes = bytes?;
+            retained_bytes = Some(bytes.len() as u64);
+            Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+        })?;
 
-        self.metrics.record_miss();
-
-        let t0 = Instant::now();
-        let bytes = self.store.get(&shard_def.artifact_key);
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        self.metrics.record_load_attempt(elapsed_ns);
-        let bytes = bytes?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        // Step 3: Insert the loaded shard and collect hot-but-uncached shards
-        //         to warm (if a prefetch policy is active).
-        //
-        // The threshold is computed once here to avoid the u32→u64 widening
-        // conversion inside the filter closure.
-        let warm_threshold: Option<u64> = self.policy.as_ref().and_then(|p| {
-            if p.enabled {
-                Some(u64::from(p.min_query_count))
-            } else {
-                None
-            }
-        });
-        let to_warm: Vec<(ShardId, String)> = {
-            let mut cache = self.cache.lock().map_err(|_| {
-                IndexError::Other(
-                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
-                        .into(),
-                )
-            })?;
-            cache.insert(shard_id, Arc::clone(&idx));
-            self.metrics.record_retained_bytes(bytes.len() as u64);
-
-            match warm_threshold {
-                Some(threshold) => self
-                    .manifest
-                    .shards
-                    .iter()
-                    .filter(|s| {
-                        !cache.contains(s.shard_id) && cache.access_count(s.shard_id) >= threshold
-                    })
-                    .map(|s| (s.shard_id, s.artifact_key.clone()))
-                    .collect(),
-                None => Vec::new(),
-            }
-        };
-
-        // Step 4: Warm hot shards outside the lock (best-effort; errors are
-        //         logged at DEBUG and do not fail the original load).
-        for (warm_id, artifact_key) in to_warm {
-            let t0 = Instant::now();
-            let warm_bytes = self.store.get(&artifact_key);
-            let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            self.metrics.record_load_attempt(elapsed_ns);
-
-            match warm_bytes {
-                Ok(warm_bytes) => match ShardIndex::from_bytes(&warm_bytes) {
-                    Ok(warm_idx) => {
-                        if let Ok(mut cache) = self.cache.lock() {
-                            if !cache.contains(warm_id) {
-                                debug!(shard_id = ?warm_id, "prefetch: warming hot shard");
-                                cache.insert(warm_id, Arc::new(warm_idx));
-                                self.metrics.record_retained_bytes(warm_bytes.len() as u64);
-                            }
-                        } else {
-                            debug!(
-                                shard_id = ?warm_id,
-                                "prefetch: cache lock poisoned while warming shard"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(shard_id = ?warm_id, error = %e, "prefetch: failed to parse shard");
-                    }
-                },
-                Err(e) => {
-                    debug!(shard_id = ?warm_id, error = %e, "prefetch: failed to load shard from store");
+        match access {
+            CacheAccess::Hit => self.metrics.record_hit(),
+            CacheAccess::Miss => {
+                if let Some(bytes) = retained_bytes {
+                    self.metrics.record_retained_bytes(bytes);
                 }
+                self.warm_hot_shards()?;
             }
+            CacheAccess::Raced => {}
         }
-        Ok(idx)
+
+        Ok(shard)
     }
 }
 
@@ -397,11 +369,14 @@ impl CandidateSearchStage for PqCandidateStage {
 }
 
 /// Merge stage that keeps the best `k` scored candidates with deduplication.
+///
+/// Delegates to [`GlobalMerge`] so ordering is deterministic: results are
+/// sorted by score ascending with vector ID as a tie-breaker.
 pub struct TopKMerge;
 
 impl MergeStage for TopKMerge {
     fn merge(&self, results: Vec<SearchResult>, k: usize) -> Vec<SearchResult> {
-        merge_top_k(results, k)
+        GlobalMerge.merge(results, k)
     }
 }
 
@@ -523,17 +498,28 @@ impl QueryPipeline {
             k
         };
 
+        type PerShardSearchOutput = (Vec<SearchResult>, Option<Arc<ShardIndex>>);
+
+        let keep_probed_shards = self.reranker.is_some();
+        let per_shard: Result<Vec<PerShardSearchOutput>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.loader.load(shard_id)?;
+                let results = self.candidate_search.search(
+                    &embedded,
+                    &shard,
+                    metric,
+                    candidates_per_shard,
+                )?;
+                Ok((results, keep_probed_shards.then_some(shard)))
+            })
+            .collect();
+
         let mut all_results = Vec::new();
         let mut probed_shards = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.loader.load(shard_id)?;
-            all_results.extend(self.candidate_search.search(
-                &embedded,
-                &shard,
-                metric,
-                candidates_per_shard,
-            )?);
-            if self.reranker.is_some() {
+        for (results, shard) in per_shard? {
+            all_results.extend(results);
+            if let Some(shard) = shard {
                 probed_shards.push(shard);
             }
         }
@@ -574,6 +560,7 @@ pub struct QueryPipelineBuilder {
     merge: Arc<dyn MergeStage>,
     reranker: Option<Arc<dyn RerankStage>>,
     rerank_oversample: usize,
+    shard_cache_capacity: usize,
 }
 
 impl QueryPipelineBuilder {
@@ -585,9 +572,10 @@ impl QueryPipelineBuilder {
             router: Arc::new(CentroidRouter),
             loader: None,
             candidate_search: Arc::new(ExactCandidateSearch),
-            merge: Arc::new(TopKMerge),
+            merge: Arc::new(GlobalMerge),
             reranker: None,
             rerank_oversample: 1,
+            shard_cache_capacity: DEFAULT_SHARD_CACHE_CAPACITY,
         }
     }
 
@@ -654,12 +642,36 @@ impl QueryPipelineBuilder {
         self
     }
 
+    /// Set the shard LRU cache capacity for the default [`CachedShardLoader`].
+    ///
+    /// Ignored when a custom loader is supplied via
+    /// [`with_loader`](Self::with_loader).  Defaults to
+    /// [`DEFAULT_SHARD_CACHE_CAPACITY`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    #[must_use]
+    pub fn with_shard_cache_capacity(mut self, capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "QueryPipelineBuilder shard cache capacity must be at least 1"
+        );
+        self.shard_cache_capacity = capacity;
+        self
+    }
+
     /// Assemble the [`QueryPipeline`].
+    ///
+    /// If no custom loader was provided via [`with_loader`](Self::with_loader),
+    /// a [`CachedShardLoader`] backed by the store passed to
+    /// [`QueryPipeline::builder`] is used with the configured cache capacity.
     pub fn build(self) -> QueryPipeline {
         let loader = self.loader.unwrap_or_else(|| {
-            Arc::new(CachedShardLoader::new(
+            Arc::new(CachedShardLoader::with_cache_capacity(
                 Arc::clone(&self.store),
                 self.manifest.clone(),
+                self.shard_cache_capacity,
             ))
         });
         QueryPipeline {

@@ -1,222 +1,482 @@
-//! Bounded in-memory shard cache with LFU eviction and access-frequency
-//! tracking.
+//! Bounded LRU shard index cache.
 //!
-//! [`ShardCache`] stores deserialized [`ShardIndex`] objects keyed by their
-//! [`ShardId`] and tracks how many times each shard has been accessed.  When a
-//! capacity limit is configured, inserting a new entry evicts the
-//! least-frequently-accessed shard that is currently in the cache (LFU policy).
-//!
-//! The access counter is incremented every time [`ShardCache::record_access`]
-//! is called, regardless of whether the shard is in the cache at that moment.
-//! This means the frequency reflects *demand*, not *cache residency*, making
-//! it suitable for driving prefetch decisions.
+//! Provides [`ShardCache`], a thread-safe bounded LRU cache for shard index
+//! data, replacing bespoke per-searcher `Mutex<HashMap>` caches.  On a cache
+//! miss the caller supplies a load closure that fetches the shard from
+//! storage; the result is inserted and returned.  Hit and miss counts are
+//! tracked atomically.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use tracing::debug;
+use std::{
+    collections::{HashMap, VecDeque},
+    hash::Hash,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+};
 
 use shardlake_core::types::ShardId;
 
-use crate::shard::ShardIndex;
+use crate::{IndexError, Result};
 
-/// In-memory shard cache with access-frequency tracking and optional capacity.
+/// Default maximum number of shard indexes to retain in a [`ShardCache`].
+///
+/// Callers that need a different limit should construct the cache with an
+/// explicit capacity, for example by reading
+/// [`shardlake_core::config::SystemConfig::shard_cache_capacity`].
+pub const DEFAULT_SHARD_CACHE_CAPACITY: usize = 128;
+
+// ── internal LRU ─────────────────────────────────────────────────────────────
+
+/// A bounded LRU eviction cache backed by a `HashMap` and a `VecDeque`.
+///
+/// The `VecDeque` acts as an ordered access log: the front holds the
+/// least-recently-used key and the back holds the most-recently-used key.
+/// Both `get` and `insert` promote the accessed key to MRU position.
+///
+/// Promotion is O(n) because it scans the `VecDeque` for the key's current
+/// position.  This is acceptable for the expected cache sizes (≤ a few hundred
+/// shard entries); the simplicity is preferred over additional heap allocations
+/// or unsafe code that a doubly-linked-list approach would require.
+struct LruCache<K, V> {
+    capacity: usize,
+    map: HashMap<K, V>,
+    /// Access order: `order[0]` = LRU (next to be evicted),
+    /// `order[len-1]` = MRU (most recently used).
+    order: VecDeque<K>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "LruCache capacity must be at least 1");
+        Self {
+            capacity,
+            // Pre-allocate one extra slot to avoid reallocation on the
+            // common insert-then-evict path.
+            map: HashMap::with_capacity(capacity + 1),
+            order: VecDeque::with_capacity(capacity + 1),
+        }
+    }
+
+    /// Return a clone of the value associated with `key`, promoting it to the
+    /// MRU position.  Returns `None` if `key` is not present.
+    fn get(&mut self, key: &K) -> Option<V> {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        // Promote to MRU: remove from current position and push to back.
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+        self.map.get(key).cloned()
+    }
+
+    /// Insert `value` under `key`, evicting the LRU entry if the cache is at
+    /// capacity.  Updating an existing key promotes it to MRU position.
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.contains_key(&key) {
+            // Update in-place and promote to MRU.
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key.clone());
+            self.map.insert(key, value);
+            return;
+        }
+        // Evict the LRU entry when the cache is full.
+        if self.map.len() >= self.capacity {
+            if let Some(lru_key) = self.order.pop_front() {
+                self.map.remove(&lru_key);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+// ── ShardCache ────────────────────────────────────────────────────────────────
+
+/// Thread-safe, bounded LRU cache for shard index data.
+///
+/// `ShardCache<V>` stores values of type `Arc<V>` keyed by [`ShardId`].
+/// On a cache miss the caller-provided load closure is invoked to fetch the
+/// shard from storage; on success the result is inserted and returned.
 ///
 /// # Eviction
 ///
-/// When `capacity > 0` and the cache is at capacity, inserting a new shard
-/// evicts the cached entry with the lowest access count.  If several entries
-/// share the same (minimum) count the one that happens to be returned first by
-/// the underlying hash-map iterator is chosen; the choice is deterministic
-/// within a single process run but unspecified across runs.
+/// When the number of cached entries reaches the configured `capacity`, the
+/// least-recently-used entry is evicted before the new entry is inserted.
+/// An entry's "use" time is updated on every successful
+/// [`get_or_load`](ShardCache::get_or_load) call for that shard.
 ///
-/// # Access counting
+/// # Bookkeeping
 ///
-/// Call [`record_access`](Self::record_access) to increment the counter for a
-/// shard before consulting the cache so that counts accumulate for both hits
-/// and misses.  The count is never decremented and persists even after a shard
-/// is evicted; this ensures that a frequently-used shard that was evicted is
-/// still recognised as "hot" and re-warmed by the prefetch policy.
-pub struct ShardCache {
-    entries: HashMap<ShardId, Arc<ShardIndex>>,
-    access_counts: HashMap<ShardId, u64>,
-    capacity: usize,
+/// Cumulative hit and miss counts are available via [`ShardCache::hits`] and
+/// [`ShardCache::misses`].  Both counters are incremented atomically, making
+/// them safe to read from any thread without acquiring the inner lock.
+///
+/// # Capacity
+///
+/// Construct with [`DEFAULT_SHARD_CACHE_CAPACITY`] or with the value from
+/// [`shardlake_core::config::SystemConfig::shard_cache_capacity`] to respect
+/// the operator's runtime configuration.
+pub struct ShardCache<V> {
+    inner: Mutex<LruCache<ShardId, Arc<V>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
-impl ShardCache {
-    /// Create a new cache with the given capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheAccess {
+    Hit,
+    Miss,
+    Raced,
+}
+
+impl<V: Send + 'static> ShardCache<V> {
+    /// Create a cache that holds at most `capacity` entries.
     ///
-    /// `capacity` is the maximum number of shards that may be held
-    /// concurrently.  A value of `0` means no limit.
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "ShardCache capacity must be at least 1");
         Self {
-            entries: HashMap::new(),
-            access_counts: HashMap::new(),
-            capacity,
+            inner: Mutex::new(LruCache::new(capacity)),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
-    /// Return a shared reference to the cached shard, or `None` if not
-    /// present.
-    pub fn get(&self, shard_id: ShardId) -> Option<Arc<ShardIndex>> {
-        self.entries.get(&shard_id).map(Arc::clone)
-    }
-
-    /// Return `true` if `shard_id` is currently held in the cache.
-    pub fn contains(&self, shard_id: ShardId) -> bool {
-        self.entries.contains_key(&shard_id)
-    }
-
-    /// Increment the access counter for `shard_id`.
+    /// Return the cached `Arc<V>` for `shard_id`, or load and cache it.
     ///
-    /// Should be called at the beginning of every load attempt, before
-    /// checking whether the shard is already cached.
-    pub fn record_access(&mut self, shard_id: ShardId) {
-        *self.access_counts.entry(shard_id).or_insert(0) += 1;
+    /// On a **hit** the cached value is returned immediately and
+    /// [`hits`](ShardCache::hits) is incremented.  On a **miss** `load` is
+    /// called outside the lock, the result is inserted,
+    /// [`misses`](ShardCache::misses) is incremented, and the value is
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.  Any error
+    /// returned by `load` is forwarded unchanged.
+    pub fn get_or_load<F>(&self, shard_id: ShardId, load: F) -> Result<Arc<V>>
+    where
+        F: FnOnce() -> Result<Arc<V>>,
+    {
+        self.get_or_load_with_status(shard_id, load)
+            .map(|(value, _)| value)
     }
 
-    /// Return the cumulative access count for `shard_id`.
-    ///
-    /// Returns `0` for shards that have never been accessed via
-    /// [`record_access`](Self::record_access).
-    pub fn access_count(&self, shard_id: ShardId) -> u64 {
-        self.access_counts.get(&shard_id).copied().unwrap_or(0)
-    }
-
-    /// Insert `shard` into the cache under `shard_id`.
-    ///
-    /// If the shard is already present the stored entry is replaced without
-    /// triggering eviction.  If the cache is at capacity the entry with the
-    /// lowest access count is evicted first.
-    pub fn insert(&mut self, shard_id: ShardId, shard: Arc<ShardIndex>) {
-        use std::collections::hash_map::Entry;
-
-        // Update-in-place: no eviction needed.
-        if let Entry::Occupied(mut e) = self.entries.entry(shard_id) {
-            e.insert(shard);
-            return;
-        }
-
-        // Evict the least-frequently-used shard if the cache is at capacity.
-        if self.capacity > 0 && self.entries.len() == self.capacity {
-            if let Some(evict_id) = self
-                .entries
-                .keys()
-                .min_by_key(|&id| self.access_counts.get(id).copied().unwrap_or(0))
-                .copied()
-            {
-                self.entries.remove(&evict_id);
-                debug!(shard_id = ?evict_id, "evicted cold shard from cache");
+    pub(crate) fn get_or_load_with_status<F>(
+        &self,
+        shard_id: ShardId,
+        load: F,
+    ) -> Result<(Arc<V>, CacheAccess)>
+    where
+        F: FnOnce() -> Result<Arc<V>>,
+    {
+        // Fast path: check the cache under the lock.
+        {
+            let mut guard = self.lock()?;
+            if let Some(cached) = guard.get(&shard_id) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((cached, CacheAccess::Hit));
             }
         }
 
-        self.entries.insert(shard_id, shard);
+        // Slow path: cache miss – load the value outside the lock.
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let value = load()?;
+
+        // Re-acquire the lock and reuse any value inserted while we were loading.
+        let mut guard = self.lock()?;
+        if let Some(cached) = guard.get(&shard_id) {
+            return Ok((cached, CacheAccess::Raced));
+        }
+        guard.insert(shard_id, Arc::clone(&value));
+        Ok((value, CacheAccess::Miss))
     }
 
-    /// Number of shards currently held in the cache.
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    /// Return the cumulative number of cache hits.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 
-    /// Return `true` if no shards are currently held in the cache.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    /// Return the cumulative number of cache misses.
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
     }
 
-    /// Iterate over the cached shard values.
-    pub fn values(&self) -> impl Iterator<Item = &Arc<ShardIndex>> {
-        self.entries.values()
+    /// Return the number of entries currently held in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn len(&self) -> Result<usize> {
+        Ok(self.lock()?.len())
     }
 
-    /// Return the maximum capacity of this cache (`0` = unlimited).
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    /// Return `true` if the cache contains no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Return a snapshot of all currently cached values.
+    ///
+    /// Each `Arc<V>` in the returned `Vec` is cheaply cloned from the cache
+    /// under the lock; the lock is released before this method returns.
+    /// This is useful for opportunistic iteration (e.g. reranking from cached
+    /// shard data) without requiring the caller to hold the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn cached_values(&self) -> Result<Vec<Arc<V>>> {
+        Ok(self.lock()?.map.values().cloned().collect())
+    }
+
+    /// Return whether `shard_id` is currently resident in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn contains(&self, shard_id: ShardId) -> Result<bool> {
+        Ok(self.lock()?.map.contains_key(&shard_id))
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, LruCache<ShardId, Arc<V>>>> {
+        self.inner
+            .lock()
+            .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))
     }
 }
 
+// ─────────────────────────── tests ───────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
-    use crate::shard::ShardIndex;
 
-    fn dummy_shard() -> Arc<ShardIndex> {
-        Arc::new(ShardIndex {
-            shard_id: ShardId(0),
-            dims: 0,
-            centroids: vec![],
-            records: vec![],
-        })
+    // ── LruCache ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lru_cache_get_miss_on_empty() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(4);
+        assert!(cache.get(&0).is_none());
     }
 
     #[test]
-    fn unbounded_cache_holds_all_inserts() {
-        let mut cache = ShardCache::new(0);
-        for i in 0..10_u32 {
-            cache.insert(ShardId(i), dummy_shard());
-        }
-        assert_eq!(cache.len(), 10);
+    fn lru_cache_insert_and_get() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(4);
+        cache.insert(1, 100);
+        cache.insert(2, 200);
+        assert_eq!(cache.get(&1), Some(100));
+        assert_eq!(cache.get(&2), Some(200));
+        assert!(cache.get(&3).is_none());
     }
 
     #[test]
-    fn bounded_cache_evicts_on_capacity() {
-        let mut cache = ShardCache::new(2);
-        cache.record_access(ShardId(0));
-        cache.record_access(ShardId(0)); // count=2
-        cache.record_access(ShardId(1)); // count=1
-        cache.insert(ShardId(0), dummy_shard());
-        cache.insert(ShardId(1), dummy_shard());
-
+    fn lru_cache_evicts_lru_when_full() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(2);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        // Access key 1 → key 1 is MRU, key 2 becomes LRU.
+        cache.get(&1);
+        // Insert key 3: key 2 (LRU) should be evicted.
+        cache.insert(3, 30);
         assert_eq!(cache.len(), 2);
-
-        // Inserting shard 2 must evict the coldest entry (shard 1, count=1).
-        cache.record_access(ShardId(2));
-        cache.insert(ShardId(2), dummy_shard());
-
-        assert_eq!(cache.len(), 2);
-        assert!(cache.contains(ShardId(0)), "hot shard must be retained");
-        assert!(!cache.contains(ShardId(1)), "cold shard must be evicted");
-        assert!(
-            cache.contains(ShardId(2)),
-            "newly inserted shard must be present"
-        );
+        assert!(cache.get(&2).is_none(), "key 2 should have been evicted");
+        assert_eq!(cache.get(&1), Some(10));
+        assert_eq!(cache.get(&3), Some(30));
     }
 
     #[test]
-    fn access_count_persists_after_eviction() {
-        let mut cache = ShardCache::new(1);
-        cache.record_access(ShardId(0));
-        cache.record_access(ShardId(0));
-        cache.insert(ShardId(0), dummy_shard());
+    fn lru_cache_update_promotes_existing_to_mru() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(2);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        // Re-insert key 1 → key 1 becomes MRU, key 2 becomes LRU.
+        cache.insert(1, 11);
+        // Insert key 3 → key 2 (LRU) should be evicted.
+        cache.insert(3, 30);
+        assert!(cache.get(&2).is_none(), "key 2 should have been evicted");
+        assert_eq!(cache.get(&1), Some(11));
+        assert_eq!(cache.get(&3), Some(30));
+    }
 
-        // Evict shard 0 by inserting shard 1.
-        cache.record_access(ShardId(1));
-        cache.insert(ShardId(1), dummy_shard());
+    #[test]
+    fn lru_cache_capacity_one() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(1);
+        cache.insert(1, 10);
+        assert_eq!(cache.get(&1), Some(10));
+        cache.insert(2, 20);
+        // Key 1 should now be evicted.
+        assert!(cache.get(&1).is_none());
+        assert_eq!(cache.get(&2), Some(20));
+    }
 
-        assert!(!cache.contains(ShardId(0)));
+    // ── ShardCache ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shard_cache_miss_invokes_load() {
+        let cache: ShardCache<u64> = ShardCache::new(4);
+        let load_count = AtomicUsize::new(0);
+
+        let result = cache.get_or_load(ShardId(1), || {
+            load_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(42u64))
+        });
+
+        assert_eq!(*result.unwrap(), 42);
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+    }
+
+    #[test]
+    fn shard_cache_hit_returns_cached_value_without_reload() {
+        let cache: ShardCache<u64> = ShardCache::new(4);
+        let load_count = AtomicUsize::new(0);
+
+        // First access: miss → loads 42.
+        cache
+            .get_or_load(ShardId(1), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(42u64))
+            })
+            .unwrap();
+
+        // Second access: hit → should not call load (which would return 99).
+        let result = cache
+            .get_or_load(ShardId(1), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(99u64))
+            })
+            .unwrap();
+
+        assert_eq!(*result, 42, "cached value should be returned on hit");
         assert_eq!(
-            cache.access_count(ShardId(0)),
-            2,
-            "count must survive eviction"
+            load_count.load(Ordering::SeqCst),
+            1,
+            "load should be called exactly once"
+        );
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn shard_cache_evicts_lru_entry() {
+        let cache: ShardCache<u64> = ShardCache::new(2);
+        let load_count = AtomicUsize::new(0);
+
+        // Load shards 0 and 1 to fill the cache.
+        cache
+            .get_or_load(ShardId(0), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(0u64))
+            })
+            .unwrap();
+        cache
+            .get_or_load(ShardId(1), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(1u64))
+            })
+            .unwrap();
+
+        // Access shard 0 again → shard 0 is MRU, shard 1 becomes LRU.
+        cache
+            .get_or_load(ShardId(0), || Ok(Arc::new(99u64)))
+            .unwrap();
+
+        // Insert shard 2 → shard 1 (LRU) should be evicted.
+        cache
+            .get_or_load(ShardId(2), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(2u64))
+            })
+            .unwrap();
+
+        assert_eq!(cache.len().unwrap(), 2);
+
+        // Accessing shard 1 now should trigger a reload (it was evicted).
+        let before = load_count.load(Ordering::SeqCst);
+        cache
+            .get_or_load(ShardId(1), || {
+                load_count.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(1u64))
+            })
+            .unwrap();
+        let after = load_count.load(Ordering::SeqCst);
+        assert_eq!(
+            after - before,
+            1,
+            "shard 1 should be reloaded after eviction"
         );
     }
 
     #[test]
-    fn in_place_update_does_not_trigger_eviction() {
-        let mut cache = ShardCache::new(2);
-        cache.insert(ShardId(0), dummy_shard());
-        cache.insert(ShardId(1), dummy_shard());
-        // Re-inserting an existing entry must not evict anything.
-        cache.insert(ShardId(0), dummy_shard());
-        assert_eq!(cache.len(), 2);
+    fn shard_cache_is_empty_after_construction() {
+        let cache: ShardCache<u64> = ShardCache::new(8);
+        assert!(cache.is_empty().unwrap());
+        assert_eq!(cache.len().unwrap(), 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
     }
 
     #[test]
-    fn record_access_increments_count() {
-        let mut cache = ShardCache::new(0);
-        assert_eq!(cache.access_count(ShardId(7)), 0);
-        cache.record_access(ShardId(7));
-        assert_eq!(cache.access_count(ShardId(7)), 1);
-        cache.record_access(ShardId(7));
-        assert_eq!(cache.access_count(ShardId(7)), 2);
+    fn shard_cache_load_error_is_forwarded() {
+        let cache: ShardCache<u64> = ShardCache::new(4);
+        let result: Result<Arc<u64>> =
+            cache.get_or_load(ShardId(0), || Err(IndexError::Other("load failed".into())));
+        assert!(result.is_err());
+        // The failed load should still count as a miss (the attempt was made).
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+        // Nothing should be in the cache.
+        assert!(cache.is_empty().unwrap());
+    }
+
+    #[test]
+    fn shard_cache_reuses_existing_value_after_raced_load() {
+        let cache: Arc<ShardCache<u64>> = Arc::new(ShardCache::new(2));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let cache_for_thread = Arc::clone(&cache);
+        let barrier_for_thread = Arc::clone(&barrier);
+        let handle = thread::spawn(move || {
+            cache_for_thread.get_or_load_with_status(ShardId(5), || {
+                barrier_for_thread.wait();
+                barrier_for_thread.wait();
+                Ok(Arc::new(10u64))
+            })
+        });
+
+        barrier.wait();
+        let inserted = cache
+            .get_or_load(ShardId(5), || Ok(Arc::new(20u64)))
+            .unwrap();
+        barrier.wait();
+
+        let (value, access) = handle.join().expect("load thread must complete").unwrap();
+        assert_eq!(access, CacheAccess::Raced);
+        assert_eq!(*inserted, 20);
+        assert_eq!(*value, 20);
+        assert_eq!(cache.len().unwrap(), 1);
     }
 }

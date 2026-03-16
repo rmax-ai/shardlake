@@ -36,12 +36,21 @@ pub enum PartitioningError {
 /// Summary statistics for one benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
+    /// Number of query vectors evaluated.
     pub num_queries: usize,
+    /// Number of nearest neighbours retrieved per query.
     pub k: usize,
+    /// Number of shards probed per query.
     pub nprobe: usize,
+    /// Mean recall@k across all queries (fraction of true top-k found).
     pub recall_at_k: f64,
+    /// Mean per-query ANN search latency in microseconds.
     pub mean_latency_us: f64,
+    /// 99th-percentile per-query ANN search latency in microseconds.
     pub p99_latency_us: f64,
+    /// Query throughput: queries executed per second (wall-clock time over all queries).
+    pub throughput_qps: f64,
+    /// Total size of all index artifact files in bytes.
     pub artifact_size_bytes: u64,
 }
 
@@ -80,9 +89,30 @@ pub fn run_benchmark(
     policy: &FanOutPolicy,
     metric: DistanceMetric,
 ) -> BenchmarkReport {
+    let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
+    let artifact_size_bytes: u64 = keys
+        .iter()
+        .filter_map(|k| store.get(k).ok())
+        .map(|b| b.len() as u64)
+        .sum();
+
+    if queries.is_empty() {
+        return BenchmarkReport {
+            num_queries: 0,
+            k,
+            nprobe: policy.candidate_centroids as usize,
+            recall_at_k: 0.0,
+            mean_latency_us: 0.0,
+            p99_latency_us: 0.0,
+            throughput_qps: 0.0,
+            artifact_size_bytes,
+        };
+    }
+
     let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
     let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
 
+    let wall_start = Instant::now();
     for query in queries {
         let gt = exact_search(&query.data, corpus, metric, k);
         let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
@@ -97,17 +127,12 @@ pub fn run_benchmark(
         latencies_us.push(elapsed_us);
         recalls.push(r);
     }
+    let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
 
     let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
     let mean_latency = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
     let p99_latency = nearest_rank_percentile(&mut latencies_us, 0.99);
-
-    let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
-    let artifact_size_bytes: u64 = keys
-        .iter()
-        .filter_map(|k| store.get(k).ok())
-        .map(|b| b.len() as u64)
-        .sum();
+    let throughput_qps = queries.len() as f64 / wall_elapsed_secs.max(f64::EPSILON);
 
     let report = BenchmarkReport {
         num_queries: queries.len(),
@@ -116,6 +141,7 @@ pub fn run_benchmark(
         recall_at_k: mean_recall,
         mean_latency_us: mean_latency,
         p99_latency_us: p99_latency,
+        throughput_qps,
         artifact_size_bytes,
     };
 
@@ -123,6 +149,7 @@ pub fn run_benchmark(
         recall_at_k = report.recall_at_k,
         mean_latency_us = report.mean_latency_us,
         p99_latency_us = report.p99_latency_us,
+        throughput_qps = report.throughput_qps,
         artifact_size_bytes = report.artifact_size_bytes,
         "Benchmark complete"
     );
@@ -570,6 +597,143 @@ mod tests {
     fn test_nearest_rank_percentile_handles_single_value() {
         let mut values = vec![42.0];
         assert_eq!(nearest_rank_percentile(&mut values, 0.99), 42.0);
+    }
+
+    #[test]
+    fn run_benchmark_reports_correct_field_counts() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let searcher = IndexSearcher::new(Arc::clone(&store_arc), manifest);
+        let report = run_benchmark(
+            &searcher,
+            &store_arc,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        );
+
+        assert_eq!(report.num_queries, 5);
+        assert_eq!(report.k, 3);
+        assert_eq!(report.nprobe, 1);
+        assert!((0.0..=1.0).contains(&report.recall_at_k));
+        assert!(report.mean_latency_us >= 0.0);
+        assert!(report.mean_latency_us.is_finite());
+        assert!(report.p99_latency_us.is_finite());
+        assert!(report.p99_latency_us >= 0.0);
+        assert!(report.throughput_qps > 0.0);
+        assert!(report.artifact_size_bytes > 0);
+    }
+
+    #[test]
+    fn run_benchmark_empty_queries_return_zero_metrics() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 1, tmp.path().to_path_buf());
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let searcher = IndexSearcher::new(Arc::clone(&store_arc), manifest);
+        let report = run_benchmark(
+            &searcher,
+            &store_arc,
+            &[],
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        );
+
+        assert_eq!(report.num_queries, 0);
+        assert_eq!(report.k, 3);
+        assert_eq!(report.nprobe, 1);
+        assert_eq!(report.recall_at_k, 0.0);
+        assert_eq!(report.mean_latency_us, 0.0);
+        assert_eq!(report.p99_latency_us, 0.0);
+        assert_eq!(report.throughput_qps, 0.0);
+        assert!(report.artifact_size_bytes > 0);
+    }
+
+    #[test]
+    fn run_benchmark_recall_is_perfect_with_full_probe() {
+        // With nprobe large enough to cover all shards, recall should be 1.0.
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        // candidate_centroids=2 covers both shards
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let searcher = IndexSearcher::new(Arc::clone(&store_arc), manifest);
+        let report = run_benchmark(
+            &searcher,
+            &store_arc,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        );
+
+        assert!((report.recall_at_k - 1.0_f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn run_benchmark_throughput_is_positive() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 1, tmp.path().to_path_buf());
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let searcher = IndexSearcher::new(Arc::clone(&store_arc), manifest);
+        let report = run_benchmark(
+            &searcher,
+            &store_arc,
+            &records,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        );
+
+        assert!(report.throughput_qps > 0.0, "throughput must be positive");
+        // throughput (qps) should be in a plausible range: wall-clock time includes
+        // both exact-search overhead and approximate search, so throughput will be
+        // somewhat lower than 1e6 / mean_latency_us but should be at least 1 qps.
+        assert!(report.throughput_qps >= 1.0);
+        assert!(report.throughput_qps < 1e12);
     }
 
     #[test]

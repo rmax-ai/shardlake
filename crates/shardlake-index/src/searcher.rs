@@ -1,10 +1,11 @@
-//! Query-time shard searcher with lazy loading and in-memory cache.
+//! Query-time shard searcher with lazy loading and in-memory LRU cache.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
+use rayon::prelude::*;
 use tracing::{debug, info};
 
 use shardlake_core::{
@@ -16,7 +17,7 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
-    cache::ShardCache,
+    cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
     pq::PqCodebook,
@@ -25,40 +26,69 @@ use crate::{
 };
 
 /// Searcher that loads shard indexes lazily from `store`, caching them in RAM.
+///
+/// Raw shard indexes and PQ-encoded shards are each kept in a bounded LRU
+/// cache.  Use [`IndexSearcher::with_cache_capacity`] when you need to size
+/// the caches explicitly (e.g. from
+/// [`SystemConfig::shard_cache_capacity`](shardlake_core::config::SystemConfig::shard_cache_capacity)).
 pub struct IndexSearcher {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<ShardCache>,
-    pq_shard_cache: Mutex<HashMap<ShardId, Arc<PqShard>>>,
+    /// LRU cache of raw shard indexes keyed by shard ID.
+    cache: ShardCache<ShardIndex>,
+    /// LRU cache of PQ-encoded shards keyed by shard ID.
+    pq_shard_cache: ShardCache<PqShard>,
     /// PQ codebook; loaded once on first PQ search, then cached.
     codebook: Mutex<Option<Arc<PqCodebook>>>,
     metadata_cache: Mutex<Option<Arc<HashMap<String, serde_json::Value>>>>,
+    access_counts: Mutex<HashMap<ShardId, u64>>,
     prefetch: Option<PrefetchPolicy>,
 }
 
 impl IndexSearcher {
-    /// Create a new searcher from a loaded manifest.
+    /// Create a new searcher using [`DEFAULT_SHARD_CACHE_CAPACITY`] for both
+    /// the raw-shard and PQ-shard caches.
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self::with_cache_capacity(store, manifest, DEFAULT_SHARD_CACHE_CAPACITY)
+    }
+
+    /// Create a new searcher with a specific LRU cache `capacity` for both the
+    /// raw-shard and PQ-shard caches.
+    ///
+    /// Pass `config.shard_cache_capacity` here to honour the operator's runtime
+    /// configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    pub fn with_cache_capacity(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        capacity: usize,
+    ) -> Self {
+        assert!(
+            capacity > 0,
+            "IndexSearcher shard cache capacity must be at least 1"
+        );
         info!(
             index_version = %manifest.index_version,
             shards = manifest.shards.len(),
+            shard_cache_capacity = capacity,
             "IndexSearcher created"
         );
         Self {
             store,
             manifest,
-            cache: Mutex::new(ShardCache::new(0)),
-            pq_shard_cache: Mutex::new(HashMap::new()),
+            cache: ShardCache::new(capacity),
+            pq_shard_cache: ShardCache::new(capacity),
             codebook: Mutex::new(None),
             metadata_cache: Mutex::new(None),
+            access_counts: Mutex::new(HashMap::new()),
             prefetch: None,
         }
     }
 
     /// Create a new searcher configured from a [`SystemConfig`].
-    ///
-    /// The `cache_capacity` and `prefetch` fields are applied to the raw shard
-    /// cache used for exact per-shard search and reranking.
     pub fn from_config(
         store: Arc<dyn ObjectStore>,
         manifest: Manifest,
@@ -66,34 +96,14 @@ impl IndexSearcher {
     ) -> Result<Self> {
         config.prefetch.validate()?;
 
-        let mut searcher =
-            Self::new(store, manifest).with_cache_capacity(config.cache_capacity as usize);
+        let mut searcher = Self::with_cache_capacity(store, manifest, config.shard_cache_capacity);
         if config.prefetch.enabled {
             searcher.prefetch = Some(config.prefetch.clone());
         }
         Ok(searcher)
     }
 
-    /// Set the maximum number of raw shards to retain in memory.
-    ///
-    /// `capacity = 0` preserves the historical unbounded cache behaviour.
-    #[must_use]
-    pub fn with_cache_capacity(self, capacity: usize) -> Self {
-        Self {
-            store: self.store,
-            manifest: self.manifest,
-            cache: Mutex::new(ShardCache::new(capacity)),
-            pq_shard_cache: self.pq_shard_cache,
-            codebook: self.codebook,
-            metadata_cache: self.metadata_cache,
-            prefetch: self.prefetch,
-        }
-    }
-
     /// Enable best-effort warming of hot raw shards after cache misses.
-    ///
-    /// Callers should validate the policy before passing it here, or prefer
-    /// [`IndexSearcher::from_config`] which performs that validation.
     #[must_use]
     pub fn with_prefetch(mut self, policy: PrefetchPolicy) -> Self {
         self.prefetch = Some(policy);
@@ -208,18 +218,24 @@ impl IndexSearcher {
                 policy.max_vectors_per_shard,
             )
         } else {
-            let mut all_results = Vec::new();
-            for shard_id in probe_shards {
-                let shard = self.load_shard(shard_id)?;
-                let records = if policy.max_vectors_per_shard > 0 {
-                    let limit = (policy.max_vectors_per_shard as usize).min(shard.records.len());
-                    &shard.records[..limit]
-                } else {
-                    &shard.records
-                };
-                let results = exact_search(query, records, metric, k);
-                all_results.extend(results);
-            }
+            // Stages: Load shard + exact search run concurrently across probed shards.
+            // Each task loads one shard and scores its records; results are merged below.
+            // Any shard-load error short-circuits the fan-out.
+            let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+                .par_iter()
+                .map(|&shard_id| {
+                    let shard = self.load_shard(shard_id)?;
+                    let records = if policy.max_vectors_per_shard > 0 {
+                        let limit =
+                            (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                        &shard.records[..limit]
+                    } else {
+                        &shard.records
+                    };
+                    Ok(exact_search(query, records, metric, k))
+                })
+                .collect();
+            let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
             Ok(merge_top_k(all_results, k))
         }
     }
@@ -245,34 +261,37 @@ impl IndexSearcher {
         let table = codebook.compute_distance_table(query)?;
         let metadata_map = self.load_metadata_map()?;
 
-        let mut all_results: Vec<SearchResult> = Vec::new();
-
-        for &shard_id in probe_shards {
-            let shard = self.load_pq_shard(shard_id)?;
-            let max_entries = if max_vectors_per_shard > 0 {
-                (max_vectors_per_shard as usize).min(shard.entries.len())
-            } else {
-                shard.entries.len()
-            };
-            let mut scored: Vec<SearchResult> = shard
-                .entries
-                .iter()
-                .take(max_entries)
-                .map(|(id, codes)| SearchResult {
-                    id: *id,
-                    score: codebook.adc_distance(codes, &table),
-                    metadata: metadata_map.get(&id.to_string()).cloned(),
-                })
-                .collect();
-            scored.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            scored.truncate(k);
-            all_results.extend(scored);
-        }
-
+        // Load and score PQ-encoded shards concurrently.  The codebook distance
+        // table and metadata map are computed once and shared across tasks.
+        let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.load_pq_shard(shard_id)?;
+                let max_entries = if max_vectors_per_shard > 0 {
+                    (max_vectors_per_shard as usize).min(shard.entries.len())
+                } else {
+                    shard.entries.len()
+                };
+                let mut scored: Vec<SearchResult> = shard
+                    .entries
+                    .iter()
+                    .take(max_entries)
+                    .map(|(id, codes)| SearchResult {
+                        id: *id,
+                        score: codebook.adc_distance(codes, &table),
+                        metadata: metadata_map.get(&id.to_string()).cloned(),
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored.truncate(k);
+                Ok(scored)
+            })
+            .collect();
+        let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
         Ok(merge_top_k(all_results, k))
     }
 
@@ -313,16 +332,8 @@ impl IndexSearcher {
             candidates.iter().map(|result| result.id).collect();
 
         let vector_lookup: HashMap<VectorId, Vec<f32>> = {
-            let cache = self.cache.lock().map_err(|_| {
-                IndexError::Other(
-                    "shard cache lock poisoned during rerank: a previous thread panicked \
-                         while holding the cache lock"
-                        .into(),
-                )
-            })?;
-
             let mut vectors = HashMap::with_capacity(remaining_ids.len());
-            for shard in cache.values() {
+            for shard in self.cache.cached_values()? {
                 for record in &shard.records {
                     if remaining_ids.remove(&record.id) {
                         if record.data.len() != expected_dims {
@@ -438,141 +449,112 @@ impl IndexSearcher {
 
     /// Load a PQ-encoded shard from cache or store.
     fn load_pq_shard(&self, shard_id: ShardId) -> Result<Arc<PqShard>> {
-        {
-            let cache = self
-                .pq_shard_cache
-                .lock()
-                .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
-            if let Some(s) = cache.get(&shard_id) {
-                return Ok(Arc::clone(s));
+        self.pq_shard_cache.get_or_load(shard_id, || {
+            let shard_def = self
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard_id)
+                .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+            let bytes = self.store.get(&shard_def.artifact_key)?;
+            let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+            if shard.dims != self.manifest.dims as usize {
+                return Err(IndexError::Other(format!(
+                    "PQ shard {shard_id} dims {} do not match manifest dims {}",
+                    shard.dims, self.manifest.dims
+                )));
             }
-        }
-
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|s| s.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let shard = Arc::new(PqShard::from_bytes(&bytes)?);
-        if shard.dims != self.manifest.dims as usize {
-            return Err(IndexError::Other(format!(
-                "PQ shard {shard_id} dims {} do not match manifest dims {}",
-                shard.dims, self.manifest.dims
-            )));
-        }
-        if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
-            return Err(IndexError::Other(format!(
-                "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
-                shard.pq_m, self.manifest.compression.pq_num_subspaces
-            )));
-        }
-        if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
-            return Err(IndexError::Other(format!(
-                "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
-                shard.pq_k, self.manifest.compression.pq_codebook_size
-            )));
-        }
-
-        let mut cache = self
-            .pq_shard_cache
-            .lock()
-            .map_err(|_| IndexError::Other("PQ shard cache lock poisoned".into()))?;
-        cache.insert(shard_id, Arc::clone(&shard));
-        Ok(shard)
+            if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
+                return Err(IndexError::Other(format!(
+                    "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
+                    shard.pq_m, self.manifest.compression.pq_num_subspaces
+                )));
+            }
+            if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
+                return Err(IndexError::Other(format!(
+                    "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
+                    shard.pq_k, self.manifest.compression.pq_codebook_size
+                )));
+            }
+            Ok(shard)
+        })
     }
 
     // ── Raw shard path ────────────────────────────────────────────────────────
 
-    /// Load a raw shard from cache or store.
-    fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
-            cache.record_access(shard_id);
-            if let Some(idx) = cache.get(shard_id) {
-                return Ok(idx);
-            }
-        }
+    fn record_access(&self, shard_id: ShardId) -> Result<()> {
+        let mut counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("search access-count lock poisoned".into()))?;
+        *counts.entry(shard_id).or_insert(0) += 1;
+        Ok(())
+    }
 
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|s| s.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        let warm_threshold = self.prefetch.as_ref().and_then(|policy| {
-            if policy.enabled {
-                Some(u64::from(policy.min_query_count))
-            } else {
-                None
-            }
-        });
-
-        let to_warm: Vec<(ShardId, String)> = {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
-            cache.insert(shard_id, Arc::clone(&idx));
-
-            match warm_threshold {
-                Some(threshold) => self
-                    .manifest
-                    .shards
-                    .iter()
-                    .filter(|shard| {
-                        !cache.contains(shard.shard_id)
-                            && cache.access_count(shard.shard_id) >= threshold
-                    })
-                    .map(|shard| (shard.shard_id, shard.artifact_key.clone()))
-                    .collect(),
-                None => Vec::new(),
-            }
+    fn prefetch_candidates(&self) -> Result<Vec<(ShardId, String)>> {
+        let Some(policy) = self.prefetch.as_ref().filter(|policy| policy.enabled) else {
+            return Ok(Vec::new());
         };
 
-        for (warm_id, artifact_key) in to_warm {
-            match self.store.get(&artifact_key) {
-                Ok(warm_bytes) => match ShardIndex::from_bytes(&warm_bytes) {
-                    Ok(warm_idx) => {
-                        if let Ok(mut cache) = self.cache.lock() {
-                            if !cache.contains(warm_id) {
-                                debug!(shard_id = ?warm_id, "prefetch: warming hot shard");
-                                cache.insert(warm_id, Arc::new(warm_idx));
-                            }
-                        } else {
-                            debug!(
-                                shard_id = ?warm_id,
-                                "prefetch: search cache lock poisoned while warming shard"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        debug!(
-                            shard_id = ?warm_id,
-                            error = %error,
-                            "prefetch: failed to parse shard"
-                        );
-                    }
-                },
+        let threshold = u64::from(policy.min_query_count);
+        let counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("search access-count lock poisoned".into()))?;
+
+        self.manifest
+            .shards
+            .iter()
+            .filter(|shard| counts.get(&shard.shard_id).copied().unwrap_or(0) >= threshold)
+            .filter_map(|shard| match self.cache.contains(shard.shard_id) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok((shard.shard_id, shard.artifact_key.clone()))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    fn warm_hot_shards(&self) -> Result<()> {
+        for (shard_id, artifact_key) in self.prefetch_candidates()? {
+            match self.cache.get_or_load_with_status(shard_id, || {
+                let bytes = self.store.get(&artifact_key)?;
+                Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+            }) {
+                Ok((_, crate::cache::CacheAccess::Miss)) => {
+                    debug!(?shard_id, "prefetch: warmed hot shard");
+                }
+                Ok((_, crate::cache::CacheAccess::Hit | crate::cache::CacheAccess::Raced)) => {}
                 Err(error) => {
-                    debug!(
-                        shard_id = ?warm_id,
-                        error = %error,
-                        "prefetch: failed to load shard from store"
-                    );
+                    debug!(?shard_id, %error, "prefetch: failed to warm shard");
                 }
             }
         }
-        Ok(idx)
+
+        Ok(())
+    }
+
+    /// Load a raw shard from cache or store.
+    fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        self.record_access(shard_id)?;
+
+        let (shard, access) = self.cache.get_or_load_with_status(shard_id, || {
+            let shard_def = self
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard_id)
+                .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+
+            let bytes = self.store.get(&shard_def.artifact_key)?;
+            Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+        })?;
+
+        if matches!(access, crate::cache::CacheAccess::Miss) {
+            self.warm_hot_shards()?;
+        }
+
+        Ok(shard)
     }
 }
 
@@ -849,12 +831,15 @@ mod tests {
                 .unwrap()
         };
         let (counting_store, shard_loads) = CountingStore::new(base_store as Arc<dyn ObjectStore>);
-        let searcher = IndexSearcher::new(counting_store as Arc<dyn ObjectStore>, manifest.clone())
-            .with_cache_capacity(1)
-            .with_prefetch(PrefetchPolicy {
-                enabled: true,
-                min_query_count: 2,
-            });
+        let searcher = IndexSearcher::with_cache_capacity(
+            counting_store as Arc<dyn ObjectStore>,
+            manifest.clone(),
+            1,
+        )
+        .with_prefetch(PrefetchPolicy {
+            enabled: true,
+            min_query_count: 2,
+        });
 
         let hot_shard = manifest.shards[0].shard_id;
         let cold_shard = manifest.shards[1].shard_id;

@@ -3,9 +3,7 @@
 Shardlake is configured primarily through CLI flags. A `config/default.toml` file
 documents the default values for the fields that map to `SystemConfig`, but it is not
 loaded automatically—CLI flags always take precedence and are the authoritative way to
-set configuration today. Fields without dedicated CLI flags are still relevant for
-programmatic consumers that construct search components from `SystemConfig`
-directly (for example via `IndexSearcher::from_config`).
+set configuration today.
 
 ## `SystemConfig` fields
 
@@ -25,9 +23,9 @@ individual command flags.
 | `pq_num_subspaces` | u32 | `8` | Number of PQ sub-spaces (`M`) used when `pq_enabled` is `true`. Must be at least 1 and divide the embedding dimension evenly. |
 | `pq_codebook_size` | u32 | `256` | Number of centroids (`K`) per PQ sub-space when `pq_enabled` is `true`. Must be in the range `1..=256`. |
 | `kmeans_sample_size` | u32 or absent | absent (`None`) | Maximum number of vectors used to train K-means centroids. When absent, all vectors are used. When set to a positive `n` smaller than the dataset size, a reproducible random sample of up to `n` vectors is drawn (using `kmeans_seed`) before running K-means. All vectors—including those not in the sample—are still assigned to the nearest centroid after training, so no data is lost. Recorded in `algorithm.params.kmeans_sample_size` in the manifest only when bounded sampling actually occurs. Equivalent to `--kmeans-sample-size`. |
-| `cache_capacity` | u32 | `0` | Maximum number of shards to hold in the in-memory shard cache. `0` means no limit (all loaded shards are retained for the process lifetime). When the limit is exceeded, the least-frequently-accessed shard is evicted (LFU policy). Has no effect on cold-path behaviour: shards that are not probed are never loaded. |
-| `prefetch.enabled` | bool | `false` | Enable shard prefetch warming. When `true`, shards whose probe count reaches `prefetch.min_query_count` are loaded into the cache proactively on the next cache-miss event, reducing future I/O latency for hot shards. Disabled by default; lazy-load semantics are preserved when `false`. |
-| `prefetch.min_query_count` | u32 | `3` | Minimum number of times a shard must be probed before it is considered "hot" and eligible for prefetch warming. Must be ≥ 1 when `prefetch.enabled` is `true`. |
+| `shard_cache_capacity` | usize | `128` | Maximum number of shard indexes kept in the in-memory LRU cache at query time. When more than `shard_cache_capacity` distinct shards have been loaded, the least-recently-used shard is evicted to bound memory usage. Set this to at least as large as `nprobe` (or `candidate_shards` when non-zero) so that all shards probed in a single query can stay hot in cache simultaneously. This value must be greater than or equal to `1`. Equivalent to `--shard-cache-capacity` on `serve`. |
+| `prefetch.enabled` | bool | `false` | Enable optional shard warming for programmatic consumers that construct an `IndexSearcher` or `CachedShardLoader` with prefetch support. Lazy loading remains unchanged when disabled. |
+| `prefetch.min_query_count` | u32 | `3` | Minimum number of probe events a shard must accumulate before it becomes eligible for warming. Must be ≥ 1 when `prefetch.enabled` is `true`. |
 
 ### `config/default.toml` (reference)
 
@@ -42,10 +40,10 @@ max_vectors_per_shard = 0
 pq_enabled = false
 pq_num_subspaces = 8
 pq_codebook_size = 256
+shard_cache_capacity = 128
 # kmeans_sample_size is absent by default (all vectors used for training).
 # Set to a positive integer to limit centroid training to a sample:
 # kmeans_sample_size = 50000
-cache_capacity = 0
 
 [prefetch]
 enabled = false
@@ -119,59 +117,30 @@ A typical starting point is `nprobe ≈ sqrt(num_shards)`. Measure recall@k with
 
 ## Prefetch policy
 
-The **prefetch policy** controls optional shard warming based on observed query
-frequency.  When enabled, shards that have been probed enough times are
-considered "hot" and are loaded into the cache proactively on the next
-cache-miss event, reducing I/O latency for subsequent queries.
+`PrefetchPolicy` adds optional shard warming on top of the normal lazy-loading
+path used by `IndexSearcher` and `CachedShardLoader`.
 
-Prefetching is **disabled by default**.  The lazy-load-on-probe semantics are
-preserved for all shards when `prefetch.enabled = false`.
+When `prefetch.enabled = true`, a shard becomes eligible for warming once it
+has been probed at least `prefetch.min_query_count` times. On a later cache
+miss, eligible hot shards that are not currently resident in the bounded LRU
+cache are loaded proactively in the background of that miss-handling path.
+
+This keeps cold shards lazy while reducing follow-up I/O for repeatedly probed
+hot shards.
 
 ### `prefetch.enabled`
 
-Set to `true` to activate shard warming.  When disabled (the default) the
-`min_query_count` field has no effect.
+Turns proactive warming on or off. Disabled by default.
 
 ### `prefetch.min_query_count`
 
-The minimum number of times a shard must be probed before it becomes eligible
-for prefetch warming.  A shard is considered "hot" once its probe count
-reaches this value.
+Controls how many probe events are required before a shard is considered hot.
 
 | Value | Effect |
 |-------|--------|
 | `0` | Invalid when `enabled = true`; rejected with `"min_query_count must be ≥ 1 when prefetch is enabled"` |
-| `1` | Every shard is warmed on its first probe |
-| `3` (default) | A shard must be probed at least 3 times before warming |
-
-### `cache_capacity` and eviction
-
-Prefetching works best when combined with a bounded cache (`cache_capacity > 0`).
-When a capacity limit is set:
-
-1. Access counts are tracked per shard across both hits and misses.
-2. When the cache is full, the **least-frequently-used** (LFU) shard is
-   evicted to make room for a new entry.
-3. Access counts **persist after eviction**; a frequently-used shard that was
-   evicted is still recognised as "hot" and re-warmed when the prefetch
-   threshold is met.
-
-With an **unbounded cache** (`cache_capacity = 0`, the default), every loaded
-shard is retained forever and eviction never occurs; prefetch warming is only
-triggered for shards that have a high access count but have never been loaded.
-
-### Example: bounded cache with prefetch warming
-
-```toml
-# Keep at most 64 shards in memory; evict cold ones.
-cache_capacity = 64
-
-[prefetch]
-# Enable proactive warming of hot shards.
-enabled = true
-# A shard must be probed at least 5 times before it is warmed.
-min_query_count = 5
-```
+| `1` | A shard becomes eligible for warming after its first probe |
+| `3` (default) | A shard becomes eligible after three probes |
 
 ## Validation
 
@@ -183,9 +152,9 @@ request time (for per-request HTTP overrides).  The following invariants are enf
   `"invalid fan-out policy: candidate_centroids must be ≥ 1"`.
 - `candidate_shards` and `max_vectors_per_shard` accept any value including `0`
   (meaning no limit).
-- `prefetch.min_query_count` must be ≥ 1 when `prefetch.enabled = true`. A value of
-  `0` would cause every shard to be eagerly warmed on its first access and is rejected
-  with: `"invalid prefetch policy: min_query_count must be ≥ 1 when prefetch is enabled"`.
+- `shard_cache_capacity` must be ≥ 1. A value of `0` is rejected during config
+  deserialisation instead of panicking later during cache construction.
+- `prefetch.min_query_count` must be ≥ 1 when `prefetch.enabled = true`.
 
 ## Storage backends
 

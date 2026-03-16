@@ -8,15 +8,11 @@ max_vectors_per_shard = 0
 pq_enabled = false
 pq_num_subspaces = 8
 pq_codebook_size = 256
+shard_cache_capacity = 128
 # kmeans_sample_size is unset (absent = None).  When absent, all vectors are
 # used for centroid training.  Set to a positive integer to train centroids
 # from a random sample of that many vectors instead (e.g. 50000).
 # kmeans_sample_size = 50000
-
-# cache_capacity: maximum number of shards to hold in the in-memory cache.
-# 0 means no limit (all loaded shards are retained for the process lifetime).
-# When the limit is exceeded the least-frequently-accessed shard is evicted.
-cache_capacity = 0
 
 # prefetch: optional shard warming based on query frequency.
 # When enabled, shards probed at least min_query_count times are warmed into

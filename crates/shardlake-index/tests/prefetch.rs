@@ -1,7 +1,6 @@
 //! Focused tests for the shard prefetch policy and cache eviction.
 //!
 //! These tests exercise:
-//! - `ShardCache` access-frequency tracking and LFU eviction.
 //! - `CachedShardLoader` with prefetching disabled (lazy cold-path).
 //! - `CachedShardLoader` with prefetching enabled (hot-shard warming).
 //! - Interaction between the prefetch policy and cache capacity limits.
@@ -175,11 +174,12 @@ fn loader_disabled_policy_no_extra_loads() {
         enabled: false,
         min_query_count: 1,
     };
-    // capacity=1 so second insert would normally evict the first.
-    let loader =
-        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
-            .with_capacity(1)
-            .with_prefetch(policy);
+    let loader = CachedShardLoader::with_cache_capacity(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        manifest.clone(),
+        1,
+    )
+    .with_prefetch(policy);
 
     let s0 = manifest.shards[0].shard_id;
     let s1 = manifest.shards[1].shard_id;
@@ -205,12 +205,12 @@ fn loader_enabled_policy_warms_evicted_hot_shard() {
         enabled: true,
         min_query_count: 2,
     };
-    // capacity=1: only one shard fits; a new load always evicts the current
-    // resident — unless it is hot enough to survive LFU ordering.
-    let loader =
-        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
-            .with_capacity(1)
-            .with_prefetch(policy);
+    let loader = CachedShardLoader::with_cache_capacity(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        manifest.clone(),
+        1,
+    )
+    .with_prefetch(policy);
 
     let s0 = manifest.shards[0].shard_id;
     let s1 = manifest.shards[1].shard_id;
@@ -258,10 +258,12 @@ fn loader_enabled_policy_threshold_not_met_no_warming() {
         enabled: true,
         min_query_count: 5, // high threshold
     };
-    let loader =
-        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
-            .with_capacity(1)
-            .with_prefetch(policy);
+    let loader = CachedShardLoader::with_cache_capacity(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        manifest.clone(),
+        1,
+    )
+    .with_prefetch(policy);
 
     let s0 = manifest.shards[0].shard_id;
     let s1 = manifest.shards[1].shard_id;
@@ -282,14 +284,17 @@ fn loader_enabled_policy_threshold_not_met_no_warming() {
 
 // ── cache capacity / eviction ─────────────────────────────────────────────────
 
-/// The unbounded loader (capacity=0) must never evict a shard.
+/// A loader whose capacity exceeds the shard count must retain all loaded shards.
 #[test]
 fn loader_unbounded_cache_retains_all_loaded_shards() {
     let tmp = tempfile::tempdir().unwrap();
     let (manifest, store, counter) = build_index(&tmp, 3, "unbounded");
 
-    let loader =
-        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone());
+    let loader = CachedShardLoader::with_cache_capacity(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        manifest.clone(),
+        manifest.shards.len() + 1,
+    );
 
     // Load all shards once.
     for shard_def in &manifest.shards {
@@ -315,16 +320,17 @@ fn loader_bounded_cache_does_not_exceed_capacity() {
     let tmp = tempfile::tempdir().unwrap();
     let (manifest, store, _counter) = build_index(&tmp, 4, "bounded");
 
-    let loader =
-        CachedShardLoader::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
-            .with_capacity(2);
+    let loader = CachedShardLoader::with_cache_capacity(
+        Arc::clone(&store) as Arc<dyn ObjectStore>,
+        manifest.clone(),
+        2,
+    );
 
     let s0 = manifest.shards[0].shard_id;
     let s1 = manifest.shards[1].shard_id;
     let s2 = manifest.shards[2].shard_id;
     let s3 = manifest.shards[3].shard_id;
 
-    // Make shard 0 hot so later LFU evictions are deterministic.
     loader.load(s0).unwrap();
     loader.load(s0).unwrap();
     loader.load(s1).unwrap();

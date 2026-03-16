@@ -1,6 +1,9 @@
 //! Integration tests for the composable ANN query pipeline.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use shardlake_core::{
     config::{FanOutPolicy, SystemConfig},
@@ -11,12 +14,12 @@ use shardlake_core::{
 };
 use shardlake_index::{
     pipeline::{
-        CandidateSearchStage, ExactCandidateStage, ExactRerankStage, PqCandidateStage,
-        QueryPipeline, RerankStage,
+        CandidateSearchStage, ExactRerankStage, LoadShardStage, PqCandidateStage, QueryPipeline,
+        RerankStage,
     },
     pq::{PqCodebook, PqParams},
     shard::ShardIndex,
-    BuildParams, IndexBuilder, IndexSearcher,
+    BuildParams, IndexBuilder, IndexError, IndexSearcher,
 };
 use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
 
@@ -137,8 +140,15 @@ fn pipeline_matches_searcher_results() {
         };
         let searcher_results = searcher.search(&query, 5, &policy).unwrap();
         let pipeline_results = pipeline.run(&query, 5, 2).unwrap();
-        let searcher_ids: Vec<VectorId> = searcher_results.iter().map(|result| result.id).collect();
-        let pipeline_ids: Vec<VectorId> = pipeline_results.iter().map(|result| result.id).collect();
+        let mut searcher_ids: Vec<VectorId> =
+            searcher_results.iter().map(|result| result.id).collect();
+        let mut pipeline_ids: Vec<VectorId> =
+            pipeline_results.iter().map(|result| result.id).collect();
+        // Sort both before comparing: the two implementations may break ties
+        // between equidistant vectors differently due to floating-point
+        // precision, so we only verify that the same candidate set is found.
+        searcher_ids.sort();
+        pipeline_ids.sort();
         assert_eq!(
             searcher_ids, pipeline_ids,
             "query {index} should match searcher results"
@@ -342,4 +352,88 @@ fn pq_rerank_pipeline_matches_exact_topk_set() {
         .map(|result| result.id)
         .collect();
     assert_eq!(approx_ids, exact_ids);
+}
+
+#[test]
+fn pipeline_shard_searches_run_concurrently() {
+    struct ConcurrentProbeSearcher {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl CandidateSearchStage for ConcurrentProbeSearcher {
+        fn search(
+            &self,
+            _query: &[f32],
+            _shard: &ShardIndex,
+            _metric: DistanceMetric,
+            _k: usize,
+        ) -> shardlake_index::Result<Vec<SearchResult>> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut cur = self.peak.load(Ordering::SeqCst);
+            while now > cur {
+                match self
+                    .peak
+                    .compare_exchange(cur, now, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    let records = make_records(40, 4);
+    let (store, manifest, _tmp) =
+        build_index(records.clone(), 4, 4, "ds-par", DistanceMetric::Euclidean);
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)
+        .with_candidate_search(Box::new(ConcurrentProbeSearcher {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        }))
+        .build();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+
+    pool.install(|| pipeline.run(&records[0].data, 5, 4))
+        .unwrap();
+
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak >= 2,
+        "expected at least 2 concurrent shard searches, observed peak = {observed_peak}"
+    );
+}
+
+#[test]
+fn pipeline_shard_load_failure_propagates() {
+    struct FailingLoader;
+
+    impl LoadShardStage for FailingLoader {
+        fn load(&self, _shard_id: ShardId) -> shardlake_index::Result<Arc<ShardIndex>> {
+            Err(IndexError::Other("injected shard load failure".into()))
+        }
+    }
+
+    let records = make_records(20, 4);
+    let (store, manifest, _tmp) =
+        build_index(records.clone(), 2, 4, "ds-fail", DistanceMetric::Euclidean);
+    let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)
+        .with_loader(Box::new(FailingLoader))
+        .build();
+
+    let err = pipeline
+        .run(&records[0].data, 5, 2)
+        .expect_err("pipeline must propagate shard load error");
+    assert!(
+        err.to_string().contains("injected shard load failure"),
+        "unexpected error message: {err}"
+    );
 }
