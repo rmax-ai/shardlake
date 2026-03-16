@@ -1,13 +1,13 @@
 //! `shardlake serve` – start HTTP query server.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 
 use shardlake_core::config::FanOutPolicy;
-use shardlake_index::{IndexSearcher, DEFAULT_SHARD_CACHE_CAPACITY};
+use shardlake_index::{bm25::Bm25Index, IndexSearcher, DEFAULT_SHARD_CACHE_CAPACITY};
 use shardlake_manifest::Manifest;
 use shardlake_serve::{build_router, AppState, PrometheusMetrics};
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -62,17 +62,18 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
         shard_cache_capacity = args.shard_cache_capacity,
         "Serving manifest"
     );
-    let searcher = std::sync::Arc::new(IndexSearcher::with_cache_capacity(
-        std::sync::Arc::clone(&store),
+    let bm25_index = load_bm25_index(&*store, &manifest)?;
+    let searcher = Arc::new(IndexSearcher::with_cache_capacity(
+        Arc::clone(&store),
         manifest,
         args.shard_cache_capacity,
     ));
-    let metrics = std::sync::Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
+    let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
     let state = AppState {
         searcher,
         fan_out,
         metrics,
-        bm25_index: None,
+        bm25_index,
     };
     let router = build_router(state);
 
@@ -81,6 +82,23 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     println!("Serving on http://{}", args.bind);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+fn load_bm25_index(store: &dyn ObjectStore, manifest: &Manifest) -> Result<Option<Arc<Bm25Index>>> {
+    manifest
+        .lexical
+        .as_ref()
+        .map(|lexical| {
+            Bm25Index::load(store, &lexical.artifact_key)
+                .with_context(|| {
+                    format!(
+                        "failed to load lexical index artifact `{}` for index version `{}`",
+                        lexical.artifact_key, manifest.index_version
+                    )
+                })
+                .map(Arc::new)
+        })
+        .transpose()
 }
 
 fn parse_positive_shard_cache_capacity(raw: &str) -> std::result::Result<usize, String> {
@@ -95,9 +113,16 @@ fn parse_positive_shard_cache_capacity(raw: &str) -> std::result::Result<usize, 
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use clap::Parser;
+    use shardlake_core::types::{
+        DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId,
+    };
+    use shardlake_index::{bm25::BM25Params, Bm25Index};
+    use shardlake_manifest::{BuildMetadata, CompressionConfig, LexicalIndexConfig, Manifest};
+    use shardlake_storage::{paths, LocalObjectStore};
 
-    use super::ServeArgs;
+    use super::{load_bm25_index, ServeArgs};
 
     #[test]
     fn serve_args_reject_zero_shard_cache_capacity() {
@@ -107,5 +132,53 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("--shard-cache-capacity"));
         assert!(message.contains("value must be greater than 0"));
+    }
+
+    #[test]
+    fn load_bm25_index_returns_index_when_manifest_includes_lexical_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LocalObjectStore::new(tmp.path()).expect("store");
+        let lexical_key = paths::index_lexical_key("idx-test");
+        let bm25 = Bm25Index::build(&[(VectorId(1), "quick brown fox")], BM25Params::default());
+        bm25.save(&store, &lexical_key).expect("save lexical index");
+
+        let manifest = Manifest {
+            manifest_version: 4,
+            dataset_version: DatasetVersion("ds-test".into()),
+            embedding_version: EmbeddingVersion("emb-test".into()),
+            index_version: IndexVersion("idx-test".into()),
+            alias: "latest".into(),
+            dims: 3,
+            distance_metric: DistanceMetric::Cosine,
+            vectors_key: "datasets/ds-test/vectors.jsonl".into(),
+            metadata_key: "datasets/ds-test/metadata.json".into(),
+            shards: Vec::new(),
+            total_vector_count: 1,
+            build_metadata: BuildMetadata {
+                built_at: Utc::now(),
+                builder_version: "test".into(),
+                num_kmeans_iters: 1,
+                nprobe_default: 1,
+                build_duration_secs: 0.0,
+            },
+            algorithm: Default::default(),
+            shard_summary: None,
+            compression: CompressionConfig::default(),
+            recall_estimate: None,
+            coarse_quantizer_key: None,
+            lexical: Some(LexicalIndexConfig {
+                artifact_key: lexical_key,
+                k1: 1.5,
+                b: 0.75,
+                doc_count: 1,
+            }),
+        };
+
+        let loaded = load_bm25_index(&store, &manifest).expect("load lexical index");
+
+        let index = loaded.expect("bm25 index should be loaded");
+        let results = index.search("quick", 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.0, 1);
     }
 }
