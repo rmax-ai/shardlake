@@ -52,10 +52,9 @@ impl std::fmt::Display for IndexVersion {
 
 /// Identifies the ANN algorithm family used to build and query an index.
 ///
-/// This type is the key used by [`AnnPlugin`](shardlake_index::plugin::AnnPlugin)
-/// implementations and [`AnnRegistry`](shardlake_index::plugin::AnnRegistry) to
-/// select the right candidate-search backend without hard-coding algorithm checks
-/// at call sites.
+/// This type is the key used by `AnnPlugin` implementations and `AnnRegistry`
+/// to select the right candidate-search backend without hard-coding algorithm
+/// checks at call sites.
 ///
 /// # Examples
 ///
@@ -99,7 +98,8 @@ impl std::str::FromStr for AnnFamily {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Other`] when `s` does not match any known family.
+    /// Returns [`crate::error::CoreError::Other`] when `s` does not match any
+    /// known family.
     fn from_str(s: &str) -> crate::error::Result<Self> {
         match s {
             "ivf_flat" => Ok(Self::IvfFlat),
