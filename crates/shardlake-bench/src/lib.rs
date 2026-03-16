@@ -18,12 +18,32 @@ use shardlake_core::{
     types::{DistanceMetric, VectorId, VectorRecord},
 };
 use shardlake_index::{
+    bm25::Bm25Index,
     exact::{exact_search, precision_at_k, recall_at_k},
     kmeans::top_n_centroids,
+    ranking::{rank_hybrid, HybridRankingPolicy},
     IndexSearcher, Result as IndexResult, PQ8_CODEC,
 };
 use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
+
+/// Convert an optional metadata [`serde_json::Value`] to a plain text string
+/// suitable for BM25 querying.
+///
+/// - `None` → empty string (BM25 search returns no results for an empty query).
+/// - `String` values → returned as-is.
+/// - All other JSON values → formatted with `serde_json::Value::to_string()`.
+///
+/// This matches the text extraction convention used when building BM25 indexes
+/// from corpus metadata, ensuring that query text and index text are tokenised
+/// consistently.
+pub fn metadata_to_text(meta: &Option<serde_json::Value>) -> String {
+    match meta {
+        None => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    }
+}
 
 /// Errors that can arise while evaluating partition quality.
 #[derive(Debug, thiserror::Error)]
@@ -701,6 +721,203 @@ fn nearest_rank_percentile(values: &mut [f64], percentile: f64) -> f64 {
     let rank = ((values.len() as f64) * percentile).ceil() as usize;
     let index = rank.saturating_sub(1).min(values.len() - 1);
     values[index]
+}
+
+// ── Hybrid recall evaluation ───────────────────────────────────────────────────
+
+/// Quality and latency metrics for a single retrieval mode (vector-only, BM25-only, or hybrid).
+///
+/// All recall and precision values are in the range `[0, 1]`.  Latencies are in microseconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalModeMetrics {
+    /// Mean recall@k across all evaluated queries (fraction of true top-k found).
+    pub recall_at_k: f64,
+    /// Mean precision@k across all evaluated queries (fraction of retrieved results that are true top-k).
+    pub precision_at_k: f64,
+    /// Mean per-query search latency in microseconds.
+    pub mean_latency_us: f64,
+    /// 99th-percentile per-query search latency in microseconds.
+    pub p99_latency_us: f64,
+}
+
+/// Evaluation report produced by [`run_eval_hybrid`].
+///
+/// Compares vector-only, BM25-only, and hybrid retrieval across the same query
+/// set using recall@k and precision@k against an exact vector ground-truth, so
+/// the improvement (or regression) from adding the lexical signal is immediately
+/// visible.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use shardlake_bench::run_eval_hybrid;
+/// use shardlake_index::ranking::HybridRankingPolicy;
+///
+/// let policy = HybridRankingPolicy { vector_weight: 0.7, bm25_weight: 0.3 };
+/// let report = run_eval_hybrid(
+///     &searcher, &bm25, &queries, &query_texts, &corpus, 10, &fan_out_policy,
+///     metric, &policy,
+/// )?;
+/// println!("hybrid recall@10: {:.4}", report.hybrid.recall_at_k);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalHybridReport {
+    /// Number of query vectors evaluated.
+    pub num_queries: usize,
+    /// Number of nearest neighbours retrieved per query.
+    pub k: usize,
+    /// Number of shards probed per query.
+    pub nprobe: usize,
+    /// Weight applied to the normalized vector-distance score in hybrid ranking.
+    pub vector_weight: f32,
+    /// Weight applied to the normalized BM25 score in hybrid ranking.
+    pub bm25_weight: f32,
+    /// Metrics for vector-only retrieval (ANN search with no lexical signal).
+    pub vector_only: RetrievalModeMetrics,
+    /// Metrics for BM25-only retrieval (lexical search with no vector signal).
+    pub bm25_only: RetrievalModeMetrics,
+    /// Metrics for hybrid retrieval (combined vector + BM25 signal).
+    pub hybrid: RetrievalModeMetrics,
+}
+
+/// Evaluate hybrid retrieval quality versus vector-only and BM25-only baselines.
+///
+/// For each query the function runs three search modes — vector-only ANN,
+/// BM25-only lexical, and weighted hybrid — and measures recall@k and
+/// precision@k against an exact brute-force ground truth derived from the full
+/// `corpus`.  The three sets of metrics are returned together in an
+/// [`EvalHybridReport`] that makes quality differences directly comparable.
+///
+/// # Arguments
+///
+/// * `searcher`      – A loaded [`IndexSearcher`] used for vector-only and hybrid ANN.
+/// * `bm25`          – A loaded [`Bm25Index`] used for BM25-only and hybrid lexical search.
+/// * `queries`       – Query vectors; ids and data are used for ANN and ground-truth.
+/// * `query_texts`   – BM25 query strings, one per entry in `queries` (same order).
+/// * `corpus`        – Full corpus used to compute exact ground-truth top-k per query.
+/// * `k`             – Number of nearest neighbours to retrieve per query.
+/// * `policy`        – Query-time fan-out policy (centroid, shard, and per-shard limits).
+/// * `metric`        – Distance metric for exact ground-truth computation.
+/// * `hybrid_policy` – Weighting policy for blending vector and BM25 scores.
+///
+/// # Errors
+///
+/// Returns an error when `queries` is empty or when the ANN search fails.
+#[allow(clippy::too_many_arguments)]
+pub fn run_eval_hybrid(
+    searcher: &IndexSearcher,
+    bm25: &Bm25Index,
+    queries: &[VectorRecord],
+    query_texts: &[String],
+    corpus: &[VectorRecord],
+    k: usize,
+    policy: &FanOutPolicy,
+    metric: DistanceMetric,
+    hybrid_policy: &HybridRankingPolicy,
+) -> IndexResult<EvalHybridReport> {
+    if queries.is_empty() {
+        return Err(shardlake_index::IndexError::Other(
+            "eval-hybrid requires at least one query vector".to_string(),
+        ));
+    }
+    if query_texts.len() != queries.len() {
+        return Err(shardlake_index::IndexError::Other(format!(
+            "eval-hybrid requires one query text per query vector (got {} query vectors and {} query texts)",
+            queries.len(),
+            query_texts.len()
+        )));
+    }
+
+    let nprobe = policy.candidate_centroids as usize;
+
+    let mut vec_recalls: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut vec_precisions: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut vec_latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+
+    let mut bm25_recalls: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut bm25_precisions: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut bm25_latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+
+    let mut hybrid_recalls: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut hybrid_precisions: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut hybrid_latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+
+    for (query, text) in queries.iter().zip(query_texts.iter()) {
+        // Exact ground truth for vector-based recall.
+        let gt = exact_search(&query.data, corpus, metric, k);
+        let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+        // ── Vector-only ──────────────────────────────────────────────────
+        let t0 = Instant::now();
+        let vec_results = searcher.search(&query.data, k, policy)?;
+        vec_latencies_us.push(t0.elapsed().as_micros() as f64);
+        let vec_ids: Vec<VectorId> = vec_results.iter().map(|r| r.id).collect();
+        vec_recalls.push(recall_at_k(&gt_ids, &vec_ids));
+        vec_precisions.push(precision_at_k(&gt_ids, &vec_ids));
+
+        // ── BM25-only ────────────────────────────────────────────────────
+        let t0 = Instant::now();
+        let bm25_results = bm25.search(text, k);
+        bm25_latencies_us.push(t0.elapsed().as_micros() as f64);
+        let bm25_ids: Vec<VectorId> = bm25_results.iter().map(|r| r.id).collect();
+        bm25_recalls.push(recall_at_k(&gt_ids, &bm25_ids));
+        bm25_precisions.push(precision_at_k(&gt_ids, &bm25_ids));
+
+        // ── Hybrid ───────────────────────────────────────────────────────
+        // Re-run vector search to get a fresh set of results for blending.
+        // We request k results from each signal and let rank_hybrid merge them.
+        let t0 = Instant::now();
+        let vec_for_hybrid = searcher.search(&query.data, k, policy)?;
+        let bm25_for_hybrid = bm25.search(text, k);
+        let hybrid_results = rank_hybrid(vec_for_hybrid, bm25_for_hybrid, hybrid_policy, k);
+        hybrid_latencies_us.push(t0.elapsed().as_micros() as f64);
+        let hybrid_ids: Vec<VectorId> = hybrid_results.iter().map(|r| r.id).collect();
+        hybrid_recalls.push(recall_at_k(&gt_ids, &hybrid_ids));
+        hybrid_precisions.push(precision_at_k(&gt_ids, &hybrid_ids));
+    }
+
+    let mean_f64 = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+
+    let vector_only = RetrievalModeMetrics {
+        recall_at_k: mean_f64(&vec_recalls),
+        precision_at_k: mean_f64(&vec_precisions),
+        mean_latency_us: mean_f64(&vec_latencies_us),
+        p99_latency_us: nearest_rank_percentile(&mut vec_latencies_us, 0.99),
+    };
+    let bm25_only = RetrievalModeMetrics {
+        recall_at_k: mean_f64(&bm25_recalls),
+        precision_at_k: mean_f64(&bm25_precisions),
+        mean_latency_us: mean_f64(&bm25_latencies_us),
+        p99_latency_us: nearest_rank_percentile(&mut bm25_latencies_us, 0.99),
+    };
+    let hybrid = RetrievalModeMetrics {
+        recall_at_k: mean_f64(&hybrid_recalls),
+        precision_at_k: mean_f64(&hybrid_precisions),
+        mean_latency_us: mean_f64(&hybrid_latencies_us),
+        p99_latency_us: nearest_rank_percentile(&mut hybrid_latencies_us, 0.99),
+    };
+
+    let report = EvalHybridReport {
+        num_queries: queries.len(),
+        k,
+        nprobe,
+        vector_weight: hybrid_policy.vector_weight,
+        bm25_weight: hybrid_policy.bm25_weight,
+        vector_only,
+        bm25_only,
+        hybrid,
+    };
+
+    info!(
+        num_queries = report.num_queries,
+        k = report.k,
+        vector_only_recall = report.vector_only.recall_at_k,
+        bm25_only_recall = report.bm25_only.recall_at_k,
+        hybrid_recall = report.hybrid.recall_at_k,
+        "Hybrid evaluation complete"
+    );
+
+    Ok(report)
 }
 
 // ── Partition evaluation ───────────────────────────────────────────────────────
@@ -1932,5 +2149,197 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let decoded: CompareAnnReport = serde_json::from_str(&json).unwrap();
         assert!(decoded.entries.is_empty());
+    }
+
+    // ── run_eval_hybrid tests ─────────────────────────────────────────────────
+
+    /// Build a [`Bm25Index`] from a slice of [`VectorRecord`] by serialising
+    /// each record's metadata (or using an empty string when absent).
+    fn build_bm25_from_records(records: &[VectorRecord]) -> Bm25Index {
+        use shardlake_index::bm25::BM25Params;
+        let docs: Vec<(shardlake_core::types::VectorId, String)> = records
+            .iter()
+            .map(|r| {
+                let text = metadata_to_text(&r.metadata);
+                (r.id, text)
+            })
+            .collect();
+        let doc_refs: Vec<(shardlake_core::types::VectorId, &str)> =
+            docs.iter().map(|(id, text)| (*id, text.as_str())).collect();
+        Bm25Index::build(&doc_refs, BM25Params::default())
+    }
+
+    #[test]
+    fn run_eval_hybrid_returns_error_for_empty_queries() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 1, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let bm25 = build_bm25_from_records(&records);
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let hybrid_policy = HybridRankingPolicy {
+            vector_weight: 0.7,
+            bm25_weight: 0.3,
+        };
+
+        let result = run_eval_hybrid(
+            &searcher,
+            &bm25,
+            &[],
+            &[],
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            &hybrid_policy,
+        );
+        assert!(result.is_err(), "empty queries must return an error");
+    }
+
+    #[test]
+    fn run_eval_hybrid_reports_correct_field_counts() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+
+        let bm25 = build_bm25_from_records(&records);
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let query_texts: Vec<String> = queries
+            .iter()
+            .map(|r| metadata_to_text(&r.metadata))
+            .collect();
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let hybrid_policy = HybridRankingPolicy {
+            vector_weight: 0.7,
+            bm25_weight: 0.3,
+        };
+
+        let report = run_eval_hybrid(
+            &searcher,
+            &bm25,
+            &queries,
+            &query_texts,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            &hybrid_policy,
+        )
+        .unwrap();
+
+        assert_eq!(report.num_queries, 5);
+        assert_eq!(report.k, 3);
+        assert_eq!(report.nprobe, 1);
+        assert!((report.vector_weight - 0.7).abs() < 1e-6);
+        assert!((report.bm25_weight - 0.3).abs() < 1e-6);
+
+        for metrics in [&report.vector_only, &report.bm25_only, &report.hybrid] {
+            assert!((0.0..=1.0).contains(&metrics.recall_at_k));
+            assert!((0.0..=1.0).contains(&metrics.precision_at_k));
+            assert!(metrics.mean_latency_us >= 0.0);
+            assert!(metrics.p99_latency_us >= 0.0);
+        }
+    }
+
+    #[test]
+    fn run_eval_hybrid_returns_error_for_mismatched_query_text_count() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let bm25 = build_bm25_from_records(&records);
+        let queries: Vec<VectorRecord> = records[..3].to_vec();
+        let query_texts = vec![metadata_to_text(&queries[0].metadata)];
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let hybrid_policy = HybridRankingPolicy {
+            vector_weight: 0.7,
+            bm25_weight: 0.3,
+        };
+
+        let result = run_eval_hybrid(
+            &searcher,
+            &bm25,
+            &queries,
+            &query_texts,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            &hybrid_policy,
+        );
+
+        assert!(
+            result.is_err(),
+            "mismatched query text count must return an error"
+        );
+    }
+
+    #[test]
+    fn run_eval_hybrid_vector_recall_perfect_with_full_probe() {
+        // With nprobe covering all shards, vector-only recall should be 1.0.
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+
+        let bm25 = build_bm25_from_records(&records);
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let query_texts: Vec<String> = queries
+            .iter()
+            .map(|r| metadata_to_text(&r.metadata))
+            .collect();
+
+        // candidate_centroids=2 covers both shards.
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let hybrid_policy = HybridRankingPolicy {
+            vector_weight: 1.0,
+            bm25_weight: 0.0,
+        };
+
+        let report = run_eval_hybrid(
+            &searcher,
+            &bm25,
+            &queries,
+            &query_texts,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            &hybrid_policy,
+        )
+        .unwrap();
+
+        assert!(
+            (report.vector_only.recall_at_k - 1.0).abs() < 1e-9,
+            "expected perfect vector recall, got {}",
+            report.vector_only.recall_at_k
+        );
     }
 }

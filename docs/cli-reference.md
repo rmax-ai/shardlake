@@ -1,7 +1,7 @@
 # CLI Reference
 
 `shardlake` is the single binary that drives the entire pipeline: ingest → build-index →
-publish → serve → benchmark → eval-ann → compare-ann.
+publish → serve → benchmark → eval-ann → compare-ann → eval-hybrid.
 
 ## Global flags
 
@@ -683,6 +683,8 @@ shardlake eval-ann --k 10 --nprobe 4 --max-queries 500 --output json
 
 ---
 
+---
+
 ## `shardlake compare-ann`
 
 Compares multiple ANN families (IVF-PQ, HNSW, DiskANN, or any combination) in one
@@ -794,6 +796,128 @@ shardlake compare-ann \
   --alias da-idx \
   --k 10 --nprobe 4 --max-queries 500 \
   --output json
+```
+
+---
+
+## `shardlake eval-hybrid`
+
+Evaluates hybrid retrieval quality by running three retrieval modes — **vector-only**,
+**BM25-only**, and **hybrid** — on the same query set and comparing their recall@k and
+precision@k against an exact brute-force ground truth.
+
+This command requires the resolved index manifest to include a lexical (BM25)
+artifact in `manifest.lexical`.
+
+The current CLI does **not** yet expose a `build-index` flag that produces that
+artifact automatically, so `eval-hybrid` is currently only usable with indexes
+prepared by a workflow that has already written `indexes/<index-version>/lexical.bm25`
+and the corresponding `manifest.lexical` entry.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] eval-hybrid [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--alias <STRING>` | string | `latest` | Alias to evaluate |
+| `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve per query |
+| `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
+| `--max-queries <N>` | usize | `0` | Maximum query vectors to evaluate (0 = min(corpus size, 100)) |
+| `--vector-weight <F>` | f32 | `0.7` | Weight for normalized vector-distance scores in hybrid ranking. Must be ≥ 0; at least one weight must be > 0. |
+| `--bm25-weight <F>` | f32 | `0.3` | Weight for normalized BM25 lexical scores in hybrid ranking. Must be ≥ 0; at least one weight must be > 0. |
+| `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+
+### How BM25 query text is derived
+
+Each query's BM25 query string is derived from the record's `metadata` field using the
+same extraction logic used at index build time:
+
+- Records with no metadata produce an empty BM25 query (BM25 returns no results).
+- Records whose metadata is a plain JSON string use that string verbatim.
+- Records with a JSON object or other value use the JSON-serialized form of the metadata.
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Recall@k | Fraction of true top-k neighbours (by vector distance) that appear in the retrieved results |
+| Precision@k | Fraction of retrieved results that are true top-k neighbours |
+| Mean latency | Average per-query search time in microseconds |
+| P99 latency | 99th-percentile per-query search time in microseconds |
+| Recall delta (hybrid vs vector-only) | Positive means hybrid improves over vector alone |
+| Recall delta (hybrid vs bm25-only) | Positive means hybrid improves over BM25 alone |
+
+### Output
+
+**Text (default):**
+
+```
+=== Hybrid Retrieval Evaluation Report ===
+  Queries:           100
+  k:                 10
+  nprobe:            2
+  vector_weight:     0.70
+  bm25_weight:       0.30
+
+  Mode           Recall@10  Precision@10  Mean latency  P99 latency
+  -------------------------------------------------------------------------
+  vector-only    0.8700      0.8700        42.3 µs        210.0 µs
+  bm25-only      0.6500      0.6500        12.1 µs         58.0 µs
+  hybrid         0.9100      0.9100        55.2 µs        262.0 µs
+
+  Recall delta (hybrid vs vector-only): +0.0400
+  Recall delta (hybrid vs bm25-only):   +0.2600
+```
+
+**JSON (`--output json`):**
+
+```json
+{
+  "num_queries": 100,
+  "k": 10,
+  "nprobe": 2,
+  "vector_weight": 0.7,
+  "bm25_weight": 0.3,
+  "vector_only": {
+    "recall_at_k": 0.87,
+    "precision_at_k": 0.87,
+    "mean_latency_us": 42.3,
+    "p99_latency_us": 210.0
+  },
+  "bm25_only": {
+    "recall_at_k": 0.65,
+    "precision_at_k": 0.65,
+    "mean_latency_us": 12.1,
+    "p99_latency_us": 58.0
+  },
+  "hybrid": {
+    "recall_at_k": 0.91,
+    "precision_at_k": 0.91,
+    "mean_latency_us": 55.2,
+    "p99_latency_us": 262.0
+  }
+}
+```
+
+### Example
+
+```bash
+# Default text output (0.7 / 0.3 default weights)
+shardlake eval-hybrid --k 10 --nprobe 4 --max-queries 500
+
+# Favour vector signal (70/30 split)
+shardlake eval-hybrid --k 10 --nprobe 4 --vector-weight 0.7 --bm25-weight 0.3
+
+# Pure BM25-only baseline (no vector signal)
+shardlake eval-hybrid --k 10 --nprobe 4 --vector-weight 0.0 --bm25-weight 1.0
+
+# Machine-readable JSON for CI regression tracking
+shardlake eval-hybrid --k 10 --nprobe 4 --max-queries 500 --output json
 ```
 
 ---
