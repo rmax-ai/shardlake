@@ -397,17 +397,17 @@ fn inner_product_pipeline_returns_query_vector_as_top_result() {
 #[test]
 fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differing_corpus() {
     // Construct a corpus where cosine and euclidean give different top-1 results:
-    //   id=0: direction [1,0,0,0], magnitude=1   — nearest by cosine to query [1,ε,ε,ε]
-    //   id=1: direction [1,0,0,0], magnitude=10  — nearest by cosine tied with id=0,
-    //                                              but far in L2 from query
-    //   id=2: direction [1,1,1,1]/2, magnitude≈1  — farther by cosine, closer in L2
+    //   id=0: [1.0, 0.1, 0.0, 0.0]  — nearest in L2, but slightly off-angle
+    //   id=1: [100.0, 0.0, 0.0, 0.0] — exact cosine match, but far in L2
+    //   id=2: [0.0, 1.0, 0.0, 0.0]  — clearly worse under both metrics
     //
-    // We use records where id=0 is unit-scale along x, id=1 is large-scale along x,
-    // and id=2 is nearby in L2 but at a different angle.
+    // This makes the metric choice observable end-to-end: euclidean should prefer
+    // the nearby off-angle point, while cosine should prefer the distant point with
+    // exactly matching direction.
     let corpus: Vec<VectorRecord> = vec![
         VectorRecord {
             id: VectorId(0),
-            data: vec![1.0, 0.0, 0.0, 0.0],
+            data: vec![1.0, 0.1, 0.0, 0.0],
             metadata: None,
         },
         VectorRecord {
@@ -444,18 +444,20 @@ fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differ
     assert_eq!(
         euc_top1[0].id,
         VectorId(0),
-        "euclidean: id=0 is at distance 0"
+        "euclidean should prefer the nearby off-angle record"
     );
 
-    // Cosine: id=0 (dist=0) and id=1 (dist=0) are tied; id=2 has nonzero angle.
-    // Top-1 must be either id=0 or id=1 (both have cosine distance 0).
-    assert!(
-        cos_top1[0].id == VectorId(0) || cos_top1[0].id == VectorId(1),
-        "cosine top-1 should be id=0 or id=1 (both parallel to query), got {:?}",
-        cos_top1[0].id
+    assert_eq!(
+        cos_top1[0].id,
+        VectorId(1),
+        "cosine should prefer the exact directional match even when it is far away"
     );
     assert!(
         cos_top1[0].score < 1e-6,
         "cosine score for a parallel vector must be ~0"
+    );
+    assert_ne!(
+        euc_top1[0].id, cos_top1[0].id,
+        "the two metrics should produce different top-1 results for this corpus"
     );
 }
