@@ -15,7 +15,7 @@ use shardlake_core::{
     AnnFamily,
 };
 use shardlake_index::{
-    plugin::{AnnPlugin, AnnRegistry, IvfFlatPlugin, IvfPqPlugin},
+    plugin::{AnnPlugin, AnnRegistry, DiskAnnPlugin, IvfFlatPlugin, IvfPqPlugin},
     pq::{PqCodebook, PqParams},
     BuildParams, IndexBuilder, QueryPipeline,
 };
@@ -82,12 +82,14 @@ fn build_test_index(
 fn ann_family_parses_all_known_names() {
     assert_eq!("ivf_flat".parse::<AnnFamily>().unwrap(), AnnFamily::IvfFlat);
     assert_eq!("ivf_pq".parse::<AnnFamily>().unwrap(), AnnFamily::IvfPq);
+    assert_eq!("diskann".parse::<AnnFamily>().unwrap(), AnnFamily::DiskAnn);
 }
 
 #[test]
 fn ann_family_display_matches_as_str() {
     assert_eq!(AnnFamily::IvfFlat.to_string(), AnnFamily::IvfFlat.as_str());
     assert_eq!(AnnFamily::IvfPq.to_string(), AnnFamily::IvfPq.as_str());
+    assert_eq!(AnnFamily::DiskAnn.to_string(), AnnFamily::DiskAnn.as_str());
 }
 
 #[test]
@@ -205,12 +207,17 @@ fn registry_exposes_all_builtin_families() {
         "ivf_flat should be registered"
     );
     assert!(families.contains(&"ivf_pq"), "ivf_pq should be registered");
+    assert!(
+        families.contains(&"diskann"),
+        "diskann should be registered"
+    );
 }
 
 #[test]
 fn registry_exists_for_known_families() {
     assert!(AnnRegistry::exists("ivf_flat"));
     assert!(AnnRegistry::exists("ivf_pq"));
+    assert!(AnnRegistry::exists("diskann"));
 }
 
 #[test]
@@ -224,6 +231,12 @@ fn registry_does_not_exist_for_unknown_family() {
 fn registry_get_flat_returns_ivf_flat_plugin() {
     let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
     assert_eq!(plugin.family(), "ivf_flat");
+}
+
+#[test]
+fn registry_get_flat_returns_diskann_plugin() {
+    let plugin = AnnRegistry::get_flat("diskann").unwrap();
+    assert_eq!(plugin.family(), "diskann");
 }
 
 #[test]
@@ -257,15 +270,15 @@ fn registry_get_flat_rejects_unknown_family() {
 
 // ── Pipeline integration – no algorithm-specific branching ───────────────────
 
-/// Demonstrate that both backends can be wired into a QueryPipeline through
-/// the same AnnPlugin interface without algorithm-specific branching at the
-/// call site.
+/// Demonstrate that all three backends can be wired into a QueryPipeline
+/// through the same AnnPlugin interface without algorithm-specific branching
+/// at the call site.
 #[test]
-fn both_backends_wire_into_pipeline_via_plugin_interface() {
+fn all_backends_wire_into_pipeline_via_plugin_interface() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let records = make_records(12, 4);
-    // Use Euclidean so both IvfFlatPlugin and IvfPqPlugin are compatible.
+    // Use Euclidean so IvfFlatPlugin, IvfPqPlugin, and DiskAnnPlugin are all compatible.
     let manifest = build_test_index(
         store.as_ref(),
         records.clone(),
@@ -275,11 +288,12 @@ fn both_backends_wire_into_pipeline_via_plugin_interface() {
         tmp.path(),
     );
 
-    // Both plugins implement the same trait; the call site below is identical
-    // for both – no algorithm-specific branching at the wiring edge.
+    // All plugins implement the same trait; the call site below is identical
+    // for all – no algorithm-specific branching at the wiring edge.
     let plugins: Vec<Box<dyn AnnPlugin>> = vec![
         Box::new(IvfFlatPlugin),
         Box::new(IvfPqPlugin::new(make_codebook(4, 2))),
+        Box::new(DiskAnnPlugin::new(8)),
     ];
 
     let query = records[0].data.clone();
