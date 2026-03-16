@@ -17,13 +17,16 @@
 //! │       └── info.json               ← dataset_info_key
 //! ├── indexes/
 //! │   └── <index-version>/
-//! │       ├── manifest.json      ← index_manifest_key
-//! │       ├── pq_codebook.bin    ← index_pq_codebook_key (PQ builds only)
 //! │       ├── manifest.json           ← index_manifest_key
+//! │       ├── pq_codebook.bin         ← index_pq_codebook_key (PQ builds only)
 //! │       ├── coarse_quantizer.cq     ← index_coarse_quantizer_key
-//! │       └── shards/
-//! │           ├── shard-0000.sidx     ← index_shard_key(…, 0)
-//! │           └── shard-0001.sidx     ← index_shard_key(…, 1)
+//! │       ├── worker_plan.json        ← worker_plan_key (distributed builds)
+//! │       ├── shards/
+//! │       │   ├── shard-0000.sidx     ← index_shard_key(…, 0)
+//! │       │   └── shard-0001.sidx     ← index_shard_key(…, 1)
+//! │       └── workers/
+//! │           └── <worker-id>/
+//! │               └── output.json     ← worker_output_key(…, worker_id)
 //! └── aliases/
 //!     └── <alias-name>.json           ← alias_key
 //! ```
@@ -94,6 +97,28 @@ pub fn index_lexical_key(index_version: &str) -> String {
     format!("indexes/{index_version}/lexical.bm25")
 }
 
+/// Storage key for the worker plan JSON for a distributed index build.
+///
+/// Written by the plan phase of a distributed build so that individual workers
+/// can load their assignment by indexing into the plan's `assignments` list.
+pub fn worker_plan_key(index_version: &str) -> String {
+    format!("indexes/{index_version}/worker_plan.json")
+}
+
+/// Storage key for the intermediate output metadata written by a single worker.
+///
+/// Each worker writes one `output.json` file containing the list of
+/// shard-output descriptors for the shards it built.  The merge step
+/// reads these files to assemble the final manifest without re-reading the
+/// shard artifact bytes.
+///
+/// Worker IDs are zero-padded to 4 digits in the directory name
+/// (`workers/0000/`, `workers/0001/`, …).  Worker IDs ≥ 10 000 expand
+/// beyond four digits without truncation (`workers/10000/`).
+pub fn worker_output_key(index_version: &str, worker_id: usize) -> String {
+    format!("indexes/{index_version}/workers/{worker_id:04}/output.json")
+}
+
 /// Storage key for an alias pointer JSON file.
 pub fn alias_key(alias: &str) -> String {
     format!("aliases/{alias}.json")
@@ -151,6 +176,24 @@ mod tests {
     #[test]
     fn index_lexical_key_has_stable_layout() {
         assert_eq!(index_lexical_key("idx-v1"), "indexes/idx-v1/lexical.bm25");
+    }
+
+    #[test]
+    fn worker_keys_have_stable_layout() {
+        assert_eq!(worker_plan_key("idx-v1"), "indexes/idx-v1/worker_plan.json");
+        assert_eq!(
+            worker_output_key("idx-v1", 0),
+            "indexes/idx-v1/workers/0000/output.json"
+        );
+        assert_eq!(
+            worker_output_key("idx-v1", 3),
+            "indexes/idx-v1/workers/0003/output.json"
+        );
+        // Worker IDs >= 10_000 expand beyond four digits without truncation.
+        assert_eq!(
+            worker_output_key("idx-v1", 10_000),
+            "indexes/idx-v1/workers/10000/output.json"
+        );
     }
 
     #[test]

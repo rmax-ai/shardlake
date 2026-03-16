@@ -68,6 +68,11 @@ Requirements:
    - stop immediately if the push, head refresh, or lease renewal fails or disagrees about the new head SHA
 13. Before changing labels or leaving a durable summary comment, confirm lease ownership again with `tools/loop_claim.sh inspect --ref <lease-ref-name>`.
 14. Add or update a concise PR comment when maintainers need a durable summary of what was fixed, what was deferred, and whether the PR is now merge-ready.
+    Before deciding what to record, check whether this automation has already left a PR comment on the current head SHA that documents the same blockers found in this pass (a repeat-blocker pattern indicating the loop has stalled without progress).
+    If the same blockers have already been documented on the current head and no new fixes have been pushed since:
+    - Determine whether every remaining blocker has a concrete, unambiguous fix (an exact file, function, and change description that requires no design or policy decision):
+      - **All blockers are concrete and unambiguous:** compose a targeted PR comment that (a) summarises each blocker with its file path and the exact change required, and (b) ends with `@copilot please apply the fixes above`. Post this comment and do NOT add `needs-human`.
+      - **Any blocker requires a design decision, architectural judgment, or policy call:** ensure the `needs-human` label exists, add it to the PR, and post a concise PR comment that names each open question, lists the available options, and states the minimum next action for a human to unblock the PR. Do not tag `@copilot` in this case.
 15. If the PR is ready to merge:
    - add the `ready-to-merge` label
    - remove the `ready-for-open-review` label
