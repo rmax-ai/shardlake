@@ -514,6 +514,7 @@ mod tests {
             pq_enabled: false,
             pq_num_subspaces: SystemConfig::default_pq_num_subspaces(),
             pq_codebook_size: SystemConfig::default_pq_codebook_size(),
+            ..SystemConfig::default()
         };
         IndexBuilder::new(store, &config)
             .build(BuildParams {
