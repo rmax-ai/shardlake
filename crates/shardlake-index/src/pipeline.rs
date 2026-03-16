@@ -19,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-use tracing::debug;
+use tracing::{debug, debug_span};
 
 use shardlake_core::{
     error::CoreError,
@@ -162,6 +162,8 @@ impl CachedShardLoader {
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        let _span = debug_span!("shard_load", shard_id = shard_id.0).entered();
+
         {
             let cache = self.cache.lock().map_err(|_| {
                 IndexError::Other(
@@ -170,11 +172,13 @@ impl LoadShardStage for CachedShardLoader {
                 )
             })?;
             if let Some(idx) = cache.get(&shard_id) {
+                debug!("cache hit");
                 self.metrics.record_hit();
                 return Ok(Arc::clone(idx));
             }
         }
 
+        debug!("cache miss, loading from store");
         let shard_def = self
             .manifest
             .shards
@@ -402,12 +406,20 @@ impl QueryPipeline {
         let mut probed_shards = Vec::new();
         for shard_id in probe_shards {
             let shard = self.loader.load(shard_id)?;
-            all_results.extend(self.candidate_search.search(
-                &embedded,
-                &shard,
-                metric,
-                candidates_per_shard,
-            )?);
+            {
+                let _span = debug_span!(
+                    "ann_search",
+                    shard_id = shard_id.0,
+                    k = candidates_per_shard
+                )
+                .entered();
+                all_results.extend(self.candidate_search.search(
+                    &embedded,
+                    &shard,
+                    metric,
+                    candidates_per_shard,
+                )?);
+            }
             if self.reranker.is_some() {
                 probed_shards.push(shard);
             }
@@ -426,6 +438,8 @@ impl QueryPipeline {
                         .cloned(),
                 );
             }
+            let n_candidates = merged.len();
+            let _span = debug_span!("rerank", k, n_candidates).entered();
             Ok(reranker.rerank(&embedded, merged, &probed_records, metric, k))
         } else {
             Ok(merged)
@@ -555,6 +569,7 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
     use crate::builder::{BuildParams, IndexBuilder};
@@ -710,5 +725,145 @@ mod tests {
             .build();
         let results = pipeline.run(&query, 3, 1).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    /// Guard that clears the shared span-name list on creation and asserts
+    /// specified names were recorded when dropped/checked.
+    ///
+    /// Tests that need to verify tracing spans call [`init_global_span_collector`]
+    /// once per process, then wrap each pipeline exercise in a [`SpanWindow`].
+    struct SpanWindow<'a>(&'a std::sync::Mutex<Vec<String>>);
+
+    impl SpanWindow<'_> {
+        fn new(names: &std::sync::Mutex<Vec<String>>) -> SpanWindow<'_> {
+            names.lock().unwrap().clear();
+            SpanWindow(names)
+        }
+
+        fn contains(&self, name: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|n| n == name)
+        }
+    }
+
+    /// Initialise the process-wide tracing subscriber and return the shared
+    /// span-name buffer.  Safe to call from multiple tests; the subscriber is
+    /// only registered once.
+    fn init_global_span_collector() -> &'static std::sync::Mutex<Vec<String>> {
+        use std::sync::OnceLock;
+        static NAMES: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+        static INIT: OnceLock<()> = OnceLock::new();
+
+        let names = NAMES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+
+        INIT.get_or_init(|| {
+            // `StaticCollector` wraps a raw pointer to the 'static NAMES mutex
+            // so it can be embedded in the tracing subscriber without requiring
+            // an Arc clone on every span event.
+            struct StaticCollector(*const std::sync::Mutex<Vec<String>>);
+
+            // SAFETY: `StaticCollector` holds a pointer to the `'static` NAMES
+            // mutex.  The mutex itself is `Send + Sync`, so sharing a raw
+            // pointer to it across threads is sound for as long as the program
+            // runs—which is guaranteed by the `'static` lifetime of NAMES.
+            unsafe impl Send for StaticCollector {}
+            unsafe impl Sync for StaticCollector {}
+
+            impl<S> tracing_subscriber::Layer<S> for StaticCollector
+            where
+                S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+            {
+                fn on_new_span(
+                    &self,
+                    attrs: &tracing::span::Attributes<'_>,
+                    _id: &tracing::span::Id,
+                    _ctx: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    // SAFETY: self.0 points to the 'static NAMES mutex, which
+                    // is valid for the entire lifetime of the process.
+                    unsafe { &*self.0 }
+                        .lock()
+                        .unwrap()
+                        .push(attrs.metadata().name().to_string());
+                }
+            }
+
+            let collector = StaticCollector(names as *const _);
+
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with(collector);
+            // Ignore an error: if another test binary already set the global
+            // default that's fine; our tests assert on the *same* static NAMES.
+            let _ = subscriber.try_init();
+        });
+
+        names
+    }
+
+    #[test]
+    fn pipeline_run_emits_shard_load_and_ann_search_spans() {
+        let names = init_global_span_collector();
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+
+        let window = SpanWindow::new(names);
+        let pipeline = build_pipeline(records);
+        pipeline.run(&query, 3, 2).unwrap();
+
+        assert!(
+            window.contains("shard_load"),
+            "expected shard_load span; got: {:?}",
+            names.lock().unwrap()
+        );
+        assert!(
+            window.contains("ann_search"),
+            "expected ann_search span; got: {:?}",
+            names.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn pipeline_run_with_reranker_emits_rerank_span() {
+        let names = init_global_span_collector();
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let tmp = tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-rerank-spans".into()),
+                embedding_version: EmbeddingVersion("emb-rerank-spans".into()),
+                index_version: IndexVersion("idx-rerank-spans".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: "datasets/ds-rerank-spans/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-rerank-spans/metadata.json".into(),
+                pq_params: None,
+            })
+            .unwrap();
+        std::mem::forget(tmp);
+
+        let window = SpanWindow::new(names);
+        let pipeline = QueryPipeline::builder(store, manifest)
+            .rerank_stage(Arc::new(ExactRerankStage))
+            .rerank_oversample(2)
+            .build();
+        pipeline.run(&query, 3, 2).unwrap();
+
+        assert!(
+            window.contains("rerank"),
+            "expected rerank span; got: {:?}",
+            names.lock().unwrap()
+        );
     }
 }
