@@ -75,22 +75,32 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// A request-validation error that can be sent directly as an HTTP response.
+///
+/// Wraps a `(StatusCode, Json<serde_json::Value>)` tuple so callers can return
+/// typed errors from `resolve_policy` without heap-allocating an opaque
+/// `axum::response::Response`.
+struct PolicyError(StatusCode, Json<serde_json::Value>);
+
+impl IntoResponse for PolicyError {
+    fn into_response(self) -> axum::response::Response {
+        (self.0, self.1).into_response()
+    }
+}
+
 /// Parse and validate the fan-out policy from a [`QueryRequest`], falling back
 /// to the server-level defaults in `fan_out`.
 ///
-/// Returns `Ok(FanOutPolicy)` on success, or an HTTP error response on invalid
-/// input.
+/// Returns `Ok(FanOutPolicy)` on success, or a [`PolicyError`] that can be
+/// returned directly as an HTTP response on invalid input.
 fn resolve_policy(
     req: &QueryRequest,
     fan_out: &FanOutPolicy,
-) -> std::result::Result<FanOutPolicy, Box<axum::response::Response>> {
+) -> std::result::Result<FanOutPolicy, PolicyError> {
     if req.k == 0 {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "k must be > 0" })),
-            )
-                .into_response(),
+        return Err(PolicyError(
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "k must be > 0" })),
         ));
     }
 
@@ -99,14 +109,11 @@ fn resolve_policy(
     let legacy_candidate_centroids = match req.nprobe.map(u32::try_from).transpose() {
         Ok(value) => value,
         Err(_) => {
-            return Err(Box::new(
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("nprobe must be <= {}", u32::MAX)
-                    })),
-                )
-                    .into_response(),
+            return Err(PolicyError(
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("nprobe must be <= {}", u32::MAX)
+                })),
             ));
         }
     };
@@ -126,12 +133,9 @@ fn resolve_policy(
     };
 
     if let Err(e) = policy.validate() {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
+        return Err(PolicyError(
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
         ));
     }
 
@@ -162,7 +166,7 @@ async fn query_handler(
 ) -> impl IntoResponse {
     let policy = match resolve_policy(&req, &state.fan_out) {
         Ok(p) => p,
-        Err(resp) => return *resp,
+        Err(e) => return e.into_response(),
     };
 
     let version = state.searcher.manifest().index_version.0.clone();
@@ -203,7 +207,7 @@ async fn query_plan_handler(
 ) -> impl IntoResponse {
     let policy = match resolve_policy(&req, &state.fan_out) {
         Ok(p) => p,
-        Err(resp) => return *resp,
+        Err(e) => return e.into_response(),
     };
 
     let version = state.searcher.manifest().index_version.0.clone();
