@@ -63,6 +63,10 @@ impl IndexSearcher {
         manifest: Manifest,
         capacity: usize,
     ) -> Self {
+        assert!(
+            capacity > 0,
+            "IndexSearcher shard cache capacity must be at least 1"
+        );
         info!(
             index_version = %manifest.index_version,
             shards = manifest.shards.len(),
@@ -293,7 +297,7 @@ impl IndexSearcher {
 
         let vector_lookup: HashMap<VectorId, Vec<f32>> = {
             let mut vectors = HashMap::with_capacity(remaining_ids.len());
-            for shard in self.cache.cached_values() {
+            for shard in self.cache.cached_values()? {
                 for record in &shard.records {
                     if remaining_ids.remove(&record.id) {
                         if record.data.len() != expected_dims {

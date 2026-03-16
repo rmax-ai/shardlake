@@ -37,7 +37,11 @@ pub struct ServeArgs {
     /// Larger values improve repeat-query latency at the cost of higher memory
     /// usage.  Should be at least as large as `--nprobe`, or `--candidate-shards`
     /// when that flag is non-zero and smaller than `--nprobe`.
-    #[arg(long, default_value_t = DEFAULT_SHARD_CACHE_CAPACITY)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHARD_CACHE_CAPACITY,
+        value_parser = parse_positive_shard_cache_capacity
+    )]
     pub shard_cache_capacity: usize,
 }
 
@@ -71,4 +75,31 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     println!("Serving on http://{}", args.bind);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+fn parse_positive_shard_cache_capacity(raw: &str) -> std::result::Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| format!("invalid integer value `{raw}`: {err}"))?;
+    if value == 0 {
+        return Err("value must be greater than 0".into());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::ServeArgs;
+
+    #[test]
+    fn serve_args_reject_zero_shard_cache_capacity() {
+        let err = ServeArgs::try_parse_from(["shardlake", "--shard-cache-capacity", "0"])
+            .expect_err("zero shard cache capacity must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("--shard-cache-capacity"));
+        assert!(message.contains("value must be greater than 0"));
+    }
 }

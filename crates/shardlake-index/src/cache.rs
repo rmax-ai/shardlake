@@ -11,7 +11,7 @@ use std::{
     hash::Hash,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
 };
 
@@ -135,6 +135,7 @@ pub struct ShardCache<V> {
 pub(crate) enum CacheAccess {
     Hit,
     Miss,
+    Raced,
 }
 
 impl<V: Send + 'static> ShardCache<V> {
@@ -144,6 +145,7 @@ impl<V: Send + 'static> ShardCache<V> {
     ///
     /// Panics if `capacity` is `0`.
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "ShardCache capacity must be at least 1");
         Self {
             inner: Mutex::new(LruCache::new(capacity)),
             hits: AtomicU64::new(0),
@@ -181,10 +183,7 @@ impl<V: Send + 'static> ShardCache<V> {
     {
         // Fast path: check the cache under the lock.
         {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))?;
+            let mut guard = self.lock()?;
             if let Some(cached) = guard.get(&shard_id) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((cached, CacheAccess::Hit));
@@ -195,11 +194,11 @@ impl<V: Send + 'static> ShardCache<V> {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let value = load()?;
 
-        // Re-acquire the lock and insert the loaded value.
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))?;
+        // Re-acquire the lock and reuse any value inserted while we were loading.
+        let mut guard = self.lock()?;
+        if let Some(cached) = guard.get(&shard_id) {
+            return Ok((cached, CacheAccess::Raced));
+        }
         guard.insert(shard_id, Arc::clone(&value));
         Ok((value, CacheAccess::Miss))
     }
@@ -215,13 +214,21 @@ impl<V: Send + 'static> ShardCache<V> {
     }
 
     /// Return the number of entries currently held in the cache.
-    pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn len(&self) -> Result<usize> {
+        Ok(self.lock()?.len())
     }
 
     /// Return `true` if the cache contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
     }
 
     /// Return a snapshot of all currently cached values.
@@ -230,11 +237,18 @@ impl<V: Send + 'static> ShardCache<V> {
     /// under the lock; the lock is released before this method returns.
     /// This is useful for opportunistic iteration (e.g. reranking from cached
     /// shard data) without requiring the caller to hold the lock.
-    pub fn cached_values(&self) -> Vec<Arc<V>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn cached_values(&self) -> Result<Vec<Arc<V>>> {
+        Ok(self.lock()?.map.values().cloned().collect())
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, LruCache<ShardId, Arc<V>>>> {
         self.inner
             .lock()
-            .map(|g| g.map.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| IndexError::Other("shard cache lock poisoned".into()))
     }
 }
 
@@ -243,6 +257,10 @@ impl<V: Send + 'static> ShardCache<V> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use super::*;
 
@@ -385,7 +403,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.len().unwrap(), 2);
 
         // Accessing shard 1 now should trigger a reload (it was evicted).
         let before = load_count.load(Ordering::SeqCst);
@@ -406,8 +424,8 @@ mod tests {
     #[test]
     fn shard_cache_is_empty_after_construction() {
         let cache: ShardCache<u64> = ShardCache::new(8);
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty().unwrap());
+        assert_eq!(cache.len().unwrap(), 0);
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 0);
     }
@@ -422,6 +440,34 @@ mod tests {
         assert_eq!(cache.misses(), 1);
         assert_eq!(cache.hits(), 0);
         // Nothing should be in the cache.
-        assert!(cache.is_empty());
+        assert!(cache.is_empty().unwrap());
+    }
+
+    #[test]
+    fn shard_cache_reuses_existing_value_after_raced_load() {
+        let cache: Arc<ShardCache<u64>> = Arc::new(ShardCache::new(2));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let cache_for_thread = Arc::clone(&cache);
+        let barrier_for_thread = Arc::clone(&barrier);
+        let handle = thread::spawn(move || {
+            cache_for_thread.get_or_load_with_status(ShardId(5), || {
+                barrier_for_thread.wait();
+                barrier_for_thread.wait();
+                Ok(Arc::new(10u64))
+            })
+        });
+
+        barrier.wait();
+        let inserted = cache
+            .get_or_load(ShardId(5), || Ok(Arc::new(20u64)))
+            .unwrap();
+        barrier.wait();
+
+        let (value, access) = handle.join().expect("load thread must complete").unwrap();
+        assert_eq!(access, CacheAccess::Raced);
+        assert_eq!(*inserted, 20);
+        assert_eq!(*value, 20);
+        assert_eq!(cache.len().unwrap(), 1);
     }
 }

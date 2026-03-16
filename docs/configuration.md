@@ -23,7 +23,7 @@ individual command flags.
 | `pq_num_subspaces` | u32 | `8` | Number of PQ sub-spaces (`M`) used when `pq_enabled` is `true`. Must be at least 1 and divide the embedding dimension evenly. |
 | `pq_codebook_size` | u32 | `256` | Number of centroids (`K`) per PQ sub-space when `pq_enabled` is `true`. Must be in the range `1..=256`. |
 | `kmeans_sample_size` | u32 or absent | absent (`None`) | Maximum number of vectors used to train K-means centroids. When absent, all vectors are used. When set to a positive `n` smaller than the dataset size, a reproducible random sample of up to `n` vectors is drawn (using `kmeans_seed`) before running K-means. All vectors—including those not in the sample—are still assigned to the nearest centroid after training, so no data is lost. Recorded in `algorithm.params.kmeans_sample_size` in the manifest only when bounded sampling actually occurs. Equivalent to `--kmeans-sample-size`. |
-| `shard_cache_capacity` | usize | `128` | Maximum number of shard indexes kept in the in-memory LRU cache at query time. When more than `shard_cache_capacity` distinct shards have been loaded, the least-recently-used shard is evicted to bound memory usage. Set this to at least as large as `nprobe` (or `candidate_shards` when non-zero) so that all shards probed in a single query can stay hot in cache simultaneously. Equivalent to `--shard-cache-capacity` on `serve`. |
+| `shard_cache_capacity` | usize | `128` | Maximum number of shard indexes kept in the in-memory LRU cache at query time. When more than `shard_cache_capacity` distinct shards have been loaded, the least-recently-used shard is evicted to bound memory usage. Set this to at least as large as `nprobe` (or `candidate_shards` when non-zero) so that all shards probed in a single query can stay hot in cache simultaneously. This value must be greater than or equal to `1`. Equivalent to `--shard-cache-capacity` on `serve`. |
 
 ### `config/default.toml` (reference)
 
@@ -119,6 +119,8 @@ request time (for per-request HTTP overrides).  The following invariants are enf
   `"invalid fan-out policy: candidate_centroids must be ≥ 1"`.
 - `candidate_shards` and `max_vectors_per_shard` accept any value including `0`
   (meaning no limit).
+- `shard_cache_capacity` must be ≥ 1. A value of `0` is rejected during config
+  deserialisation instead of panicking later during cache construction.
 
 ## Storage backends
 

@@ -161,6 +161,10 @@ impl CachedShardLoader {
         manifest: Manifest,
         capacity: usize,
     ) -> Self {
+        assert!(
+            capacity > 0,
+            "CachedShardLoader shard cache capacity must be at least 1"
+        );
         Self {
             store,
             manifest,
@@ -205,6 +209,7 @@ impl LoadShardStage for CachedShardLoader {
                     self.metrics.record_retained_bytes(bytes);
                 }
             }
+            CacheAccess::Raced => {}
         }
 
         Ok(shard)
@@ -546,7 +551,16 @@ impl QueryPipelineBuilder {
     /// Ignored when a custom loader is supplied via
     /// [`with_loader`](Self::with_loader).  Defaults to
     /// [`DEFAULT_SHARD_CACHE_CAPACITY`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    #[must_use]
     pub fn with_shard_cache_capacity(mut self, capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "QueryPipelineBuilder shard cache capacity must be at least 1"
+        );
         self.shard_cache_capacity = capacity;
         self
     }

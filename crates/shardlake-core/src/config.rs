@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::CoreError;
 
@@ -147,7 +147,10 @@ pub struct SystemConfig {
     ///
     /// Defaults to `128`.  Must be ≥ 1; passing `0` when constructing an
     /// `IndexSearcher` or `CachedShardLoader` will panic at construction time.
-    #[serde(default = "SystemConfig::default_shard_cache_capacity")]
+    #[serde(
+        default = "SystemConfig::default_shard_cache_capacity",
+        deserialize_with = "deserialize_nonzero_shard_cache_capacity"
+    )]
     pub shard_cache_capacity: usize,
 }
 
@@ -204,5 +207,43 @@ impl Default for SystemConfig {
             pq_codebook_size: Self::default_pq_codebook_size(),
             shard_cache_capacity: Self::default_shard_cache_capacity(),
         }
+    }
+}
+
+fn deserialize_nonzero_shard_cache_capacity<'de, D>(
+    deserializer: D,
+) -> std::result::Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let capacity = usize::deserialize(deserializer)?;
+    if capacity == 0 {
+        return Err(serde::de::Error::custom(
+            "shard_cache_capacity must be >= 1",
+        ));
+    }
+    Ok(capacity)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::SystemConfig;
+
+    #[test]
+    fn system_config_rejects_zero_shard_cache_capacity() {
+        let err = serde_json::from_value::<SystemConfig>(json!({
+            "storage_root": "./data",
+            "num_shards": 4,
+            "kmeans_iters": 20,
+            "nprobe": 2,
+            "shard_cache_capacity": 0
+        }))
+        .expect_err("zero shard_cache_capacity must be rejected during deserialisation");
+
+        assert!(err
+            .to_string()
+            .contains("shard_cache_capacity must be >= 1"));
     }
 }

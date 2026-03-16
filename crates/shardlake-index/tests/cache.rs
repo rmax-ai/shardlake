@@ -132,7 +132,7 @@ fn shard_cache_lru_eviction() {
     cache
         .get_or_load(shardlake_core::types::ShardId(1), mk_loader(1))
         .unwrap();
-    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.len().unwrap(), 2);
 
     // Promote shard 0 → shard 1 is now LRU.
     cache
@@ -144,7 +144,7 @@ fn shard_cache_lru_eviction() {
     cache
         .get_or_load(shardlake_core::types::ShardId(2), mk_loader(2))
         .unwrap();
-    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.len().unwrap(), 2);
 
     // Accessing shard 1 must reload it (was evicted).
     cache
@@ -210,28 +210,42 @@ fn cached_loader_respects_custom_capacity() {
         manifest.clone(),
         2,
     );
+    let metrics = loader.metrics();
 
     // Load all 4 shards; only 2 should remain in cache after eviction.
     for shard_def in &manifest.shards {
         loader.load(shard_def.shard_id).unwrap();
     }
-    // After loading 4 shards into a capacity-2 cache, exactly 2 remain.
-    // (We can't directly inspect the cache from the public API, but we can
-    // verify that repeated access to the same shard doesn't panic or error.)
+    let before = metrics.snapshot();
+
+    // After loading 4 shards into a capacity-2 cache, the first shard should
+    // have been evicted. Reloading it should therefore record another miss.
     let sid = manifest.shards[0].shard_id;
-    let result = loader.load(sid);
-    assert!(result.is_ok(), "reloading an evicted shard should succeed");
+    loader.load(sid).unwrap();
+    let after = metrics.snapshot();
+
+    assert_eq!(before.misses, 4, "initial distinct loads should all miss");
+    assert_eq!(before.hits, 0, "distinct loads should not hit the cache");
+    assert_eq!(
+        after.misses,
+        before.misses + 1,
+        "reloading the oldest shard should miss after eviction"
+    );
+    assert_eq!(
+        after.hits, before.hits,
+        "reloading an evicted shard should not count as a hit"
+    );
 }
 
 // ── IndexSearcher integration tests ───────────────────────────────────────────
 
 #[test]
-fn index_searcher_with_cache_capacity_respects_limit() {
+fn index_searcher_with_tiny_cache_still_returns_results() {
     let tmp = TempDir::new().unwrap();
     let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let manifest = build_index(store.as_ref(), tmp.path(), 4, 4, 40);
 
-    // Build a searcher with a tiny cache so eviction definitely kicks in.
+    // Build a searcher with a tiny cache to exercise the bounded-cache path.
     let searcher =
         IndexSearcher::with_cache_capacity(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest, 1);
 
@@ -240,7 +254,7 @@ fn index_searcher_with_cache_capacity_respects_limit() {
         candidate_shards: 0,
         max_vectors_per_shard: 0,
     };
-    // Running the search should not error even with a very small cache.
+    // Running the search should still succeed with a very small cache.
     let results = searcher
         .search(&[0.01, 0.02, 0.03, 0.04], 5, &policy)
         .unwrap();
