@@ -11,7 +11,8 @@
 //!
 //! [`QueryPipeline`] keeps the modular stage surface introduced on `main` while
 //! adding ANN-specific candidate and rerank stages such as [`PqCandidateStage`]
-//! and [`ExactRerankStage`].
+//! and [`ExactRerankStage`]. Stages 3 and 4 can execute concurrently across
+//! probed shards using Rayon.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+use rayon::prelude::*;
 use tracing::debug;
 
 use shardlake_core::{
@@ -413,17 +415,28 @@ impl QueryPipeline {
             k
         };
 
+        type PerShardSearchOutput = (Vec<SearchResult>, Option<Arc<ShardIndex>>);
+
+        let keep_probed_shards = self.reranker.is_some();
+        let per_shard: Result<Vec<PerShardSearchOutput>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.loader.load(shard_id)?;
+                let results = self.candidate_search.search(
+                    &embedded,
+                    &shard,
+                    metric,
+                    candidates_per_shard,
+                )?;
+                Ok((results, keep_probed_shards.then_some(shard)))
+            })
+            .collect();
+
         let mut all_results = Vec::new();
         let mut probed_shards = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.loader.load(shard_id)?;
-            all_results.extend(self.candidate_search.search(
-                &embedded,
-                &shard,
-                metric,
-                candidates_per_shard,
-            )?);
-            if self.reranker.is_some() {
+        for (results, shard) in per_shard? {
+            all_results.extend(results);
+            if let Some(shard) = shard {
                 probed_shards.push(shard);
             }
         }
