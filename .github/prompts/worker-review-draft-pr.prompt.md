@@ -71,7 +71,12 @@ Requirements:
    - remove the `ready-for-draft-check` label
 16. If the PR is not ready:
    - keep it in draft
-   - leave a concise evidence-based PR comment only when it adds durable value beyond the PR body
+   - Before deciding what to record, check whether this automation has already left a PR comment on the current head SHA that documents the same blockers found in this pass (a repeat-blocker pattern indicating the loop has stalled without progress).
+   - If the same blockers have already been documented on the current head and no new fixes have been pushed since:
+     - Determine whether every blocker has a concrete, unambiguous fix (an exact file, function, and change description that requires no design or policy decision):
+       - **All blockers are concrete and unambiguous:** compose a targeted PR comment that (a) summarises each blocker with its file path and the exact change required, and (b) ends with `@copilot please apply the fixes above`. Post this comment, keep the PR in draft, and do NOT add `needs-human`.
+       - **Any blocker requires a design decision, architectural judgment, or policy call:** ensure the `needs-human` label exists, add it to the PR, and post a concise PR comment that names each open question, lists the available options, and states the minimum next action for a human to unblock the PR. Do not tag `@copilot` in this case.
+   - If the blockers have NOT already been documented on the current head (first pass through this state), leave a concise evidence-based PR comment only when it adds durable value beyond the PR body.
 17. Clean up the dedicated worktree before finishing unless doing so would destroy unpushed local changes that must be preserved.
 18. Do not inspect or modify any other PR.
 

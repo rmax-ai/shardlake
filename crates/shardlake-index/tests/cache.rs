@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use shardlake_core::{
-    config::{FanOutPolicy, SystemConfig},
+    config::{FanOutPolicy, QueryConfig, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
     },
@@ -275,7 +275,19 @@ fn pipeline_builder_with_cache_capacity_propagates_limit() {
         .with_shard_cache_capacity(1)
         .build();
 
-    let results = pipeline.run(&[0.01, 0.02, 0.03, 0.04], 5, 2).unwrap();
+    let results = pipeline
+        .run(
+            &[0.01, 0.02, 0.03, 0.04],
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     // Even with cache capacity = 1, results should be returned correctly.
     assert!(!results.is_empty());
 }

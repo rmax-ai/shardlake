@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use shardlake_core::{
-    config::{FanOutPolicy, SystemConfig},
+    config::{FanOutPolicy, QueryConfig, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult, ShardId,
         VectorId, VectorRecord,
@@ -128,7 +128,19 @@ fn pipeline_nprobe_limits_shards_probed() {
     });
 
     let pipeline = QueryPipeline::builder(counting, manifest).build();
-    let results = pipeline.run(&records[0].data, 5, 1).unwrap();
+    let results = pipeline
+        .run(
+            &records[0].data,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 1,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert!(!results.is_empty());
     assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
@@ -150,7 +162,20 @@ fn pipeline_matches_searcher_results() {
             max_vectors_per_shard: 0,
         };
         let searcher_results = searcher.search(&query, 5, &policy).unwrap();
-        let pipeline_results = pipeline.run(&query, 5, 2).unwrap();
+        let pipeline_results = pipeline
+            .run(
+                &query,
+                &QueryConfig {
+                    top_k: 5,
+                    fan_out: FanOutPolicy {
+                        candidate_centroids: 2,
+                        candidate_shards: 0,
+                        max_vectors_per_shard: 0,
+                    },
+                    ..QueryConfig::default()
+                },
+            )
+            .unwrap();
         let mut searcher_ids: Vec<VectorId> =
             searcher_results.iter().map(|result| result.id).collect();
         let mut pipeline_ids: Vec<VectorId> =
@@ -279,7 +304,19 @@ fn pipeline_with_pq_stage_and_reranking_finds_correct_top1() {
         .rerank_oversample(5)
         .build();
 
-    let results = pipeline.search(&records[0].data, 3, 2).unwrap();
+    let results = pipeline
+        .search(
+            &records[0].data,
+            &QueryConfig {
+                top_k: 3,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert_eq!(results[0].id, VectorId(0));
 }
 
@@ -318,7 +355,19 @@ fn pipeline_rerank_receives_only_merged_candidate_records() {
         }))
         .build();
 
-    let results = pipeline.run(&records[0].data, 3, 2).unwrap();
+    let results = pipeline
+        .run(
+            &records[0].data,
+            &QueryConfig {
+                top_k: 3,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(*seen_records.lock().unwrap(), 3);
 }
@@ -351,13 +400,33 @@ fn pq_rerank_pipeline_matches_exact_topk_set() {
         .build();
 
     let exact_ids: Vec<VectorId> = exact_pipeline
-        .run(&query, 5, 2)
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
         .unwrap()
         .into_iter()
         .map(|result| result.id)
         .collect();
     let approx_ids: Vec<VectorId> = approx_pipeline
-        .run(&query, 5, 2)
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
         .unwrap()
         .into_iter()
         .map(|result| result.id)
@@ -394,7 +463,19 @@ fn test_mmap_loader_returns_same_results_as_cached_loader() {
     let cached_pipeline =
         QueryPipeline::builder(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone())
             .build();
-    let cached_results = cached_pipeline.run(&query, 5, 2).unwrap();
+    let cached_results = cached_pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
 
     // MmapShardLoader path with threshold=0 so every file is memory-mapped.
     let mmap_pipeline =
@@ -405,7 +486,19 @@ fn test_mmap_loader_returns_same_results_as_cached_loader() {
                 0,
             )))
             .build();
-    let mmap_results = mmap_pipeline.run(&query, 5, 2).unwrap();
+    let mmap_results = mmap_pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
 
     assert!(!mmap_results.is_empty(), "mmap loader must return results");
     assert_eq!(
@@ -454,7 +547,19 @@ fn test_mmap_loader_fallback_for_small_files() {
             .build();
 
     let query = records[0].data.clone();
-    let results = mmap_pipeline.run(&query, 5, 2).unwrap();
+    let results = mmap_pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
 
     assert!(
         !results.is_empty(),
@@ -563,8 +668,20 @@ fn pipeline_shard_searches_run_concurrently() {
         .build()
         .unwrap();
 
-    pool.install(|| pipeline.run(&records[0].data, 5, 4))
-        .unwrap();
+    pool.install(|| {
+        pipeline.run(
+            &records[0].data,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 4,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+    })
+    .unwrap();
 
     let observed_peak = peak.load(Ordering::SeqCst);
     assert!(
@@ -591,7 +708,17 @@ fn pipeline_shard_load_failure_propagates() {
         .build();
 
     let err = pipeline
-        .run(&records[0].data, 5, 2)
+        .run(
+            &records[0].data,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
         .expect_err("pipeline must propagate shard load error");
     assert!(
         err.to_string().contains("injected shard load failure"),
@@ -609,7 +736,19 @@ fn cosine_pipeline_returns_query_vector_as_top_result() {
         build_index(records.clone(), 2, 4, "ds-cosine", DistanceMetric::Cosine);
 
     let pipeline = QueryPipeline::builder(store, manifest).build();
-    let results = pipeline.run(&query, 5, 2).unwrap();
+    let results = pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert!(!results.is_empty());
     assert_eq!(
         results[0].id,
@@ -641,7 +780,19 @@ fn inner_product_pipeline_returns_query_vector_as_top_result() {
     );
 
     let pipeline = QueryPipeline::builder(store, manifest).build();
-    let results = pipeline.run(&query, 5, 2).unwrap();
+    let results = pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 5,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert!(!results.is_empty());
     assert_eq!(
         results[0].id, last_id,
@@ -692,8 +843,32 @@ fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differ
     let euclidean_pipeline = QueryPipeline::builder(store_euc, manifest_euc).build();
     let cosine_pipeline = QueryPipeline::builder(store_cos, manifest_cos).build();
 
-    let euc_top1 = euclidean_pipeline.run(&query, 1, 1).unwrap();
-    let cos_top1 = cosine_pipeline.run(&query, 1, 1).unwrap();
+    let euc_top1 = euclidean_pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 1,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 1,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
+    let cos_top1 = cosine_pipeline
+        .run(
+            &query,
+            &QueryConfig {
+                top_k: 1,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 1,
+                    ..Default::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
 
     assert_eq!(
         euc_top1[0].id,

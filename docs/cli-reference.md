@@ -186,6 +186,124 @@ shardlake build-index \
 
 ---
 
+## `shardlake build-index-worker`
+
+Distributed build worker mode.  Splits the index-build workload across
+multiple independent workers, each responsible for a subset of shards.  Use
+this instead of `build-index` when the dataset is too large to build on a
+single machine, or when you want to parallelize shard construction.
+
+The workflow has two phases: **`plan`** and **`execute`**.
+
+### Phase 1 – `plan`
+
+Trains the IVF coarse quantizer, assigns all dataset vectors to shards, and
+partitions shards round-robin across `--num-workers` workers.  Writes a
+`worker_plan.json` file and the coarse-quantizer artifact to storage.
+
+Run this **once** before launching individual workers.
+
+#### Usage
+
+```
+shardlake [--storage <PATH>] build-index-worker --mode plan \
+  --dataset-version <STRING> [OPTIONS]
+```
+
+#### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dataset-version <STRING>` | string | *(required)* | Dataset version to index (must match a prior `ingest` run) |
+| `--index-version <STRING>` | string | `idx-<timestamp>` | Version tag for the index artifact |
+| `--embedding-version <STRING>` | string | dataset manifest `embedding_version` | Embedding version to record in the manifest |
+| `--metric <METRIC>` | enum | `cosine` | Distance metric: `cosine`, `euclidean`, or `inner-product` |
+| `--num-shards <N>` | u32 | `4` | Number of K-means clusters / shards |
+| `--kmeans-iters <N>` | u32 | `20` | Number of K-means iterations |
+| `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for reproducible shard layout |
+| `--kmeans-sample-size <N>` | u32 | use all vectors | Maximum vectors for centroid training |
+| `--num-workers <N>` | usize | `1` | Number of workers to distribute shards across |
+
+#### Output
+
+Writes to `<storage>/indexes/<index-version>/`:
+
+| File | Description |
+|------|-------------|
+| `worker_plan.json` | Worker plan JSON (shard assignments, centroids, and dataset keys) |
+| `coarse_quantizer.cq` | Trained IVF coarse-quantizer artifact |
+
+#### Example
+
+```bash
+# Plan a 4-worker distributed build
+shardlake build-index-worker --mode plan \
+  --dataset-version ds-v1 \
+  --index-version idx-v1 \
+  --num-shards 8 \
+  --kmeans-seed 3735928559 \
+  --num-workers 4
+```
+
+---
+
+### Phase 2 – `execute`
+
+Loads the plan for a given index version, reads the dataset vectors, assigns
+each vector to its globally nearest shard using the centroids from the plan,
+builds the shards assigned to `--worker-id`, and writes shard artifacts and
+an `output.json` metadata file to storage.
+
+Run one `execute` invocation per worker ID (`0` through `num_workers - 1`).
+
+#### Usage
+
+```
+shardlake [--storage <PATH>] build-index-worker --mode execute \
+  --index-version <STRING> --worker-id <N>
+```
+
+#### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(required)* | Index version whose plan to load |
+| `--worker-id <N>` | usize | *(required)* | Zero-based worker index |
+
+#### Output
+
+Writes to `<storage>/indexes/<index-version>/`:
+
+| File | Description |
+|------|-------------|
+| `shards/shard-NNNN.sidx` | Binary shard file for each shard assigned to this worker |
+| `workers/NNNN/output.json` | Intermediate output metadata (shard IDs, artifact keys, vector counts, fingerprints, centroids) |
+
+The `output.json` file is consumed by the future merge step to assemble the
+final `manifest.json` without re-reading shard artifact bytes.
+Worker IDs are zero-padded to four digits in this path (for example, worker `0`
+writes `workers/0000/output.json`).
+
+#### Reproducibility
+
+Given the same dataset, `--num-shards`, and `--kmeans-seed`, the plan phase
+always produces identical shard centroids and assignments.  Execute workers
+therefore always produce identical artifact bytes and fingerprints for the
+same inputs, enabling deterministic distributed builds.
+
+#### Example
+
+```bash
+# Run all 4 workers (can be parallelised across machines)
+for WORKER_ID in 0 1 2 3; do
+  shardlake build-index-worker --mode execute \
+    --index-version idx-v1 \
+    --worker-id $WORKER_ID
+done
+```
+
+---
+
 ## `shardlake publish`
 
 Creates or updates an alias pointer that maps a human-readable name (e.g. `latest`) to a
@@ -290,12 +408,23 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | `--max-vectors-per-shard <N>` | u32 | `0` | Maximum number of vectors to score inside each probed shard (`0` = no limit) |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
 | `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+| `--workload <MODE>` | enum | `mixed` | Workload simulation mode: `cold`, `warm`, or `mixed` |
+
+### Workload Modes
+
+| Mode | Description |
+|------|-------------|
+| `cold` | A fresh shard cache is created before every query. Simulates a process that starts cold with no pre-loaded shards. Latencies reflect pure storage-access costs. |
+| `warm` | All shards accessed by the query set are pre-loaded (un-timed warm-up pass) before the measured run. Simulates a long-running process with a fully warmed cache. |
+| `mixed` | No explicit pre-warming or cache eviction. The cache transitions from cold to warm organically as the run progresses. Reflects realistic serving behaviour (default). |
 
 ### Metrics
 
 | Metric | Description |
 |--------|-------------|
+| Workload | Simulation mode used (`cold`, `warm`, or `mixed`) |
 | Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Cache hit rate | Fraction of raw-shard loads served from in-memory cache during the measured pass; lower values indicate colder behaviour, while `cold` mode still resets the cache before each query |
 | Mean latency | Average per-query ANN search time in microseconds |
 | P99 latency | 99th-percentile per-query ANN search time in microseconds |
 | Throughput | Wall-clock query throughput in queries per second (qps) |
@@ -307,10 +436,12 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 
 ```
 === Benchmark Report ===
+  Workload:          mixed
   Queries:           100
   k:                 10
   nprobe:            2
   Recall@10:         0.9400
+  Cache hit rate:    0.8750
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
   Throughput:        23800.0 qps
@@ -321,6 +452,8 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 
 ```json
 {
+  "workload": "mixed",
+  "cache_hit_rate": 0.875,
   "num_queries": 100,
   "k": 10,
   "nprobe": 2,
@@ -335,8 +468,14 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 ### Example
 
 ```bash
-# Full precision benchmark with a larger query sample
+# Default mixed workload benchmark
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Simulate cold-start latency (fresh cache per query)
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --workload cold
+
+# Simulate fully warm-cache latency (pre-warmed before measurement)
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --workload warm
 
 # Machine-readable JSON for CI regression tracking
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --output json

@@ -8,8 +8,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use shardlake_core::{config::FanOutPolicy, error::CoreError, types::SearchResult};
-use shardlake_index::{IndexError, QueryPlan};
+use shardlake_core::{
+    config::{FanOutPolicy, QueryConfig},
+    error::CoreError,
+    types::{DistanceMetric, SearchResult},
+};
+use shardlake_index::{IndexError, QueryPlan, PQ8_CODEC};
 
 use crate::AppState;
 
@@ -33,6 +37,20 @@ pub struct QueryRequest {
     /// Maximum number of vectors to evaluate per probed shard.
     /// `0` means no limit.  Overrides the server default when present.
     pub max_vectors_per_shard: Option<u32>,
+    /// Maximum number of merged candidates passed to the reranker.
+    ///
+    /// When absent, the server reranks the top `k` ANN candidates.  When set,
+    /// it widens the candidate pool handed to the reranker to `max(k, n)`.
+    /// Must be ≥ 1 when provided.
+    /// Only meaningful when `rerank` is `true`.
+    pub rerank_limit: Option<usize>,
+    /// Distance metric override for this query.
+    ///
+    /// When absent (default), the metric stored in the index manifest is
+    /// used.  When provided, overrides the manifest metric for this query
+    /// only.  Must be one of `"cosine"`, `"euclidean"`, or
+    /// `"inner_product"`.
+    pub distance_metric: Option<DistanceMetric>,
 }
 
 /// Query response envelope.
@@ -96,12 +114,12 @@ impl IntoResponse for PolicyError {
 /// Parse and validate the fan-out policy from a [`QueryRequest`], falling back
 /// to the server-level defaults in `fan_out`.
 ///
-/// Returns `Ok(FanOutPolicy)` on success, or a [`PolicyError`] that can be
+/// Returns `Ok(QueryConfig)` on success, or a [`PolicyError`] that can be
 /// returned directly as an HTTP response on invalid input.
 fn resolve_policy(
     req: &QueryRequest,
     fan_out: &FanOutPolicy,
-) -> std::result::Result<FanOutPolicy, PolicyError> {
+) -> std::result::Result<QueryConfig, PolicyError> {
     if req.k == 0 {
         return Err(PolicyError(
             StatusCode::BAD_REQUEST,
@@ -131,20 +149,25 @@ fn resolve_policy(
         .max_vectors_per_shard
         .unwrap_or(fan_out.max_vectors_per_shard);
 
-    let policy = FanOutPolicy {
-        candidate_centroids,
-        candidate_shards,
-        max_vectors_per_shard,
+    let query_config = QueryConfig {
+        top_k: req.k,
+        fan_out: FanOutPolicy {
+            candidate_centroids,
+            candidate_shards,
+            max_vectors_per_shard,
+        },
+        rerank_limit: req.rerank_limit,
+        distance_metric: req.distance_metric,
     };
 
-    if let Err(e) = policy.validate() {
+    if let Err(e) = query_config.validate() {
         return Err(PolicyError(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
         ));
     }
 
-    Ok(policy)
+    Ok(query_config)
 }
 
 /// Map a blocking search task result to an HTTP error response.
@@ -169,20 +192,47 @@ async fn query_handler(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let policy = match resolve_policy(&req, &state.fan_out) {
-        Ok(p) => p,
+    let query_config = match resolve_policy(&req, &state.fan_out) {
+        Ok(config) => config,
         Err(e) => return e.into_response(),
     };
 
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    let k = req.k;
     let rerank = req.rerank.unwrap_or(false);
+    let manifest = searcher.manifest();
+    let pq_metric_override_rejected = manifest.compression.enabled
+        && manifest.compression.codec == PQ8_CODEC
+        && matches!(
+            query_config.distance_metric,
+            Some(metric) if metric != DistanceMetric::Euclidean
+        );
+    if pq_metric_override_rejected {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "PQ-compressed indexes currently support only euclidean distance queries"
+            })),
+        )
+            .into_response();
+    }
+    let policy = query_config.fan_out.clone();
+    let k = query_config.top_k;
+    let metric = query_config
+        .distance_metric
+        .unwrap_or(manifest.distance_metric);
+    let candidate_k = if rerank {
+        query_config.rerank_limit.unwrap_or(k).max(k)
+    } else {
+        k
+    };
     match tokio::task::spawn_blocking(move || {
-        let ann_results = searcher.search(&vector, k, &policy)?;
+        let ann_results = searcher.search_with_metric(&vector, candidate_k, &policy, metric)?;
         if rerank {
-            searcher.rerank(&vector, ann_results)
+            let mut reranked = searcher.rerank_with_metric(&vector, ann_results, metric)?;
+            reranked.truncate(k);
+            Ok(reranked)
         } else {
             Ok(ann_results)
         }
@@ -210,16 +260,39 @@ async fn query_plan_handler(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let policy = match resolve_policy(&req, &state.fan_out) {
-        Ok(p) => p,
+    let query_config = match resolve_policy(&req, &state.fan_out) {
+        Ok(config) => config,
         Err(e) => return e.into_response(),
     };
 
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    let k = req.k;
-    match tokio::task::spawn_blocking(move || searcher.search_with_plan(&vector, k, &policy)).await
+    let manifest = searcher.manifest();
+    let pq_metric_override_rejected = manifest.compression.enabled
+        && manifest.compression.codec == PQ8_CODEC
+        && matches!(
+            query_config.distance_metric,
+            Some(metric) if metric != DistanceMetric::Euclidean
+        );
+    if pq_metric_override_rejected {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "PQ-compressed indexes currently support only euclidean distance queries"
+            })),
+        )
+            .into_response();
+    }
+    let policy = query_config.fan_out.clone();
+    let k = query_config.top_k;
+    let metric = query_config
+        .distance_metric
+        .unwrap_or(manifest.distance_metric);
+    match tokio::task::spawn_blocking(move || {
+        searcher.search_with_plan_with_metric(&vector, k, &policy, metric)
+    })
+    .await
     {
         Ok(Ok(plan)) => Json(QueryPlanResponse {
             plan,
@@ -252,7 +325,7 @@ mod tests {
             DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
         },
     };
-    use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher};
+    use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher, PqParams};
     use shardlake_storage::{LocalObjectStore, ObjectStore};
     use tower::util::ServiceExt;
 
@@ -313,6 +386,126 @@ mod tests {
                 max_vectors_per_shard: 0,
             },
             debug_routes_enabled,
+        };
+        (build_router(state), tmp)
+    }
+
+    fn make_distance_metric_router() -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 4,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![100.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![9.0, 1.0],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-metric".into()),
+                embedding_version: EmbeddingVersion("emb-metric".into()),
+                index_version: IndexVersion("idx-metric".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 2,
+                vectors_key: "datasets/ds-metric/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-metric/metadata.json".into(),
+                pq_params: None,
+            })
+            .expect("build index");
+        let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let state = AppState {
+            searcher,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 1,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
+            debug_routes_enabled: false,
+        };
+        (build_router(state), tmp)
+    }
+
+    fn make_pq_router() -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 4,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            pq_enabled: true,
+            pq_num_subspaces: 1,
+            pq_codebook_size: 2,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![0.5, 0.5],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(4),
+                data: vec![0.25, 0.75],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-pq".into()),
+                embedding_version: EmbeddingVersion("emb-pq".into()),
+                index_version: IndexVersion("idx-pq".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 2,
+                vectors_key: "datasets/ds-pq/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-pq/metadata.json".into(),
+                pq_params: Some(PqParams {
+                    num_subspaces: 1,
+                    codebook_size: 2,
+                }),
+            })
+            .expect("build index");
+        let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let state = AppState {
+            searcher,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 1,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
+            debug_routes_enabled: false,
         };
         (build_router(state), tmp)
     }
@@ -587,7 +780,6 @@ mod tests {
             .expect("body bytes");
         let payload: QueryPlanResponse =
             serde_json::from_slice(&body).expect("query plan response json");
-        // All searched shard IDs must be ≤ num_shards configured in make_test_router (2).
         for shard_id in &payload.plan.searched_shards {
             assert!(shard_id.0 < 2, "unexpected shard id {shard_id}");
         }
@@ -607,5 +799,139 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn query_route_accepts_rerank_limit() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"candidate_centroids":1,"rerank":true,"rerank_limit":5}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_zero_rerank_limit() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1,"rerank_limit":0}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rerank_limit"),
+            "expected error mentioning rerank_limit, got: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_route_accepts_distance_metric_override() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"distance_metric":"euclidean"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_applies_distance_metric_override() {
+        let (app, _tmp) = make_distance_metric_router();
+
+        let default_response = app
+            .clone()
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[10.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(default_response.status(), StatusCode::OK);
+        let default_body = to_bytes(default_response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let default_payload: QueryResponse =
+            serde_json::from_slice(&default_body).expect("query response json");
+        assert_eq!(default_payload.results[0].id, VectorId(2));
+
+        let cosine_response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[10.0,0.0],"k":1,"distance_metric":"cosine"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(cosine_response.status(), StatusCode::OK);
+        let cosine_body = to_bytes(cosine_response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let cosine_payload: QueryResponse =
+            serde_json::from_slice(&cosine_body).expect("query response json");
+        assert_eq!(cosine_payload.results[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_non_euclidean_metric_for_pq_indexes() {
+        let (app, _tmp) = make_pq_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"distance_metric":"cosine"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(
+            payload["error"],
+            "PQ-compressed indexes currently support only euclidean distance queries"
+        );
     }
 }
