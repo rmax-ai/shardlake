@@ -72,6 +72,7 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
         searcher,
         fan_out,
         metrics,
+        bm25_index: None,
     };
     let router = build_router(state);
 

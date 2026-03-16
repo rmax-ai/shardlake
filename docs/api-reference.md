@@ -37,8 +37,16 @@ curl -s http://localhost:8080/health
 
 ## `POST /query`
 
-Performs approximate nearest-neighbour (ANN) search and optionally reranks
-the top candidates by exact distance computation before returning results.
+Performs search and optionally reranks the top candidates by exact distance
+computation before returning results.  Three retrieval modes are supported:
+
+- **`vector`** (default) – approximate nearest-neighbour (ANN) search against
+  the IVF vector index.
+- **`lexical`** – BM25 full-text search against the lexical index.  Requires a
+  BM25 artifact to have been built alongside the vector index.
+- **`hybrid`** – blends vector-distance and BM25 scores using
+  [`rank_hybrid`](#weighted-hybrid-ranking).  Requires both a query vector and
+  query text.
 
 ### Request body
 
@@ -46,6 +54,8 @@ the top candidates by exact distance computation before returning results.
 {
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
+  "query_mode": "vector",
+  "query_text": "quick brown fox",
   "candidate_centroids": 3,
   "candidate_shards": 2,
   "max_vectors_per_shard": 500,
@@ -57,13 +67,15 @@ the top candidates by exact distance computation before returning results.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `vector` | `float[]` | Yes | Query vector. Must have the same number of dimensions as the index. |
+| `vector` | `float[]` | Mode-dependent | Query vector. Must have the same number of dimensions as the index. Required for `vector` and `hybrid` modes; ignored for `lexical`. |
 | `k` | integer | Yes | Number of results to return. Must be ≥ 1. |
+| `query_mode` | string | No | Retrieval mode. One of `"vector"` (default), `"lexical"`, or `"hybrid"`. See [Query modes](#query-modes) below. |
+| `query_text` | string | Mode-dependent | Query text for BM25 full-text search. Required for `lexical` and `hybrid` modes; ignored for `vector`. |
 | `nprobe` | integer | No | Backward-compatible alias for `candidate_centroids`. Ignored when `candidate_centroids` is also provided. Defaults to the server's `--nprobe` value. |
 | `candidate_centroids` | integer | No | Number of nearest IVF centroids to select for shard routing. Must be ≥ 1 when provided. Takes precedence over `nprobe`. Defaults to the server's `--nprobe` value. |
 | `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
 | `max_vectors_per_shard` | integer | No | Maximum number of vectors evaluated inside each probed shard. `0` means no limit. Defaults to the server's `--max-vectors-per-shard` value. |
-| `rerank` | boolean | No | When `true`, the ANN candidates are re-scored against their raw vectors using exact distance computation before the final ranking is returned. Defaults to `false`. See [Exact reranking](#exact-reranking) below. |
+| `rerank` | boolean | No | When `true`, the ANN candidates are re-scored against their raw vectors using exact distance computation before the final ranking is returned. Defaults to `false`. See [Exact reranking](#exact-reranking) below. Only applies to `vector` and `hybrid` modes. |
 | `rerank_limit` | integer | No | Maximum number of merged candidates passed to the reranker. Must be ≥ 1 when provided. When absent, the server reranks the top `k` ANN candidates. Only meaningful when `rerank` is `true`. See [Rerank candidate limit](#rerank-candidate-limit) below. |
 | `distance_metric` | string | No | Distance metric override for this query. One of `"cosine"`, `"euclidean"`, or `"inner_product"`. When absent, the metric stored in the index manifest is used. See [Per-query distance metric](#per-query-distance-metric) below. |
 
@@ -100,10 +112,17 @@ the top candidates by exact distance computation before returning results.
 | Status | Body | Cause |
 |--------|------|-------|
 | `400 Bad Request` | `{"error": "k must be > 0"}` | `k` field is 0 |
+| `400 Bad Request` | `{"error": "vector is required for vector mode"}` | `query_mode` is `"vector"` (or absent) and `vector` field is missing |
+| `400 Bad Request` | `{"error": "query_text is required for lexical mode"}` | `query_mode` is `"lexical"` and `query_text` field is missing or empty |
+| `400 Bad Request` | `{"error": "lexical query mode is not available: no BM25 index loaded"}` | `query_mode` is `"lexical"` but the server was started without a BM25 lexical index |
+| `400 Bad Request` | `{"error": "vector is required for hybrid mode"}` | `query_mode` is `"hybrid"` and `vector` field is missing |
+| `400 Bad Request` | `{"error": "query_text is required for hybrid mode"}` | `query_mode` is `"hybrid"` and `query_text` field is missing or empty |
+| `400 Bad Request` | `{"error": "hybrid query mode is not available: no BM25 index loaded"}` | `query_mode` is `"hybrid"` but the server was started without a BM25 lexical index |
 | `400 Bad Request` | `{"error": "invalid fan-out policy: candidate_centroids must be ≥ 1"}` | `candidate_centroids` (or `nprobe`) is 0 |
 | `400 Bad Request` | `{"error": "invalid query config: rerank_limit must be ≥ 1 when set"}` | `rerank_limit` is 0 |
 | `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
 | `400 Bad Request` | `{"error": "PQ-compressed indexes currently support only euclidean distance queries"}` | Request overrides `distance_metric` to a non-euclidean value against a PQ-compressed index |
+| `422 Unprocessable Entity` | JSON parse error | `query_mode` contains an unrecognised value |
 | `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
 ### Example
@@ -130,6 +149,51 @@ curl -s -X POST http://localhost:8080/query \
     "rerank": true
   }' | python3 -m json.tool
 ```
+
+### Example: lexical search
+
+```bash
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query_mode": "lexical",
+    "query_text": "quick brown fox",
+    "k": 5
+  }' | python3 -m json.tool
+```
+
+### Example: hybrid search
+
+```bash
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query_mode": "hybrid",
+    "vector": [0.5, 0.3, 0.8, 0.1],
+    "query_text": "quick brown fox",
+    "k": 5
+  }' | python3 -m json.tool
+```
+
+## Query modes
+
+The `query_mode` field selects which retrieval backend(s) are used for the
+query.
+
+| Value | Required fields | Description |
+|-------|-----------------|-------------|
+| `"vector"` (default) | `vector` | Approximate nearest-neighbour (ANN) search using the IVF vector index. |
+| `"lexical"` | `query_text` | BM25 full-text search using the lexical inverted index.  The index must have been built with a BM25 artifact. |
+| `"hybrid"` | `vector`, `query_text` | Runs both vector and lexical search, then blends the results using [`rank_hybrid`](#weighted-hybrid-ranking). |
+
+**Backward compatibility:** existing clients that do not send `query_mode`
+continue to use `"vector"` mode.  The `vector` field remains optional in the
+JSON body; it is only validated to be present when the selected mode requires
+it.
+
+**Availability:** `"lexical"` and `"hybrid"` modes require the loaded index to
+include a BM25 artifact.  Requests using these modes are rejected with
+`400 Bad Request` when no BM25 index is available.
 
 ## Exact reranking
 

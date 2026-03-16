@@ -12,17 +12,32 @@ use tracing::error;
 use shardlake_core::{
     config::{FanOutPolicy, QueryConfig},
     error::CoreError,
-    types::{DistanceMetric, SearchResult},
+    types::{DistanceMetric, QueryMode, SearchResult},
 };
-use shardlake_index::{IndexError, PQ8_CODEC};
+use shardlake_index::{
+    ranking::{rank_hybrid, HybridRankingPolicy},
+    IndexError, PQ8_CODEC,
+};
 
 use crate::AppState;
 
 /// Query request payload.
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
-    pub vector: Vec<f32>,
+    /// Query vector.  Required for `vector` and `hybrid` modes.
+    pub vector: Option<Vec<f32>>,
     pub k: usize,
+    /// Retrieval mode.  Defaults to `"vector"` when absent.
+    ///
+    /// - `"vector"` – ANN vector search (requires `vector`).
+    /// - `"lexical"` – BM25 full-text search (requires `query_text`).
+    /// - `"hybrid"` – blend of vector and lexical (requires both `vector` and
+    ///   `query_text`).
+    #[serde(default)]
+    pub query_mode: QueryMode,
+    /// Query text for BM25 lexical search.  Required for `lexical` and
+    /// `hybrid` modes; ignored for `vector` mode.
+    pub query_text: Option<String>,
     /// Number of nearest centroids to select (overrides the server default).
     /// Alias for `candidate_centroids`; kept for backward compatibility.
     pub nprobe: Option<usize>,
@@ -118,6 +133,63 @@ async fn query_handler(
             .into_response();
     }
 
+    // Validate mode-specific field requirements.
+    let query_mode = req.query_mode;
+    match query_mode {
+        QueryMode::Vector => {
+            if req.vector.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "vector is required for vector mode" })),
+                )
+                    .into_response();
+            }
+        }
+        QueryMode::Lexical => {
+            if req.query_text.as_deref().map(str::is_empty).unwrap_or(true) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "query_text is required for lexical mode" })),
+                )
+                    .into_response();
+            }
+            if state.bm25_index.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "lexical query mode is not available: no BM25 index loaded"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        QueryMode::Hybrid => {
+            if req.vector.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "vector is required for hybrid mode" })),
+                )
+                    .into_response();
+            }
+            if req.query_text.as_deref().map(str::is_empty).unwrap_or(true) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "query_text is required for hybrid mode" })),
+                )
+                    .into_response();
+            }
+            if state.bm25_index.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "hybrid query mode is not available: no BM25 index loaded"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Build per-request fan-out policy, falling back to server defaults.
     // `candidate_centroids` takes precedence over the legacy `nprobe` field.
     let legacy_candidate_centroids = match req.nprobe.map(u32::try_from).transpose() {
@@ -144,6 +216,7 @@ async fn query_handler(
         .unwrap_or(state.fan_out.max_vectors_per_shard);
 
     let query_config = QueryConfig {
+        query_mode,
         top_k: req.k,
         fan_out: FanOutPolicy {
             candidate_centroids,
@@ -166,6 +239,7 @@ async fn query_handler(
     let searcher = state.searcher.clone();
     let metrics = Arc::clone(&state.metrics);
     let vector = req.vector;
+    let query_text = req.query_text;
     let rerank = req.rerank.unwrap_or(false);
     let timer = metrics.query_duration_seconds.start_timer();
     let manifest = searcher.manifest();
@@ -194,14 +268,41 @@ async fn query_handler(
     } else {
         k
     };
-    match tokio::task::spawn_blocking(move || {
-        let ann_results = searcher.search_with_metric(&vector, candidate_k, &policy, metric)?;
-        if rerank {
-            let mut reranked = searcher.rerank_with_metric(&vector, ann_results, metric)?;
-            reranked.truncate(k);
-            Ok(reranked)
-        } else {
-            Ok(ann_results)
+    let bm25_index = state.bm25_index.clone();
+    match tokio::task::spawn_blocking(move || -> shardlake_index::Result<Vec<SearchResult>> {
+        match query_mode {
+            QueryMode::Vector => {
+                let v = vector.expect("vector validated above");
+                let ann_results = searcher.search_with_metric(&v, candidate_k, &policy, metric)?;
+                if rerank {
+                    let mut reranked = searcher.rerank_with_metric(&v, ann_results, metric)?;
+                    reranked.truncate(k);
+                    Ok(reranked)
+                } else {
+                    Ok(ann_results)
+                }
+            }
+            QueryMode::Lexical => {
+                let bm25 = bm25_index.expect("bm25 index validated above");
+                let text = query_text.expect("query_text validated above");
+                Ok(bm25.search(&text, k))
+            }
+            QueryMode::Hybrid => {
+                let v = vector.expect("vector validated above");
+                let bm25 = bm25_index.expect("bm25 index validated above");
+                let text = query_text.expect("query_text validated above");
+                let ann_results = searcher.search_with_metric(&v, candidate_k, &policy, metric)?;
+                let vector_results = if rerank {
+                    let mut reranked = searcher.rerank_with_metric(&v, ann_results, metric)?;
+                    reranked.truncate(candidate_k);
+                    reranked
+                } else {
+                    ann_results
+                };
+                let bm25_results = bm25.search(&text, k);
+                let hybrid_policy = HybridRankingPolicy::default();
+                Ok(rank_hybrid(vector_results, bm25_results, &hybrid_policy, k))
+            }
         }
     })
     .await
@@ -260,7 +361,10 @@ mod tests {
             DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
         },
     };
-    use shardlake_index::{BuildParams, IndexBuilder, IndexSearcher, PqParams};
+    use shardlake_index::{
+        bm25::{BM25Params, Bm25Index},
+        BuildParams, IndexBuilder, IndexSearcher, PqParams,
+    };
     use shardlake_storage::{LocalObjectStore, ObjectStore};
     use tower::util::ServiceExt;
 
@@ -316,6 +420,7 @@ mod tests {
                 max_vectors_per_shard: 0,
             },
             metrics,
+            bm25_index: None,
         };
         (build_router(state), tmp)
     }
@@ -369,6 +474,7 @@ mod tests {
                 max_vectors_per_shard: 0,
             },
             metrics,
+            bm25_index: None,
         };
         (build_router(state), tmp)
     }
@@ -438,6 +544,7 @@ mod tests {
                 max_vectors_per_shard: 0,
             },
             metrics,
+            bm25_index: None,
         };
         (build_router(state), tmp)
     }
@@ -863,6 +970,367 @@ mod tests {
         assert_eq!(
             payload["error"],
             "PQ-compressed indexes currently support only euclidean distance queries"
+        );
+    }
+
+    // ── Query-mode helpers ────────────────────────────────────────────────────
+
+    /// Build a test router that includes a BM25 lexical index alongside the
+    /// vector index, enabling lexical and hybrid query mode tests.
+    fn make_lexical_router() -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 4,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-lex".into()),
+                embedding_version: EmbeddingVersion("emb-lex".into()),
+                index_version: IndexVersion("idx-lex".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 2,
+                vectors_key: "datasets/ds-lex/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-lex/metadata.json".into(),
+                pq_params: None,
+            })
+            .expect("build index");
+        let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
+        let bm25 = Bm25Index::build(
+            &[
+                (VectorId(1), "quick brown fox jumps over lazy dog"),
+                (VectorId(2), "lazy dog sleeps all day"),
+            ],
+            BM25Params::default(),
+        );
+        let state = AppState {
+            searcher,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 2,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
+            metrics,
+            bm25_index: Some(Arc::new(bm25)),
+        };
+        (build_router(state), tmp)
+    }
+
+    // ── Query mode: defaults ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_mode_defaults_to_vector_when_absent() {
+        // Omitting `query_mode` should behave identically to `"vector"`.
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_mode_vector_explicit_returns_results() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"vector"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].id, VectorId(1));
+    }
+
+    // ── Query mode: vector validation ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_mode_vector_rejects_missing_vector() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"k":1,"query_mode":"vector"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("vector is required for vector mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    // ── Query mode: lexical ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_mode_lexical_returns_results() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"k":2,"query_mode":"lexical","query_text":"lazy dog"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("json");
+        assert!(
+            !payload.results.is_empty(),
+            "lexical search returned no results"
+        );
+        // Doc 2 ("lazy dog sleeps all day") should match "lazy dog" best.
+        assert_eq!(payload.results[0].id, VectorId(2));
+    }
+
+    #[tokio::test]
+    async fn query_mode_lexical_rejects_missing_query_text() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"k":1,"query_mode":"lexical"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("query_text is required for lexical mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_lexical_rejects_no_bm25_index() {
+        // Router has no BM25 index.
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"k":1,"query_mode":"lexical","query_text":"fox"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no BM25 index loaded"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    // ── Query mode: hybrid ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_mode_hybrid_returns_results() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":2,"query_mode":"hybrid","query_text":"lazy dog"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("json");
+        assert!(
+            !payload.results.is_empty(),
+            "hybrid search returned no results"
+        );
+        // Both docs should appear (they each appear in either the vector or lexical list).
+        assert_eq!(payload.results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_mode_hybrid_rejects_missing_vector() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"k":1,"query_mode":"hybrid","query_text":"fox"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("vector is required for hybrid mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_hybrid_rejects_missing_query_text() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"hybrid"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("query_text is required for hybrid mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_hybrid_rejects_no_bm25_index() {
+        // Router has no BM25 index.
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"hybrid","query_text":"fox"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no BM25 index loaded"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_invalid_value_rejected() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"invalid_mode"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        // Axum rejects invalid enum values with a 422 or 400 during deserialization.
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST
+                || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
+            "expected 400 or 422 for invalid query_mode, got {}",
+            response.status()
         );
     }
 }
