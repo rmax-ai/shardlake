@@ -399,7 +399,7 @@ fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differ
     // Construct a corpus where cosine and euclidean give different top-1 results:
     //   id=0: [1.0, 0.1, 0.0, 0.0]  — nearest in L2, but slightly off-angle
     //   id=1: [100.0, 0.0, 0.0, 0.0] — exact cosine match, but far in L2
-    //   id=2: [0.0, 1.0, 0.0, 0.0]  — clearly worse under both metrics
+    //   id=2: [1.0, 1.0, 0.0, 0.0]  — clearly worse under both metrics
     //
     // This makes the metric choice observable end-to-end: euclidean should prefer
     // the nearby off-angle point, while cosine should prefer the distant point with
@@ -440,7 +440,7 @@ fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differ
     let euc_top1 = euclidean_pipeline.run(&query, 1, 1).unwrap();
     let cos_top1 = cosine_pipeline.run(&query, 1, 1).unwrap();
 
-    // Euclidean: id=0 (dist=0) is exactly the query.
+    // Euclidean: id=0 is the nearest point in L2 (distance 0.1).
     assert_eq!(
         euc_top1[0].id,
         VectorId(0),

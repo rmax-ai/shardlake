@@ -256,7 +256,7 @@ mod tests {
         let euclidean = exact_search(&query, &records, DistanceMetric::Euclidean, 3);
         let cosine = exact_search(&query, &records, DistanceMetric::Cosine, 3);
 
-        // Euclidean: id=2 (dist 0) < id=1 (dist 9) < id=3 (dist ~1.0)
+        // Euclidean: id=2 (dist 0) < id=3 (dist ~1.345) < id=1 (dist 9)
         assert_eq!(euclidean[0].id, VectorId(2));
         // Cosine: id=1 and id=2 are tied (same direction); id=3 has nonzero angle
         // Both id=1 and id=2 have cosine distance 0 from [1,0]; id=3 is farther.
