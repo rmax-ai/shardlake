@@ -25,6 +25,8 @@ enum Commands {
     Ingest(commands::ingest::IngestArgs),
     /// Build shard-based ANN index from ingested vectors.
     BuildIndex(commands::build_index::BuildIndexArgs),
+    /// Distributed build worker: plan or execute one worker's shard assignments.
+    BuildIndexWorker(commands::build_index_worker::BuildIndexWorkerArgs),
     /// Generate a reproducible synthetic benchmark dataset.
     Generate(commands::generate::GenerateArgs),
     /// Publish (or re-publish) a manifest alias.
@@ -53,6 +55,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Ingest(args) => commands::ingest::run(cli.storage, args).await,
         Commands::BuildIndex(args) => commands::build_index::run(cli.storage, args).await,
+        Commands::BuildIndexWorker(args) => {
+            commands::build_index_worker::run(cli.storage, args).await
+        }
         Commands::Generate(args) => commands::generate::run(cli.storage, args).await,
         Commands::Publish(args) => commands::publish::run(cli.storage, args).await,
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
