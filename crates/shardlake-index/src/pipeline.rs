@@ -21,7 +21,7 @@ use std::{
 };
 
 use rayon::prelude::*;
-use tracing::debug;
+use tracing::{debug, debug_span};
 
 use shardlake_core::{
     config::PrefetchPolicy,
@@ -263,6 +263,7 @@ impl CachedShardLoader {
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        let _span = debug_span!("shard_load", shard_id = shard_id.0).entered();
         self.record_access(shard_id)?;
 
         let mut retained_bytes = None;
@@ -273,6 +274,7 @@ impl LoadShardStage for CachedShardLoader {
                 .iter()
                 .find(|s| s.shard_id == shard_id)
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+            debug!("cache miss, loading from store");
             self.metrics.record_miss();
             let started = Instant::now();
             let bytes = self.store.get(&shard_def.artifact_key);
@@ -284,7 +286,10 @@ impl LoadShardStage for CachedShardLoader {
         })?;
 
         match access {
-            CacheAccess::Hit => self.metrics.record_hit(),
+            CacheAccess::Hit => {
+                debug!("cache hit");
+                self.metrics.record_hit();
+            }
             CacheAccess::Miss => {
                 if let Some(bytes) = retained_bytes {
                     self.metrics.record_retained_bytes(bytes);
@@ -649,17 +654,29 @@ impl QueryPipeline {
         type PerShardSearchOutput = (Vec<SearchResult>, Option<Arc<ShardIndex>>);
 
         let keep_probed_shards = self.reranker.is_some();
+        // Rayon workers do not automatically inherit the scoped tracing
+        // subscriber used by span-capture tests, so propagate it explicitly.
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         let per_shard: Result<Vec<PerShardSearchOutput>> = probe_shards
             .par_iter()
             .map(|&shard_id| {
-                let shard = self.loader.load(shard_id)?;
-                let results = self.candidate_search.search(
-                    &embedded,
-                    &shard,
-                    metric,
-                    candidates_per_shard,
-                )?;
-                Ok((results, keep_probed_shards.then_some(shard)))
+                let dispatch = dispatch.clone();
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let shard = self.loader.load(shard_id)?;
+                    let _span = debug_span!(
+                        "ann_search",
+                        shard_id = shard_id.0,
+                        k = candidates_per_shard
+                    )
+                    .entered();
+                    let results = self.candidate_search.search(
+                        &embedded,
+                        &shard,
+                        metric,
+                        candidates_per_shard,
+                    )?;
+                    Ok((results, keep_probed_shards.then_some(shard)))
+                })
             })
             .collect();
 
@@ -685,6 +702,8 @@ impl QueryPipeline {
                         .cloned(),
                 );
             }
+            let n_candidates = merged.len();
+            let _span = debug_span!("rerank", k, n_candidates).entered();
             Ok(reranker.rerank(&embedded, merged, &probed_records, metric, k))
         } else {
             Ok(merged)
@@ -837,9 +856,11 @@ impl QueryPipelineBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
+    use tracing::subscriber;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
     use crate::builder::{BuildParams, IndexBuilder};
@@ -995,5 +1016,102 @@ mod tests {
             .build();
         let results = pipeline.run(&query, 3, 1).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[derive(Clone, Default)]
+    struct SpanCollector {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SpanCollector {
+        fn snapshot(&self) -> Vec<String> {
+            self.names.lock().unwrap().clone()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCollector
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.names
+                .lock()
+                .unwrap()
+                .push(attrs.metadata().name().to_string());
+        }
+    }
+
+    fn collect_spans<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let collector = SpanCollector::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with(collector.clone());
+        let result = subscriber::with_default(subscriber, f);
+        (result, collector.snapshot())
+    }
+
+    #[test]
+    fn pipeline_run_emits_shard_load_and_ann_search_spans() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let pipeline = build_pipeline(records);
+        let (_, span_names) = collect_spans(|| pipeline.run(&query, 3, 2).unwrap());
+
+        assert!(
+            span_names.iter().any(|name| name == "shard_load"),
+            "expected shard_load span; got: {:?}",
+            span_names
+        );
+        assert!(
+            span_names.iter().any(|name| name == "ann_search"),
+            "expected ann_search span; got: {:?}",
+            span_names
+        );
+    }
+
+    #[test]
+    fn pipeline_run_with_reranker_emits_rerank_span() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let tmp = tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-rerank-spans".into()),
+                embedding_version: EmbeddingVersion("emb-rerank-spans".into()),
+                index_version: IndexVersion("idx-rerank-spans".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: "datasets/ds-rerank-spans/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-rerank-spans/metadata.json".into(),
+                pq_params: None,
+            })
+            .unwrap();
+        let pipeline = QueryPipeline::builder(store, manifest)
+            .rerank_stage(Arc::new(ExactRerankStage))
+            .rerank_oversample(2)
+            .build();
+        let (_, span_names) = collect_spans(|| pipeline.run(&query, 3, 2).unwrap());
+
+        assert!(
+            span_names.iter().any(|name| name == "rerank"),
+            "expected rerank span; got: {:?}",
+            span_names
+        );
     }
 }
