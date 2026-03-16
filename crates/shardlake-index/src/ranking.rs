@@ -121,14 +121,21 @@ impl HybridRankingPolicy {
     /// Validate the policy.
     ///
     /// Returns an error string when:
+    /// - either weight is NaN,
     /// - `vector_weight` is negative,
     /// - `bm25_weight` is negative, or
-    /// - both weights are zero (or NaN).
+    /// - both weights are zero.
     ///
     /// # Errors
     ///
     /// Returns `Err(String)` describing the violated constraint.
     pub fn validate(&self) -> Result<(), String> {
+        if self.vector_weight.is_nan() {
+            return Err("vector_weight must not be NaN".into());
+        }
+        if self.bm25_weight.is_nan() {
+            return Err("bm25_weight must not be NaN".into());
+        }
         if self.vector_weight < 0.0 {
             return Err("vector_weight must be ≥ 0".into());
         }
@@ -335,6 +342,24 @@ mod tests {
         let p = HybridRankingPolicy {
             vector_weight: 0.0,
             bm25_weight: 0.0,
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn policy_rejects_nan_vector_weight() {
+        let p = HybridRankingPolicy {
+            vector_weight: f32::NAN,
+            bm25_weight: 0.5,
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn policy_rejects_nan_bm25_weight() {
+        let p = HybridRankingPolicy {
+            vector_weight: 0.5,
+            bm25_weight: f32::NAN,
         };
         assert!(p.validate().is_err());
     }
