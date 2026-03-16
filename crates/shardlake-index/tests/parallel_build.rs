@@ -57,6 +57,8 @@ fn build_params(records: Vec<VectorRecord>, dims: usize, idx_ver: &str) -> Build
         vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-par"),
         metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-par"),
         pq_params: None,
+        ann_family: None,
+        hnsw_config: None,
     }
 }
 

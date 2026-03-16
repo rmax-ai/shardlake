@@ -13,6 +13,7 @@
 //! |--------|--------|-------|
 //! | `"ivf_flat"` | [`IvfFlatPlugin`] | Exact (flat) distance scoring, all metrics supported |
 //! | `"ivf_pq"` | [`IvfPqPlugin`] | Product-quantised scoring, Euclidean only |
+//! | `"hnsw"` | [`HnswPlugin`] | Graph-based HNSW candidate search, all metrics supported |
 //! | `"diskann"` | [`DiskAnnPlugin`] | Strided-probe experiment, Euclidean only |
 //!
 //! # Example – selecting a backend via the registry
@@ -33,11 +34,13 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use shardlake_core::{config::SystemConfig, AnnFamily, DistanceMetric};
 
 use crate::{
     exact::{distance, exact_search},
-    pipeline::{CandidateSearchStage, ExactCandidateSearch, PqCandidateStage},
+    pipeline::{CandidateSearchStage, ExactCandidateSearch, HnswCandidateSearch, PqCandidateStage},
     pq::{PqCodebook, PqParams},
     shard::ShardIndex,
     IndexError, Result,
@@ -169,6 +172,125 @@ impl AnnPlugin for IvfPqPlugin {
 
     fn candidate_stage(&self) -> Arc<dyn CandidateSearchStage> {
         Arc::new(PqCandidateStage::new(Arc::clone(&self.codebook)))
+    }
+}
+
+// ── HnswPlugin ────────────────────────────────────────────────────────────────
+
+/// Construction and search parameters for the HNSW backend.
+///
+/// These values mirror the standard HNSW hyperparameters exposed by most
+/// HNSW libraries.  `m` controls the graph density and memory footprint;
+/// `ef_construction` trades build speed for recall.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HnswConfig {
+    /// Number of bi-directional links created for each inserted node (`M`).
+    ///
+    /// Higher values increase memory use and build time but improve recall.
+    /// Must be ≥ 1.  Typical values: 8–32, default: 16.
+    pub m: usize,
+    /// Size of the dynamic candidate list used during graph construction
+    /// (`efConstruction`).
+    ///
+    /// Must be ≥ `m`.  Higher values produce higher recall at the cost of
+    /// slower index build.  Default: 200.
+    pub ef_construction: usize,
+    /// Search-time beam width (`ef`).
+    ///
+    /// Must be ≥ `top_k` at query time.  Higher values improve recall at the
+    /// cost of slower queries.  Default: 50.
+    pub ef_search: usize,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 200,
+            ef_search: 50,
+        }
+    }
+}
+
+impl HnswConfig {
+    /// Validate that the configuration values are self-consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::Other`] when:
+    /// - `m` is 0
+    /// - `ef_construction` is less than `m`
+    /// - `ef_search` is 0
+    pub fn validate(&self) -> Result<()> {
+        if self.m == 0 {
+            return Err(IndexError::Other("HNSW config: m must be ≥ 1".into()));
+        }
+        if self.ef_construction < self.m {
+            return Err(IndexError::Other(format!(
+                "HNSW config: ef_construction ({}) must be ≥ m ({})",
+                self.ef_construction, self.m
+            )));
+        }
+        if self.ef_search == 0 {
+            return Err(IndexError::Other(
+                "HNSW config: ef_search must be ≥ 1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// ANN plugin for the HNSW backend.
+///
+/// Builds and queries a Hierarchical Navigable Small World graph index.
+/// Supports all [`DistanceMetric`] variants.  The graph construction
+/// parameters are carried in [`HnswConfig`] and validated before any build
+/// or query operation.
+pub struct HnswPlugin {
+    config: HnswConfig,
+}
+
+impl HnswPlugin {
+    /// Create a new plugin with the given HNSW configuration.
+    pub fn new(config: HnswConfig) -> Self {
+        Self { config }
+    }
+
+    /// Return a reference to the HNSW configuration.
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+}
+
+impl Default for HnswPlugin {
+    fn default() -> Self {
+        Self::new(HnswConfig::default())
+    }
+}
+
+impl AnnPlugin for HnswPlugin {
+    fn family(&self) -> &str {
+        AnnFamily::Hnsw.as_str()
+    }
+
+    /// Validates HNSW configuration and metric compatibility.
+    ///
+    /// All distance metrics are supported.  Returns an error if the
+    /// [`HnswConfig`] values are invalid (e.g. `m == 0` or
+    /// `ef_construction < m`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::Other`] when the configuration is invalid.
+    fn validate(&self, _dims: usize, _metric: DistanceMetric) -> Result<()> {
+        self.config.validate()
+    }
+
+    fn candidate_stage(&self) -> Arc<dyn CandidateSearchStage> {
+        Arc::new(HnswCandidateSearch::new(
+            self.config.m,
+            self.config.ef_search,
+        ))
     }
 }
 
@@ -350,8 +472,8 @@ impl CandidateSearchStage for DiskAnnCandidateStage {
 /// Registry of known ANN family names.
 ///
 /// [`AnnRegistry`] is intentionally **stateless**: it validates that a
-/// requested family name is known and returns a ready-to-use [`IvfFlatPlugin`]
-/// for families that need no runtime artifacts.  Families that require
+/// requested family name is known and returns a ready-to-use plugin for
+/// families that need no runtime artifacts.  Families that require
 /// artifacts loaded at query time (e.g. `"ivf_pq"`, which needs a codebook)
 /// must be constructed directly from their plugin struct with the artifact.
 ///
@@ -367,14 +489,15 @@ impl CandidateSearchStage for DiskAnnCandidateStage {
 ///
 /// // Validate a family name supplied by a user.
 /// AnnRegistry::exists("ivf_flat"); // true
-/// AnnRegistry::exists("hnsw");    // false
+/// AnnRegistry::exists("hnsw");    // true
+/// AnnRegistry::exists("unknown"); // false
 /// ```
 pub struct AnnRegistry;
 
 impl AnnRegistry {
     /// Returns the names of all built-in ANN families.
     pub fn families() -> &'static [&'static str] {
-        &["ivf_flat", "ivf_pq", "diskann"]
+        &["ivf_flat", "ivf_pq", "hnsw", "diskann"]
     }
 
     /// Returns `true` if `family` is a known built-in ANN family name.
@@ -400,21 +523,21 @@ impl AnnRegistry {
         })
     }
 
-    /// Return a ready-to-use plugin for families that need no runtime
-    /// artifacts, or a helpful error for those that do.
+    /// Return a plugin for families that need no runtime artifacts.
     ///
-    /// - `"ivf_flat"` → [`IvfFlatPlugin`]
-    /// - `"diskann"` → [`DiskAnnPlugin`] with [`DISKANN_DEFAULT_BEAM_WIDTH`]
-    /// - `"ivf_pq"` → error (codebook required; construct [`IvfPqPlugin::new`] directly)
-    /// - unknown names → error listing valid choices
+    /// Returns a boxed [`AnnPlugin`] for `"ivf_flat"` and `"hnsw"`.
+    /// For families that need runtime artifacts (like `"ivf_pq"`) construct
+    /// the plugin directly, e.g.
+    /// [`IvfPqPlugin::new(codebook)`](IvfPqPlugin::new).
     ///
     /// # Errors
     ///
-    /// Returns [`IndexError::Other`] when `family` requires a runtime artifact
-    /// or is an unknown name.
+    /// Returns [`IndexError::Other`] when `family` is `"ivf_pq"` (requires a
+    /// codebook) or is an unknown name.
     pub fn get_flat(family: &str) -> Result<Box<dyn AnnPlugin>> {
         match family {
             "ivf_flat" => Ok(Box::new(IvfFlatPlugin)),
+            "hnsw" => Ok(Box::new(HnswPlugin::default())),
             "diskann" => Ok(Box::new(DiskAnnPlugin::new(DISKANN_DEFAULT_BEAM_WIDTH))),
             "ivf_pq" => Err(IndexError::Other(
                 "family \"ivf_pq\" requires a PQ codebook; \
@@ -440,7 +563,7 @@ mod tests {
 
     #[test]
     fn ann_family_as_str_round_trips() {
-        for name in ["ivf_flat", "ivf_pq", "diskann"] {
+        for name in ["ivf_flat", "ivf_pq", "hnsw", "diskann"] {
             let family: shardlake_core::AnnFamily = name.parse().unwrap();
             assert_eq!(family.as_str(), name);
             assert_eq!(family.to_string(), name);
@@ -449,9 +572,11 @@ mod tests {
 
     #[test]
     fn ann_family_unknown_name_returns_error() {
-        let err = "hnsw".parse::<shardlake_core::AnnFamily>().unwrap_err();
+        let err = "unknown_algo"
+            .parse::<shardlake_core::AnnFamily>()
+            .unwrap_err();
         assert!(err.to_string().contains("unknown ANN family"));
-        assert!(err.to_string().contains("hnsw"));
+        assert!(err.to_string().contains("unknown_algo"));
     }
 
     // ── IvfFlatPlugin ─────────────────────────────────────────────────────────
@@ -531,13 +656,81 @@ mod tests {
         let _: Arc<dyn CandidateSearchStage> = stage;
     }
 
+    // ── HnswPlugin ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hnsw_plugin_family_name() {
+        assert_eq!(HnswPlugin::default().family(), "hnsw");
+    }
+
+    #[test]
+    fn hnsw_plugin_validate_accepts_all_metrics() {
+        let plugin = HnswPlugin::default();
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::InnerProduct,
+        ] {
+            assert!(
+                plugin.validate(128, metric).is_ok(),
+                "hnsw should accept {metric}"
+            );
+        }
+    }
+
+    #[test]
+    fn hnsw_plugin_validate_rejects_zero_m() {
+        let plugin = HnswPlugin::new(HnswConfig {
+            m: 0,
+            ef_construction: 200,
+            ef_search: 50,
+        });
+        let err = plugin.validate(128, DistanceMetric::Cosine).unwrap_err();
+        assert!(err.to_string().contains("m must be"));
+    }
+
+    #[test]
+    fn hnsw_plugin_validate_rejects_ef_construction_less_than_m() {
+        let plugin = HnswPlugin::new(HnswConfig {
+            m: 16,
+            ef_construction: 4,
+            ef_search: 50,
+        });
+        let err = plugin.validate(128, DistanceMetric::Cosine).unwrap_err();
+        assert!(err.to_string().contains("ef_construction"));
+        assert!(err.to_string().contains("m"));
+    }
+
+    #[test]
+    fn hnsw_plugin_validate_rejects_zero_ef_search() {
+        let plugin = HnswPlugin::new(HnswConfig {
+            m: 16,
+            ef_construction: 200,
+            ef_search: 0,
+        });
+        let err = plugin.validate(128, DistanceMetric::Cosine).unwrap_err();
+        assert!(err.to_string().contains("ef_search"));
+    }
+
+    #[test]
+    fn hnsw_plugin_candidate_stage_is_sendable() {
+        let stage = HnswPlugin::default().candidate_stage();
+        let _: Arc<dyn CandidateSearchStage> = stage;
+    }
+
+    #[test]
+    fn hnsw_config_default_values_are_valid() {
+        HnswConfig::default().validate().unwrap();
+    }
+
     // ── AnnRegistry ───────────────────────────────────────────────────────────
 
     #[test]
-    fn registry_families_contains_both_builtins() {
+    fn registry_families_contains_all_builtins() {
         let families = AnnRegistry::families();
         assert!(families.contains(&"ivf_flat"));
         assert!(families.contains(&"ivf_pq"));
+        assert!(families.contains(&"hnsw"));
         assert!(families.contains(&"diskann"));
     }
 
@@ -545,12 +738,13 @@ mod tests {
     fn registry_exists_returns_true_for_known_names() {
         assert!(AnnRegistry::exists("ivf_flat"));
         assert!(AnnRegistry::exists("ivf_pq"));
+        assert!(AnnRegistry::exists("hnsw"));
         assert!(AnnRegistry::exists("diskann"));
     }
 
     #[test]
     fn registry_exists_returns_false_for_unknown_name() {
-        assert!(!AnnRegistry::exists("hnsw"));
+        assert!(!AnnRegistry::exists("unknown_algo"));
         assert!(!AnnRegistry::exists(""));
     }
 
@@ -558,6 +752,12 @@ mod tests {
     fn registry_get_flat_returns_ivf_flat_plugin() {
         let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
         assert_eq!(plugin.family(), "ivf_flat");
+    }
+
+    #[test]
+    fn registry_get_flat_returns_hnsw_plugin() {
+        let plugin = AnnRegistry::get_flat("hnsw").unwrap();
+        assert_eq!(plugin.family(), "hnsw");
     }
 
     #[test]
@@ -574,9 +774,9 @@ mod tests {
 
     #[test]
     fn registry_get_flat_rejects_unknown_family() {
-        let err = AnnRegistry::get_flat("hnsw").err().unwrap();
+        let err = AnnRegistry::get_flat("unknown_algo").err().unwrap();
         assert!(err.to_string().contains("unknown ANN family"));
-        assert!(err.to_string().contains("hnsw"));
+        assert!(err.to_string().contains("unknown_algo"));
     }
 
     // ── DiskAnnPlugin ─────────────────────────────────────────────────────────
@@ -630,6 +830,12 @@ mod tests {
             ("ivf_flat", DistanceMetric::Cosine, true),
             ("ivf_flat", DistanceMetric::Euclidean, true),
             ("ivf_flat", DistanceMetric::InnerProduct, true),
+            ("hnsw", DistanceMetric::Cosine, true),
+            ("hnsw", DistanceMetric::Euclidean, true),
+            ("hnsw", DistanceMetric::InnerProduct, true),
+            ("diskann", DistanceMetric::Euclidean, true),
+            ("diskann", DistanceMetric::Cosine, false),
+            ("diskann", DistanceMetric::InnerProduct, false),
         ];
         for &(name, metric, should_pass) in families {
             let plugin = AnnRegistry::get_flat(name).unwrap();

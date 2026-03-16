@@ -154,6 +154,7 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for K-means centroid initialisation. Use the same seed with identical inputs to reproduce shard layout and manifest fingerprints. |
 | `--kmeans-sample-size <N>` | u32 | use all vectors | Maximum number of vectors to use for K-means centroid training. Values must be greater than 0. When set below the dataset size, `build-index` draws a reproducible random sample using `--kmeans-seed` before training centroids, then still assigns every vector to its nearest centroid. |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
+| `--ann-family <FAMILY>` | enum | `ivf_flat` | Candidate-search backend recorded in `manifest.algorithm.algorithm`: `ivf_flat` (exact brute-force, all metrics), `hnsw` (HNSW-labelled exact-search baseline, all metrics), or `diskann` (strided-probe experiment, Euclidean only). |
 | `--parallel` | flag | `false` | Enable local parallel build. Distributes shard construction across `--num-workers` Rayon threads using the distributed worker pipeline (plan → execute → merge) entirely in-process. It produces equivalent shard artifacts to a sequential build with the same arguments, although build metadata such as timestamps and duration can differ. |
 | `--num-workers <N>` | usize | Rayon thread count | Number of parallel workers when `--parallel` is set. Values larger than `--num-shards` are clamped to the number of non-empty shards. Must be greater than 0 when provided, and requires `--parallel`. |
 
@@ -223,6 +224,20 @@ shardlake build-index \
   --num-shards 16 \
   --parallel \
   --num-workers 4
+
+# HNSW-labelled build
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric cosine \
+  --num-shards 8 \
+  --ann-family hnsw
+
+# DiskANN experiment build
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric euclidean \
+  --num-shards 8 \
+  --ann-family diskann
 ```
 
 ---

@@ -57,6 +57,8 @@ fn plan_params(index_version: &str) -> WorkerPlanParams {
         vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-merge-test"),
         metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-merge-test"),
         num_workers: 2,
+        ann_family: None,
+        hnsw_config: None,
     }
 }
 

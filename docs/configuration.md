@@ -157,6 +157,7 @@ framework.
 |---------|-----------|-------------|
 | `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
 | `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
+| `Hnsw` | `"hnsw"` | Hierarchical Navigable Small World graph-based ANN index. Supports all distance metrics. |
 | `DiskAnn` | `"diskann"` | Experimental strided-probe backend loosely inspired by DiskANN. Euclidean metric only. See [DiskANN experiment](#diskann-experiment) below. |
 
 Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
@@ -186,7 +187,7 @@ constructed.  Then call `plugin.candidate_stage()` to wire the backend into a
 
 ```rust
 // No branching—all families use the same interface.
-let plugin: &dyn AnnPlugin = &IvfFlatPlugin;
+let plugin: &dyn AnnPlugin = &HnswPlugin::default();
 plugin.validate(dims, DistanceMetric::Cosine).unwrap();
 let pipeline = QueryPipeline::builder(store, manifest)
     .candidate_stage(plugin.candidate_stage())
@@ -199,7 +200,56 @@ let pipeline = QueryPipeline::builder(store, manifest)
 |--------|--------|-------|
 | `IvfFlatPlugin` | `"ivf_flat"` | No extra data needed; constructed directly. |
 | `IvfPqPlugin::new(codebook)` | `"ivf_pq"` | Requires a pre-trained `PqCodebook` loaded from storage. |
+| `HnswPlugin::default()` | `"hnsw"` | No extra data needed; optionally customise via `HnswPlugin::new(HnswConfig { m, ef_construction, ef_search })`. |
 | `DiskAnnPlugin::new(beam_width)` | `"diskann"` | Experiment; constructed directly with a beam width. |
+
+### `HnswConfig`
+
+HNSW-specific construction and search parameters:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `m` | `16` | Number of bi-directional links per graph node (`M`). Higher values increase recall but use more memory. Must be ≥ 1. |
+| `ef_construction` | `200` | Beam width during graph construction. Must be ≥ `m`. Higher values improve recall at the cost of build speed. |
+| `ef_search` | `50` | Beam width during query time. Must be ≥ 1. Higher values improve recall at the cost of query latency. |
+
+Configuration is validated before any build or query proceeds.  Invalid
+combinations (e.g. `m = 0` or `ef_construction < m`) return a descriptive
+`IndexError` immediately so misconfigured indexes are caught before any artifact
+is written.
+
+**HNSW build and search path:**
+- Pass `ann_family: Some(AnnFamily::Hnsw)` and (optionally) `hnsw_config:
+  Some(HnswConfig { … })` to `BuildParams`.  The builder records
+  `algorithm.algorithm = "hnsw"` in the manifest together with the HNSW
+  parameters.  The IVF coarse quantizer is still written and used for shard
+  routing; the HNSW label controls only the per-shard candidate-search stage.
+- At query time, `IndexSearcher` reads the `algorithm.algorithm` field from the
+  manifest and automatically instantiates `HnswPlugin` (exact-search baseline)
+  for `"hnsw"` indexes.  No caller-side branching is needed.
+- All distance metrics are supported for HNSW.
+
+**Current implementation note:** The `HnswCandidateSearch` stage uses exact
+(brute-force) distance scoring within each IVF-partitioned shard as a correct
+baseline.  The HNSW graph hyperparameters (`m`, `ef_construction`, `ef_search`)
+are persisted in the manifest and exposed through the plugin for evaluation
+tooling, and will drive a proper graph-traversal implementation in a future PR.
+
+### CLI – building an HNSW index
+
+Pass `--ann-family hnsw` to `build-index` to produce an HNSW-labelled manifest:
+
+```sh
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric cosine \
+  --num-shards 8 \
+  --ann-family hnsw
+```
+
+The resulting manifest records `algorithm.algorithm = "hnsw"`.  Querying and
+evaluating the index with `eval-ann` proceeds automatically using the backend
+recorded in the manifest—no extra flags are needed.
 
 ### `AnnRegistry`
 
@@ -212,68 +262,20 @@ for name in AnnRegistry::families() { println!("{name}"); }
 
 // Check if a name is known.
 assert!(AnnRegistry::exists("ivf_flat"));
+assert!(AnnRegistry::exists("hnsw"));
 assert!(AnnRegistry::exists("diskann"));
-assert!(!AnnRegistry::exists("hnsw"));
 
-// Get a plugin that needs no runtime artifact.
+// Get a plugin directly (no runtime artifact needed).
 let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
-let plugin = AnnRegistry::get_flat("diskann").unwrap();
+let hnsw_plugin = AnnRegistry::get_flat("hnsw").unwrap();
+let diskann_plugin = AnnRegistry::get_flat("diskann").unwrap();
 ```
 
-For `"ivf_pq"`, `AnnRegistry::get_flat` returns a helpful error message
-explaining that the codebook must be supplied, which guides callers to
+`AnnRegistry::get_flat` returns a ready-to-use plugin for `"ivf_flat"`,
+`"hnsw"`, and `"diskann"`. For `"ivf_pq"`, it returns a helpful error
+message explaining that the codebook must be supplied, which guides callers to
 construct `IvfPqPlugin::new(codebook)` directly.
 
-### DiskANN experiment
-
-`DiskAnnPlugin` and its `DiskAnnCandidateStage` implement an experimental
-bounded-probe approximation over each shard's flat vector list. The algorithm
-uses deterministic strided sampling across each shard; it is only loosely
-inspired by DiskANN and does not implement DiskANN's navigable graph or greedy
-best-first search.
-
-**Query semantics**
-
-For each probed shard the stage scores exactly `probe_count = max(k, beam_width).min(shard_size)` records,
-selected at evenly-spaced positions across the shard, including both endpoints
-when more than one record is probed. This bound means:
-
-- Per-shard work is `O(probe_count)`, not `O(shard_size)`.
-- When the shard has at least `k` records, the stage always returns exactly `k`
-  candidates — even when `k > beam_width`.
-- When `probe_count == shard_size` (small shards or large `k`/`beam_width`)
-  the stage falls back to an exact flat scan.
-
-**Constraints**
-
-- Only `DistanceMetric::Euclidean` is accepted.  Supplying a different metric
-  causes `validate()` to return an error before any pipeline is constructed.
-
-**Beam width**
-
-The `beam_width` parameter controls the candidate budget:
-
-| Scenario | Behaviour |
-|---|---|
-| `k ≤ beam_width` (typical) | `probe_count = beam_width` — bounded exploration independent of `k` |
-| `k > beam_width` | `probe_count = k` — probe set grows to satisfy the result count |
-| `probe_count ≥ shard_size` | Degrades to exact flat scan, matching `"ivf_flat"` quality |
-
-The default beam width used by `AnnRegistry::get_flat("diskann")` is
-`DISKANN_DEFAULT_BEAM_WIDTH` (64).  Override it by constructing the plugin
-directly:
-
-```rust
-use shardlake_index::DiskAnnPlugin;
-
-let plugin = DiskAnnPlugin::new(128);
-plugin.validate(dims, DistanceMetric::Euclidean)?;
-let pipeline = QueryPipeline::builder(store, manifest)
-    .candidate_stage(plugin.candidate_stage())
-    .build();
-```
-
-### Extending with a new backend
 
 1. Implement `AnnPlugin` for a new struct.
 2. Call `plugin.validate()` and `plugin.candidate_stage()` from your build or

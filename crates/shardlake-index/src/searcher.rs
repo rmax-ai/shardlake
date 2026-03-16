@@ -22,7 +22,10 @@ use crate::{
     exact::{distance, merge_top_k},
     kmeans::top_n_centroids,
     metrics::CacheMetrics,
-    plugin::{AnnPlugin, IvfFlatPlugin, IvfPqPlugin},
+    plugin::{
+        AnnPlugin, DiskAnnPlugin, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin,
+        DISKANN_DEFAULT_BEAM_WIDTH,
+    },
     pq::PqCodebook,
     query_plan::QueryPlan,
     shard::{PqShard, ShardIndex},
@@ -66,6 +69,58 @@ struct RouteResult {
     pq_enabled: bool,
     /// Per-shard vector cap carried from the fan-out policy.
     max_vectors_per_shard: u32,
+}
+
+/// Select the [`AnnPlugin`] to use for a query by reading the manifest algorithm
+/// field.
+///
+/// Plugin selection priority:
+/// 1. `"hnsw"` algorithm → [`HnswPlugin`] with parameters extracted from
+///    `manifest.algorithm.params`.
+/// 2. `"diskann"` algorithm → [`DiskAnnPlugin`] with the default beam width.
+/// 3. PQ compression enabled (any algorithm name) → [`IvfPqPlugin`].
+/// 4. Anything else → [`IvfFlatPlugin`].
+///
+/// `load_codebook` is a closure that loads the PQ codebook artifact; it is
+/// only called when PQ is selected.
+fn resolve_plugin<F>(
+    manifest: &Manifest,
+    pq_enabled: bool,
+    load_codebook: F,
+) -> Result<Box<dyn AnnPlugin>>
+where
+    F: FnOnce() -> Result<std::sync::Arc<crate::pq::PqCodebook>>,
+{
+    if manifest.algorithm.algorithm == "hnsw" {
+        let params = &manifest.algorithm.params;
+        let m = params
+            .get("hnsw_m")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(HnswConfig::default().m);
+        let ef_construction = params
+            .get("hnsw_ef_construction")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(HnswConfig::default().ef_construction);
+        let ef_search = params
+            .get("hnsw_ef_search")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(HnswConfig::default().ef_search);
+        return Ok(Box::new(HnswPlugin::new(HnswConfig {
+            m,
+            ef_construction,
+            ef_search,
+        })));
+    }
+    if manifest.algorithm.algorithm == "diskann" {
+        return Ok(Box::new(DiskAnnPlugin::new(DISKANN_DEFAULT_BEAM_WIDTH)));
+    }
+    if pq_enabled {
+        return Ok(Box::new(IvfPqPlugin::new(load_codebook()?)));
+    }
+    Ok(Box::new(IvfFlatPlugin))
 }
 
 impl IndexSearcher {
@@ -327,13 +382,13 @@ impl IndexSearcher {
         let pq_enabled =
             self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
-        // Validate the selected ANN backend once at the routing edge so
-        // unsupported metric/backend combinations fail before any shard work.
-        let plugin: Box<dyn AnnPlugin> = if pq_enabled {
-            Box::new(IvfPqPlugin::new(self.load_codebook()?))
-        } else {
-            Box::new(IvfFlatPlugin)
-        };
+        // Select the ANN plugin from the manifest algorithm field so that
+        // indexes built with a specific family use the matching candidate-search
+        // stage.  The pq_enabled flag is still used to distinguish ivf-flat
+        // from ivf-pq within the "ivf-flat" algorithm family, for backward
+        // compatibility with manifests that predate explicit ANN family labelling.
+        let plugin: Box<dyn AnnPlugin> =
+            resolve_plugin(&self.manifest, pq_enabled, || self.load_codebook())?;
         plugin.validate(expected_dims, metric)?;
 
         // Collect centroids for routing from the manifest when available (manifest v2+).
@@ -428,11 +483,8 @@ impl IndexSearcher {
         k: usize,
         routed: &RouteResult,
     ) -> Result<Vec<SearchResult>> {
-        let plugin: Box<dyn AnnPlugin> = if routed.pq_enabled {
-            Box::new(IvfPqPlugin::new(self.load_codebook()?))
-        } else {
-            Box::new(IvfFlatPlugin)
-        };
+        let plugin: Box<dyn AnnPlugin> =
+            resolve_plugin(&self.manifest, routed.pq_enabled, || self.load_codebook())?;
         plugin.validate(self.manifest.dims as usize, routed.metric)?;
         let stage = plugin.candidate_stage();
 
@@ -1035,6 +1087,8 @@ mod tests {
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
@@ -1080,6 +1134,8 @@ mod tests {
                 vectors_key: format!("datasets/ds-{index_version}/vectors.jsonl"),
                 metadata_key: format!("datasets/ds-{index_version}/metadata.json"),
                 pq_params,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         (store, manifest)
@@ -1117,6 +1173,8 @@ mod tests {
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 
@@ -1212,6 +1270,8 @@ mod tests {
                 vectors_key: "datasets/ds-mmap-searcher/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-mmap-searcher/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let get_calls = Arc::new(AtomicUsize::new(0));
@@ -1281,6 +1341,8 @@ mod tests {
                 vectors_key: "datasets/ds-get-searcher/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-get-searcher/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let get_calls = Arc::new(AtomicUsize::new(0));
@@ -1383,6 +1445,8 @@ mod tests {
                     vectors_key: "datasets/ds-prefetch-runtime/vectors.jsonl".into(),
                     metadata_key: "datasets/ds-prefetch-runtime/metadata.json".into(),
                     pq_params: None,
+                    ann_family: None,
+                    hnsw_config: None,
                 })
                 .unwrap()
         };

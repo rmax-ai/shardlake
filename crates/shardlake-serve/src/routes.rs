@@ -538,6 +538,8 @@ mod tests {
                 vectors_key: "datasets/ds-test/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-test/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
@@ -593,6 +595,8 @@ mod tests {
                 vectors_key: "datasets/ds-metric/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-metric/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
@@ -664,6 +668,8 @@ mod tests {
                     num_subspaces: 1,
                     codebook_size: 2,
                 }),
+                ann_family: None,
+                hnsw_config: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
@@ -1258,6 +1264,8 @@ mod tests {
                 vectors_key: "datasets/ds-lex/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-lex/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
@@ -1330,6 +1338,8 @@ mod tests {
                 vectors_key: "datasets/ds-hybrid-rerank/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-hybrid-rerank/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));

@@ -22,7 +22,9 @@ use tracing::info;
 
 use shardlake_core::{
     config::SystemConfig,
-    types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
+    types::{
+        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord,
+    },
 };
 use shardlake_index::{
     merge_worker_outputs, plan_workers, BuildParams, IndexBuilder, MergeParams, WorkerBuilder,
@@ -67,6 +69,13 @@ pub struct BuildIndexArgs {
     /// All vectors are still assigned to the nearest centroid after training.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub kmeans_sample_size: Option<u32>,
+    /// ANN algorithm family to use for candidate search within each shard.
+    ///
+    /// `ivf_flat` (default): exact brute-force distance scoring, all metrics.
+    /// `hnsw`: HNSW-labelled candidate search with persisted HNSW params, all metrics.
+    /// `diskann`: strided-probe experiment, Euclidean metric only.
+    #[arg(long, default_value = "ivf_flat")]
+    pub ann_family: AnnFamily,
     /// Enable local parallel build.
     ///
     /// When set, the build is driven through the distributed worker pipeline
@@ -162,6 +171,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
             vectors_key,
             metadata_key,
             args.num_workers,
+            args.ann_family,
         )?
     } else {
         let builder = IndexBuilder::new(&store, &config);
@@ -175,6 +185,8 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
             vectors_key,
             metadata_key,
             pq_params: None,
+            ann_family: Some(args.ann_family),
+            hnsw_config: None,
         })?
     };
 
@@ -218,6 +230,7 @@ fn run_parallel_build(
     vectors_key: String,
     metadata_key: String,
     num_workers: Option<usize>,
+    ann_family: AnnFamily,
 ) -> Result<Manifest> {
     let effective_workers = num_workers.unwrap_or_else(rayon::current_num_threads);
     anyhow::ensure!(
@@ -244,6 +257,8 @@ fn run_parallel_build(
             vectors_key,
             metadata_key,
             num_workers: effective_workers,
+            ann_family: Some(ann_family),
+            hnsw_config: None,
         },
     )?;
 
@@ -349,6 +364,7 @@ mod tests {
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: None,
             },
@@ -376,6 +392,7 @@ mod tests {
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: Some(0),
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: None,
             },
@@ -403,6 +420,7 @@ mod tests {
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: Some(1),
             },
@@ -462,6 +480,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: None,
             },
@@ -497,6 +516,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: None,
             },
@@ -570,6 +590,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: true,
                 num_workers: Some(2),
             },
@@ -609,6 +630,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: false,
                 num_workers: None,
             },
@@ -629,6 +651,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
                 parallel: true,
                 num_workers: Some(1),
             },

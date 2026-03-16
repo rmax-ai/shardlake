@@ -366,6 +366,8 @@ mod tests {
                 vectors_key: paths::dataset_vectors_key("ds-combo"),
                 metadata_key: paths::dataset_metadata_key("ds-combo"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 

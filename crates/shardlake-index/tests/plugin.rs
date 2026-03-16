@@ -15,7 +15,9 @@ use shardlake_core::{
     AnnFamily,
 };
 use shardlake_index::{
-    plugin::{AnnPlugin, AnnRegistry, DiskAnnPlugin, IvfFlatPlugin, IvfPqPlugin},
+    plugin::{
+        AnnPlugin, AnnRegistry, DiskAnnPlugin, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin,
+    },
     pq::{PqCodebook, PqParams},
     BuildParams, IndexBuilder, QueryPipeline,
 };
@@ -72,6 +74,8 @@ fn build_test_index(
             vectors_key: "ds/vectors.jsonl".into(),
             metadata_key: "ds/metadata.json".into(),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap()
 }
@@ -82,6 +86,7 @@ fn build_test_index(
 fn ann_family_parses_all_known_names() {
     assert_eq!("ivf_flat".parse::<AnnFamily>().unwrap(), AnnFamily::IvfFlat);
     assert_eq!("ivf_pq".parse::<AnnFamily>().unwrap(), AnnFamily::IvfPq);
+    assert_eq!("hnsw".parse::<AnnFamily>().unwrap(), AnnFamily::Hnsw);
     assert_eq!("diskann".parse::<AnnFamily>().unwrap(), AnnFamily::DiskAnn);
 }
 
@@ -89,14 +94,15 @@ fn ann_family_parses_all_known_names() {
 fn ann_family_display_matches_as_str() {
     assert_eq!(AnnFamily::IvfFlat.to_string(), AnnFamily::IvfFlat.as_str());
     assert_eq!(AnnFamily::IvfPq.to_string(), AnnFamily::IvfPq.as_str());
+    assert_eq!(AnnFamily::Hnsw.to_string(), AnnFamily::Hnsw.as_str());
     assert_eq!(AnnFamily::DiskAnn.to_string(), AnnFamily::DiskAnn.as_str());
 }
 
 #[test]
 fn ann_family_parse_unknown_returns_error() {
-    let err = "hnsw".parse::<AnnFamily>().unwrap_err();
+    let err = "unknown_algo".parse::<AnnFamily>().unwrap_err();
     assert!(err.to_string().contains("unknown ANN family"));
-    assert!(err.to_string().contains("hnsw"));
+    assert!(err.to_string().contains("unknown_algo"));
 }
 
 #[test]
@@ -207,6 +213,7 @@ fn registry_exposes_all_builtin_families() {
         "ivf_flat should be registered"
     );
     assert!(families.contains(&"ivf_pq"), "ivf_pq should be registered");
+    assert!(families.contains(&"hnsw"), "hnsw should be registered");
     assert!(
         families.contains(&"diskann"),
         "diskann should be registered"
@@ -217,12 +224,13 @@ fn registry_exposes_all_builtin_families() {
 fn registry_exists_for_known_families() {
     assert!(AnnRegistry::exists("ivf_flat"));
     assert!(AnnRegistry::exists("ivf_pq"));
+    assert!(AnnRegistry::exists("hnsw"));
     assert!(AnnRegistry::exists("diskann"));
 }
 
 #[test]
 fn registry_does_not_exist_for_unknown_family() {
-    assert!(!AnnRegistry::exists("hnsw"));
+    assert!(!AnnRegistry::exists("unknown_algo"));
     assert!(!AnnRegistry::exists(""));
     assert!(!AnnRegistry::exists("HNSW"));
 }
@@ -231,6 +239,12 @@ fn registry_does_not_exist_for_unknown_family() {
 fn registry_get_flat_returns_ivf_flat_plugin() {
     let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
     assert_eq!(plugin.family(), "ivf_flat");
+}
+
+#[test]
+fn registry_get_flat_returns_hnsw_plugin() {
+    let plugin = AnnRegistry::get_flat("hnsw").unwrap();
+    assert_eq!(plugin.family(), "hnsw");
 }
 
 #[test]
@@ -251,14 +265,14 @@ fn registry_get_flat_rejects_ivf_pq_with_actionable_message() {
 
 #[test]
 fn registry_get_flat_rejects_unknown_family() {
-    let err = AnnRegistry::get_flat("hnsw").err().unwrap();
+    let err = AnnRegistry::get_flat("unknown_algo").err().unwrap();
     let msg = err.to_string();
     assert!(
         msg.contains("unknown ANN family"),
         "error should mention unknown family: {msg}"
     );
     assert!(
-        msg.contains("hnsw"),
+        msg.contains("unknown_algo"),
         "error should include the bad name: {msg}"
     );
     // The error message should also list the valid choices.
@@ -270,15 +284,15 @@ fn registry_get_flat_rejects_unknown_family() {
 
 // ── Pipeline integration – no algorithm-specific branching ───────────────────
 
-/// Demonstrate that all three backends can be wired into a QueryPipeline
+/// Demonstrate that all built-in backends can be wired into a QueryPipeline
 /// through the same AnnPlugin interface without algorithm-specific branching
 /// at the call site.
 #[test]
-fn all_backends_wire_into_pipeline_via_plugin_interface() {
+fn both_backends_wire_into_pipeline_via_plugin_interface() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let records = make_records(12, 4);
-    // Use Euclidean so IvfFlatPlugin, IvfPqPlugin, and DiskAnnPlugin are all compatible.
+    // Use Euclidean so IvfFlatPlugin, IvfPqPlugin, HnswPlugin, and DiskAnnPlugin are all compatible.
     let manifest = build_test_index(
         store.as_ref(),
         records.clone(),
@@ -293,6 +307,7 @@ fn all_backends_wire_into_pipeline_via_plugin_interface() {
     let plugins: Vec<Box<dyn AnnPlugin>> = vec![
         Box::new(IvfFlatPlugin),
         Box::new(IvfPqPlugin::new(make_codebook(4, 2))),
+        Box::new(HnswPlugin::default()),
         Box::new(DiskAnnPlugin::new(8)),
     ];
 
@@ -338,4 +353,123 @@ fn ivf_pq_plugin_validation_prevents_misconfigured_pipeline() {
         err.to_string().contains("euclidean"),
         "validation should explain the constraint: {err}"
     );
+}
+
+// ── HnswPlugin integration ────────────────────────────────────────────────────
+
+/// HNSW plugin satisfies the AnnPlugin trait interface.
+#[test]
+fn hnsw_plugin_satisfies_ann_plugin_trait() {
+    let plugin: &dyn AnnPlugin = &HnswPlugin::default();
+    assert_eq!(plugin.family(), "hnsw");
+}
+
+/// HNSW accepts all distance metrics.
+#[test]
+fn hnsw_plugin_accepts_all_distance_metrics() {
+    let plugin = HnswPlugin::default();
+    for metric in [
+        DistanceMetric::Cosine,
+        DistanceMetric::Euclidean,
+        DistanceMetric::InnerProduct,
+    ] {
+        assert!(
+            plugin.validate(128, metric).is_ok(),
+            "hnsw should accept metric {metric}"
+        );
+    }
+}
+
+/// HNSW plugin can be wired into a QueryPipeline and produces search results.
+#[test]
+fn hnsw_plugin_candidate_stage_searches_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let records = make_records(12, 4);
+    let manifest = build_test_index(
+        store.as_ref(),
+        records.clone(),
+        4,
+        2,
+        DistanceMetric::Cosine,
+        tmp.path(),
+    );
+
+    let stage = HnswPlugin::default().candidate_stage();
+
+    let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest)
+        .candidate_stage(stage)
+        .build();
+
+    let query = records[0].data.clone();
+    let results = pipeline
+        .search(
+            &query,
+            &QueryConfig {
+                top_k: 3,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..FanOutPolicy::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
+    assert!(!results.is_empty());
+    assert!(results.len() <= 3);
+}
+
+/// Custom HNSW parameters are reflected in the plugin configuration.
+#[test]
+fn hnsw_plugin_custom_config_is_accessible() {
+    let config = HnswConfig {
+        m: 32,
+        ef_construction: 400,
+        ef_search: 100,
+    };
+    let plugin = HnswPlugin::new(config);
+    assert_eq!(plugin.config().m, 32);
+    assert_eq!(plugin.config().ef_construction, 400);
+    assert_eq!(plugin.config().ef_search, 100);
+}
+
+/// Invalid HNSW config (m=0) is rejected before pipeline construction.
+#[test]
+fn hnsw_plugin_invalid_config_rejected_at_validation() {
+    let plugin = HnswPlugin::new(HnswConfig {
+        m: 0,
+        ef_construction: 200,
+        ef_search: 50,
+    });
+    let err = plugin.validate(128, DistanceMetric::Cosine).unwrap_err();
+    assert!(
+        err.to_string().contains("m must be"),
+        "validation should describe the invalid parameter: {err}"
+    );
+}
+
+/// ef_construction < m is rejected with a descriptive error.
+#[test]
+fn hnsw_plugin_ef_construction_less_than_m_is_rejected() {
+    let plugin = HnswPlugin::new(HnswConfig {
+        m: 16,
+        ef_construction: 8,
+        ef_search: 50,
+    });
+    let err = plugin.validate(128, DistanceMetric::Cosine).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ef_construction"),
+        "error should mention ef_construction: {msg}"
+    );
+    assert!(msg.contains("m"), "error should mention m: {msg}");
+}
+
+/// AnnFamily::Hnsw round-trips through as_str / FromStr / Display.
+#[test]
+fn hnsw_ann_family_round_trips() {
+    let family = "hnsw".parse::<AnnFamily>().unwrap();
+    assert_eq!(family, AnnFamily::Hnsw);
+    assert_eq!(family.as_str(), "hnsw");
+    assert_eq!(family.to_string(), "hnsw");
 }

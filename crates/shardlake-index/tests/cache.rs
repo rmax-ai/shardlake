@@ -60,6 +60,8 @@ fn build_index(
             vectors_key: "datasets/ds-cache-test/vectors.jsonl".into(),
             metadata_key: "datasets/ds-cache-test/metadata.json".into(),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap()
 }

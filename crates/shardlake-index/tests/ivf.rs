@@ -120,6 +120,8 @@ fn build_emits_ivf_flat_algorithm() {
             vectors_key: paths::dataset_vectors_key("ds-ivf"),
             metadata_key: paths::dataset_metadata_key("ds-ivf"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -147,6 +149,8 @@ fn build_records_num_clusters_in_params() {
             vectors_key: paths::dataset_vectors_key("ds-nc"),
             metadata_key: paths::dataset_metadata_key("ds-nc"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -178,6 +182,8 @@ fn build_persists_coarse_quantizer_artifact() {
             vectors_key: paths::dataset_vectors_key("ds-cq"),
             metadata_key: paths::dataset_metadata_key("ds-cq"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -228,6 +234,8 @@ fn coarse_quantizer_key_matches_canonical_path() {
             vectors_key: paths::dataset_vectors_key("ds-path"),
             metadata_key: paths::dataset_metadata_key("ds-path"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -256,6 +264,8 @@ fn coarse_quantizer_centroids_match_shard_def_centroids() {
             vectors_key: paths::dataset_vectors_key("ds-cen"),
             metadata_key: paths::dataset_metadata_key("ds-cen"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -301,6 +311,8 @@ fn build_compacts_empty_clusters_before_persisting_quantizer() {
             vectors_key: paths::dataset_vectors_key("ds-empty"),
             metadata_key: paths::dataset_metadata_key("ds-empty"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 

@@ -191,6 +191,8 @@ async fn run_plan(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
             vectors_key,
             metadata_key,
             num_workers: args.num_workers,
+            ann_family: None,
+            hnsw_config: None,
         },
     )?;
 

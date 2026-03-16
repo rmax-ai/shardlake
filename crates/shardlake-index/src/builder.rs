@@ -17,7 +17,8 @@ use shardlake_core::{
     config::SystemConfig,
     error::CoreError,
     types::{
-        DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
+        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
+        VectorRecord,
     },
 };
 use shardlake_manifest::{
@@ -28,7 +29,7 @@ use shardlake_storage::ObjectStore;
 
 use crate::{
     ivf::IvfQuantizer,
-    plugin::AnnRegistry,
+    plugin::{AnnRegistry, HnswConfig},
     pq::{PqCodebook, PqParams},
     shard::{PqShard, ShardIndex},
     IndexError, Result, PQ8_CODEC,
@@ -51,6 +52,23 @@ pub struct BuildParams {
     /// If `None` and `SystemConfig::pq_enabled` is `true`, PQ parameters are
     /// derived from the config.
     pub pq_params: Option<PqParams>,
+    /// ANN algorithm family to use for candidate search within each shard.
+    ///
+    /// When `None` (or `Some(AnnFamily::IvfFlat)`), the builder emits
+    /// `algorithm: "ivf-flat"` in the manifest. When
+    /// `Some(AnnFamily::DiskAnn)`, the builder records `algorithm: "diskann"`
+    /// after validating that the selected distance metric is compatible with
+    /// the DiskANN experiment backend. When `Some(AnnFamily::Hnsw)`, the
+    /// builder records `algorithm: "hnsw"` in the manifest with the HNSW graph
+    /// parameters so that `IndexSearcher` selects `HnswPlugin` at query time.
+    ///
+    /// Defaults to `None` (IVF-flat behaviour).
+    pub ann_family: Option<AnnFamily>,
+    /// Optional HNSW graph parameters.
+    ///
+    /// Only used when `ann_family == Some(AnnFamily::Hnsw)`.  When `None` and
+    /// HNSW is selected, [`HnswConfig::default`] is used.
+    pub hnsw_config: Option<HnswConfig>,
 }
 
 /// Builds a shard-based index from a flat list of vector records.
@@ -77,6 +95,8 @@ impl<'a> IndexBuilder<'a> {
             vectors_key,
             metadata_key,
             pq_params,
+            ann_family,
+            hnsw_config,
         } = params;
 
         if records.is_empty() {
@@ -117,6 +137,20 @@ impl<'a> IndexBuilder<'a> {
                 "PQ indexes currently support only euclidean distance".into(),
             ));
         }
+
+        let resolved_ann_family = ann_family.unwrap_or(AnnFamily::IvfFlat);
+        let resolved_hnsw_config = match resolved_ann_family {
+            AnnFamily::Hnsw => {
+                let config = hnsw_config.unwrap_or_default();
+                config.validate()?;
+                Some(config)
+            }
+            AnnFamily::DiskAnn => {
+                AnnRegistry::get_flat(AnnFamily::DiskAnn.as_str())?.validate(dims, metric)?;
+                None
+            }
+            _ => None,
+        };
 
         let build_start = std::time::Instant::now();
 
@@ -329,6 +363,24 @@ impl<'a> IndexBuilder<'a> {
             algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
         }
 
+        // Select the algorithm name and record backend-specific params when requested.
+        let algo_name = match resolved_ann_family {
+            AnnFamily::Hnsw => {
+                let hnsw = resolved_hnsw_config
+                    .as_ref()
+                    .expect("resolved HNSW config must exist for HNSW family");
+                algo_params.insert("hnsw_m".into(), serde_json::json!(hnsw.m));
+                algo_params.insert(
+                    "hnsw_ef_construction".into(),
+                    serde_json::json!(hnsw.ef_construction),
+                );
+                algo_params.insert("hnsw_ef_search".into(), serde_json::json!(hnsw.ef_search));
+                "hnsw"
+            }
+            AnnFamily::DiskAnn => "diskann",
+            AnnFamily::IvfFlat | AnnFamily::IvfPq => "ivf-flat",
+        };
+
         let compression = if let Some(ref cb) = codebook {
             let cb_key = shardlake_storage::paths::index_pq_codebook_key(&index_version.0);
             CompressionConfig {
@@ -362,7 +414,7 @@ impl<'a> IndexBuilder<'a> {
                 build_duration_secs,
             },
             algorithm: AlgorithmMetadata {
-                algorithm: "ivf-flat".into(),
+                algorithm: algo_name.into(),
                 variant: None,
                 params: algo_params,
             },
@@ -406,6 +458,8 @@ mod tests {
             vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-test"),
             metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-test"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         }
     }
 
@@ -481,6 +535,8 @@ mod tests {
                     num_subspaces: 2,
                     codebook_size: 4,
                 }),
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("only euclidean distance"));
@@ -525,6 +581,8 @@ mod tests {
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-sample"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-sample"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 
@@ -603,6 +661,8 @@ mod tests {
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-full"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-full"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 
@@ -649,6 +709,8 @@ mod tests {
                     vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-det-sample"),
                     metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-det-sample"),
                     pq_params: None,
+                    ann_family: None,
+                    hnsw_config: None,
                 })
                 .unwrap()
         };

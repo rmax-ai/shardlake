@@ -522,6 +522,42 @@ impl CandidateSearchStage for PqCandidateStage {
     }
 }
 
+/// HNSW candidate search stage.
+///
+/// **Current implementation:** performs exact (brute-force) candidate scoring
+/// within each probed shard as a correct baseline.  The `m` and `ef_search`
+/// fields store the HNSW graph parameters for caller inspection and are
+/// intentionally not used by the search method yet—they will drive the actual
+/// graph traversal once a graph-backed HNSW implementation replaces this
+/// baseline.
+///
+/// All [`DistanceMetric`] variants are supported.
+pub struct HnswCandidateSearch {
+    /// Number of bi-directional links per node in the graph (HNSW `M`).
+    pub m: usize,
+    /// Search-time beam width (HNSW `ef`).
+    pub ef_search: usize,
+}
+
+impl HnswCandidateSearch {
+    /// Create a new stage with the given graph parameters.
+    pub fn new(m: usize, ef_search: usize) -> Self {
+        Self { m, ef_search }
+    }
+}
+
+impl CandidateSearchStage for HnswCandidateSearch {
+    fn search(
+        &self,
+        query: &[f32],
+        shard: &ShardIndex,
+        metric: DistanceMetric,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        Ok(exact_search(query, &shard.records, metric, k))
+    }
+}
+
 /// Merge stage that keeps the best `k` scored candidates with deduplication.
 ///
 /// Delegates to [`GlobalMerge`] so ordering is deterministic: results are
@@ -940,6 +976,8 @@ mod tests {
                 vectors_key: "datasets/ds-pipeline/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-pipeline/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         std::mem::forget(tmp);
@@ -1096,6 +1134,8 @@ mod tests {
                 vectors_key: "datasets/ds-oversample/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-oversample/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let pipeline = QueryPipeline::builder(store, manifest)
@@ -1215,6 +1255,8 @@ mod tests {
                 vectors_key: "datasets/ds-rerank-spans/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-rerank-spans/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let pipeline = QueryPipeline::builder(store, manifest)

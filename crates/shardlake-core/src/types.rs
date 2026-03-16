@@ -64,6 +64,9 @@ impl std::fmt::Display for IndexVersion {
 /// let family = "ivf_flat".parse::<AnnFamily>().unwrap();
 /// assert_eq!(family.as_str(), "ivf_flat");
 /// assert_eq!(family.to_string(), "ivf_flat");
+///
+/// let hnsw = "hnsw".parse::<AnnFamily>().unwrap();
+/// assert_eq!(hnsw.as_str(), "hnsw");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +76,8 @@ pub enum AnnFamily {
     IvfFlat,
     /// IVF with product-quantised distance scoring within each shard.
     IvfPq,
+    /// Hierarchical Navigable Small World graph-based ANN index.
+    Hnsw,
     /// Experimental ANN backend loosely inspired by DiskANN.
     ///
     /// Uses a bounded strided probe over each shard's flat vector list rather
@@ -88,6 +93,7 @@ impl AnnFamily {
         match self {
             Self::IvfFlat => "ivf_flat",
             Self::IvfPq => "ivf_pq",
+            Self::Hnsw => "hnsw",
             Self::DiskAnn => "diskann",
         }
     }
@@ -112,9 +118,10 @@ impl std::str::FromStr for AnnFamily {
         match s {
             "ivf_flat" => Ok(Self::IvfFlat),
             "ivf_pq" => Ok(Self::IvfPq),
+            "hnsw" => Ok(Self::Hnsw),
             "diskann" => Ok(Self::DiskAnn),
             other => Err(crate::error::CoreError::Other(format!(
-                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, diskann"
+                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, hnsw, diskann"
             ))),
         }
     }
