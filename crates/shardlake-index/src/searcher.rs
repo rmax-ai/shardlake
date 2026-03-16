@@ -21,6 +21,7 @@ use crate::{
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
     pq::PqCodebook,
+    query_plan::QueryPlan,
     shard::{PqShard, ShardIndex},
     IndexError, Result, MMAP_MIN_SIZE_BYTES, PQ8_CODEC,
 };
@@ -44,6 +45,21 @@ pub struct IndexSearcher {
     mmap_threshold: u64,
     access_counts: Mutex<HashMap<ShardId, u64>>,
     prefetch: Option<PrefetchPolicy>,
+}
+
+/// Intermediate result of the IVF routing step, shared by [`IndexSearcher::search`]
+/// and [`IndexSearcher::search_with_plan`].
+struct RouteResult {
+    /// Shard IDs to probe after centroid selection and deduplication.
+    probe_shards: Vec<ShardId>,
+    /// Centroid vectors that were selected (one per probe index, in selection order).
+    selected_centroids: Vec<Vec<f32>>,
+    /// Distance metric derived from the manifest.
+    metric: DistanceMetric,
+    /// Whether PQ-encoded shards should be searched.
+    pq_enabled: bool,
+    /// Per-shard vector cap carried from the fan-out policy.
+    max_vectors_per_shard: u32,
 }
 
 impl IndexSearcher {
@@ -169,6 +185,53 @@ impl IndexSearcher {
         k: usize,
         policy: &FanOutPolicy,
     ) -> Result<Vec<SearchResult>> {
+        let routed = self.route_query(query, policy)?;
+        if routed.probe_shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fan_out_search(query, k, &routed)
+    }
+
+    /// Perform approximate top-k search and capture a [`QueryPlan`] with the
+    /// routing decisions made during the execution.
+    ///
+    /// The returned [`QueryPlan`] records:
+    /// - the centroid vectors that were selected during IVF routing
+    ///   (`selected_centroids`),
+    /// - the shard IDs probed after centroid-to-shard mapping and deduplication
+    ///   (`searched_shards`), and
+    /// - the candidate vectors returned by the fan-out search, before any
+    ///   reranking (`candidate_vectors`).
+    ///
+    /// The search semantics are identical to [`IndexSearcher::search`].
+    pub fn search_with_plan(
+        &self,
+        query: &[f32],
+        k: usize,
+        policy: &FanOutPolicy,
+    ) -> Result<QueryPlan> {
+        let routed = self.route_query(query, policy)?;
+        if routed.probe_shards.is_empty() {
+            return Ok(QueryPlan {
+                selected_centroids: Vec::new(),
+                searched_shards: Vec::new(),
+                candidate_vectors: Vec::new(),
+            });
+        }
+        let candidate_vectors = self.fan_out_search(query, k, &routed)?;
+        Ok(QueryPlan {
+            selected_centroids: routed.selected_centroids,
+            searched_shards: routed.probe_shards,
+            candidate_vectors,
+        })
+    }
+
+    /// Resolve the IVF routing step: collect centroids, select the top-n
+    /// candidates, and map them to deduplicated shard IDs.
+    ///
+    /// Returns an empty `probe_shards` when no centroids are present (empty
+    /// index), which callers must check before invoking [`Self::fan_out_search`].
+    fn route_query(&self, query: &[f32], policy: &FanOutPolicy) -> Result<RouteResult> {
         let expected_dims = self.manifest.dims as usize;
         if query.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
@@ -219,13 +282,24 @@ impl IndexSearcher {
         }
 
         if all_centroids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RouteResult {
+                probe_shards: Vec::new(),
+                selected_centroids: Vec::new(),
+                metric,
+                pq_enabled,
+                max_vectors_per_shard: policy.max_vectors_per_shard,
+            });
         }
 
         // ===== ROUTING STEP =====
         // Select the top `candidate_centroids` nearest IVF centroids.
         let n_centroids = (policy.candidate_centroids as usize).min(all_centroids.len());
         let probe_indices = top_n_centroids(query, &all_centroids, n_centroids);
+
+        let selected_centroids: Vec<Vec<f32>> = probe_indices
+            .iter()
+            .filter_map(|&i| all_centroids.get(i).cloned())
+            .collect();
 
         // Map centroid indices to shard ids and deduplicate.
         let mut probe_shards: Vec<ShardId> = probe_indices
@@ -248,30 +322,48 @@ impl IndexSearcher {
             "Probing shards"
         );
 
-        if pq_enabled {
+        Ok(RouteResult {
+            probe_shards,
+            selected_centroids,
+            metric,
+            pq_enabled,
+            max_vectors_per_shard: policy.max_vectors_per_shard,
+        })
+    }
+
+    /// Execute the fan-out search across the probed shards described in
+    /// `routed`.  Callers must ensure `routed.probe_shards` is non-empty.
+    fn fan_out_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        routed: &RouteResult,
+    ) -> Result<Vec<SearchResult>> {
+        if routed.pq_enabled {
             self.search_pq_shards(
                 query,
-                &probe_shards,
+                &routed.probe_shards,
                 k,
-                metric,
-                policy.max_vectors_per_shard,
+                routed.metric,
+                routed.max_vectors_per_shard,
             )
         } else {
             // Stages: Load shard + exact search run concurrently across probed shards.
             // Each task loads one shard and scores its records; results are merged below.
             // Any shard-load error short-circuits the fan-out.
-            let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+            let shard_results: Result<Vec<Vec<SearchResult>>> = routed
+                .probe_shards
                 .par_iter()
                 .map(|&shard_id| {
                     let shard = self.load_shard(shard_id)?;
-                    let records = if policy.max_vectors_per_shard > 0 {
+                    let records = if routed.max_vectors_per_shard > 0 {
                         let limit =
-                            (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                            (routed.max_vectors_per_shard as usize).min(shard.records.len());
                         &shard.records[..limit]
                     } else {
                         &shard.records
                     };
-                    Ok(exact_search(query, records, metric, k))
+                    Ok(exact_search(query, records, routed.metric, k))
                 })
                 .collect();
             let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
@@ -1111,6 +1203,84 @@ mod tests {
             shard_loads.load(Ordering::SeqCst),
             before,
             "hot shard should be cache-resident after warming"
+        );
+    }
+
+    #[test]
+    fn search_with_plan_captures_routing_details() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let plan = searcher
+            .search_with_plan(&[1.0, 0.0], 1, &policy)
+            .expect("search_with_plan");
+
+        assert!(
+            !plan.selected_centroids.is_empty(),
+            "expected at least one selected centroid"
+        );
+        for centroid in &plan.selected_centroids {
+            assert_eq!(centroid.len(), 2, "centroid must have index dimensionality");
+        }
+        assert!(
+            !plan.searched_shards.is_empty(),
+            "expected at least one searched shard"
+        );
+        assert!(
+            !plan.candidate_vectors.is_empty(),
+            "expected at least one candidate vector"
+        );
+    }
+
+    #[test]
+    fn search_with_plan_matches_search_results() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let query = &[1.0_f32, 0.0];
+        let k = 2;
+
+        let results = searcher.search(query, k, &policy).expect("search");
+        let plan = searcher
+            .search_with_plan(query, k, &policy)
+            .expect("search_with_plan");
+
+        assert_eq!(
+            results.len(),
+            plan.candidate_vectors.len(),
+            "candidate_vectors must match search results"
+        );
+        for (result, candidate) in results.iter().zip(plan.candidate_vectors.iter()) {
+            assert_eq!(result.id, candidate.id);
+        }
+    }
+
+    #[test]
+    fn search_with_plan_rejects_dimension_mismatch() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let err = searcher
+            .search_with_plan(&[1.0, 2.0, 3.0], 1, &policy)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "core error: dimension mismatch: expected 2, got 3"
         );
     }
 }

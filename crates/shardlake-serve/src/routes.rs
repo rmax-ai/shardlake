@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use shardlake_core::{config::FanOutPolicy, error::CoreError, types::SearchResult};
-use shardlake_index::IndexError;
+use shardlake_index::{IndexError, QueryPlan};
 
 use crate::AppState;
 
@@ -49,11 +49,21 @@ pub struct HealthResponse {
     pub index_version: String,
 }
 
+/// Debug query-plan response returned by `POST /debug/query-plan`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueryPlanResponse {
+    /// Routing and candidate details captured during this query execution.
+    pub plan: QueryPlan,
+    /// Index version used to serve this query.
+    pub index_version: String,
+}
+
 /// Build the axum router with all routes attached to `state`.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/query", post(query_handler))
+        .route("/debug/query-plan", post(query_plan_handler))
         .with_state(state)
 }
 
@@ -65,16 +75,23 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-async fn query_handler(
-    State(state): State<AppState>,
-    Json(req): Json<QueryRequest>,
-) -> impl IntoResponse {
+/// Parse and validate the fan-out policy from a [`QueryRequest`], falling back
+/// to the server-level defaults in `fan_out`.
+///
+/// Returns `Ok(FanOutPolicy)` on success, or an HTTP error response on invalid
+/// input.
+fn resolve_policy(
+    req: &QueryRequest,
+    fan_out: &FanOutPolicy,
+) -> std::result::Result<FanOutPolicy, Box<axum::response::Response>> {
     if req.k == 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "k must be > 0" })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "k must be > 0" })),
+            )
+                .into_response(),
+        ));
     }
 
     // Build per-request fan-out policy, falling back to server defaults.
@@ -82,25 +99,25 @@ async fn query_handler(
     let legacy_candidate_centroids = match req.nprobe.map(u32::try_from).transpose() {
         Ok(value) => value,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("nprobe must be <= {}", u32::MAX)
-                })),
-            )
-                .into_response();
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("nprobe must be <= {}", u32::MAX)
+                    })),
+                )
+                    .into_response(),
+            ));
         }
     };
     let candidate_centroids = req
         .candidate_centroids
         .or(legacy_candidate_centroids)
-        .unwrap_or(state.fan_out.candidate_centroids);
-    let candidate_shards = req
-        .candidate_shards
-        .unwrap_or(state.fan_out.candidate_shards);
+        .unwrap_or(fan_out.candidate_centroids);
+    let candidate_shards = req.candidate_shards.unwrap_or(fan_out.candidate_shards);
     let max_vectors_per_shard = req
         .max_vectors_per_shard
-        .unwrap_or(state.fan_out.max_vectors_per_shard);
+        .unwrap_or(fan_out.max_vectors_per_shard);
 
     let policy = FanOutPolicy {
         candidate_centroids,
@@ -109,12 +126,44 @@ async fn query_handler(
     };
 
     if let Err(e) = policy.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        ));
     }
+
+    Ok(policy)
+}
+
+/// Map a blocking search task result to an HTTP error response.
+fn search_error_response(e: IndexError) -> axum::response::Response {
+    match e {
+        IndexError::Core(CoreError::DimensionMismatch { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "query vector dimensions do not match the index"
+            })),
+        )
+            .into_response(),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": other.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn query_handler(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> impl IntoResponse {
+    let policy = match resolve_policy(&req, &state.fan_out) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
 
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
@@ -136,23 +185,44 @@ async fn query_handler(
             index_version: version,
         })
         .into_response(),
-        Ok(Err(IndexError::Core(CoreError::DimensionMismatch { .. }))) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "query vector dimensions do not match the index"
-            })),
-        )
-            .into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(Err(e)) => search_error_response(e),
         Err(e) => {
             error!(error = %e, "search task failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "search task failed" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn query_plan_handler(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> impl IntoResponse {
+    let policy = match resolve_policy(&req, &state.fan_out) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    let version = state.searcher.manifest().index_version.0.clone();
+    let searcher = state.searcher.clone();
+    let vector = req.vector;
+    let k = req.k;
+    match tokio::task::spawn_blocking(move || searcher.search_with_plan(&vector, k, &policy)).await
+    {
+        Ok(Ok(plan)) => Json(QueryPlanResponse {
+            plan,
+            index_version: version,
+        })
+        .into_response(),
+        Ok(Err(e)) => search_error_response(e),
+        Err(e) => {
+            error!(error = %e, "query-plan task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "query-plan task failed" })),
             )
                 .into_response()
         }
@@ -409,5 +479,101 @@ mod tests {
         assert_eq!(payload.index_version, "idx-test");
         assert_eq!(payload.results.len(), 1);
         assert_eq!(payload.results[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
+    async fn query_plan_route_returns_plan() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/debug/query-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryPlanResponse =
+            serde_json::from_slice(&body).expect("query plan response json");
+        assert_eq!(payload.index_version, "idx-test");
+        assert!(!payload.plan.selected_centroids.is_empty());
+        assert!(!payload.plan.searched_shards.is_empty());
+        assert!(!payload.plan.candidate_vectors.is_empty());
+        assert_eq!(payload.plan.candidate_vectors[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
+    async fn query_plan_route_rejects_zero_k() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/debug/query-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":0}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"], "k must be > 0");
+    }
+
+    #[tokio::test]
+    async fn query_plan_route_rejects_dimension_mismatch() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/debug/query-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0,3.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(
+            payload["error"],
+            "query vector dimensions do not match the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_plan_route_searched_shards_subset_of_index_shards() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/debug/query-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":2}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryPlanResponse =
+            serde_json::from_slice(&body).expect("query plan response json");
+        // All searched shard IDs must be ≤ num_shards configured in make_test_router (2).
+        for shard_id in &payload.plan.searched_shards {
+            assert!(shard_id.0 < 2, "unexpected shard id {shard_id}");
+        }
     }
 }

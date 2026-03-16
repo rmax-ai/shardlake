@@ -153,3 +153,64 @@ the number of candidates reranked and their dimensionality.
 - **Inner product**: `score = -dot(a, b)`. Negated so that lower is always better; the most similar vector has the most negative raw dot product but the smallest (most negative → closest to zero) reported score.
 
 In all cases, results are sorted ascending by score (best match first).
+
+---
+
+## `POST /debug/query-plan`
+
+Returns routing details captured during a single query execution.  Intended
+for offline debugging and introspection; not recommended for production query
+traffic.
+
+Accepts the same request body as `POST /query`.  The response includes the
+selected IVF centroids, the probed shard IDs, and the candidate vectors
+returned by the fan-out search (before any reranking).
+
+### Request body
+
+Identical to [`POST /query`](#post-query).
+
+### Success response — `200 OK`
+
+```json
+{
+  "plan": {
+    "selected_centroids": [
+      [0.12, 0.45, 0.89],
+      [0.33, 0.71, 0.02]
+    ],
+    "searched_shards": [0, 2],
+    "candidate_vectors": [
+      { "id": 42, "score": 0.0031, "metadata": {"label": "dog"} },
+      { "id": 7,  "score": 0.0157, "metadata": null }
+    ]
+  },
+  "index_version": "idx-v1"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `plan.selected_centroids` | `float[][]` | Centroid vectors selected during IVF routing, in selection order |
+| `plan.searched_shards` | `integer[]` | Shard IDs probed after centroid-to-shard mapping and deduplication, in probe order |
+| `plan.candidate_vectors` | array | Candidate vectors returned by the fan-out search, before any reranking |
+| `plan.candidate_vectors[].id` | integer | Numeric vector id |
+| `plan.candidate_vectors[].score` | float | Distance score (lower is better) |
+| `plan.candidate_vectors[].metadata` | object or null | Metadata attached to this vector at ingest time |
+| `index_version` | string | Index version used to serve this query |
+
+### Error responses
+
+Same error codes and bodies as [`POST /query`](#post-query).
+
+### Example
+
+```bash
+curl -s -X POST http://localhost:8080/debug/query-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vector": [0.5, 0.3, 0.8, 0.1],
+    "k": 5,
+    "candidate_centroids": 3
+  }' | python3 -m json.tool
+```
