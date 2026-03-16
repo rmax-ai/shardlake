@@ -1,5 +1,5 @@
 //! Benchmark harness: recall@k vs exact baseline, latency, artifact size.
-//! Also provides partition evaluation utilities.
+//! Also provides partition evaluation utilities and cost-estimation metrics.
 
 pub mod generate;
 
@@ -17,6 +17,7 @@ use shardlake_index::{
     kmeans::top_n_centroids,
     IndexSearcher, Result as IndexResult,
 };
+use shardlake_manifest::Manifest;
 use shardlake_storage::{paths, ObjectStore};
 
 /// Errors that can arise while evaluating partition quality.
@@ -31,6 +32,91 @@ pub enum PartitioningError {
         #[source]
         source: shardlake_index::IndexError,
     },
+}
+
+/// Cost-estimation metrics for an index configuration.
+///
+/// These metrics allow comparing the resource cost of different index
+/// configurations alongside performance and quality metrics.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use shardlake_bench::compute_cost_metrics;
+///
+/// let metrics = compute_cost_metrics(&store, &manifest);
+/// println!("disk: {} bytes, compression ratio: {:.2}x",
+///     metrics.disk_footprint_bytes, metrics.compression_ratio);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostMetrics {
+    /// Estimated in-memory footprint of the indexed vector data in bytes.
+    ///
+    /// For uncompressed indexes: `total_vectors × dims × 4` (f32 vectors).
+    /// For PQ-compressed indexes: `total_vectors × M` (1 byte per code) plus
+    /// the codebook itself (`M × K × sub_dims × 4` bytes of f32 centroids).
+    pub memory_usage_bytes: u64,
+    /// Total size of all index artifact files on disk in bytes.
+    pub disk_footprint_bytes: u64,
+    /// Vector compression ratio: raw vector bytes divided by the size of the
+    /// PQ-encoded vector representation, i.e. `(dims × 4) / M` where `M` is
+    /// the number of PQ sub-spaces.
+    ///
+    /// Returns `1.0` for uncompressed indexes (no compression applied).
+    pub compression_ratio: f64,
+}
+
+/// Compute cost-estimation metrics for the index described by `manifest`.
+///
+/// The `store` is used to measure the total on-disk footprint of all index
+/// artifacts.  This function is independent of the full benchmark pipeline
+/// and can be reused by any command that needs resource-cost information.
+///
+/// # Arguments
+///
+/// * `store` – Object store used to list and measure artifact sizes.
+/// * `manifest` – Manifest of the index being measured.
+pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -> CostMetrics {
+    let disk_footprint_bytes: u64 = store
+        .list(paths::indexes_prefix())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|k| store.get(k).ok())
+        .map(|b| b.len() as u64)
+        .sum();
+
+    let total_vectors = manifest.total_vector_count;
+    let dims = manifest.dims as u64;
+    // f32 is 4 bytes per component.
+    let raw_vector_bytes = total_vectors * dims * 4;
+
+    let (memory_usage_bytes, compression_ratio) =
+        if manifest.compression.enabled && manifest.compression.codec == "pq8" {
+            let m = manifest.compression.pq_num_subspaces as u64;
+            let k = manifest.compression.pq_codebook_size as u64;
+            // Guard against a zero-subspace value (malformed manifest).
+            if m == 0 {
+                (raw_vector_bytes, 1.0)
+            } else {
+                let sub_dims = dims / m;
+                // Encoded vectors: one byte per sub-space per vector.
+                let encoded_bytes = total_vectors * m;
+                // Codebook: M centroids-tables each with K × sub_dims f32 values.
+                let codebook_bytes = m * k * sub_dims * 4;
+                let memory = encoded_bytes + codebook_bytes;
+                let ratio = (dims as f64 * 4.0) / m as f64;
+                (memory, ratio)
+            }
+        } else {
+            (raw_vector_bytes, 1.0)
+        };
+
+    CostMetrics {
+        memory_usage_bytes,
+        disk_footprint_bytes,
+        compression_ratio,
+    }
 }
 
 /// Summary statistics for one benchmark run.
@@ -50,8 +136,8 @@ pub struct BenchmarkReport {
     pub p99_latency_us: f64,
     /// Query throughput: queries executed per second (wall-clock time over all queries).
     pub throughput_qps: f64,
-    /// Total size of all index artifact files in bytes.
-    pub artifact_size_bytes: u64,
+    /// Cost-estimation metrics: memory usage, disk footprint, and compression ratio.
+    pub cost_metrics: CostMetrics,
 }
 
 /// Evaluation report produced by [`run_eval_ann`].
@@ -89,12 +175,7 @@ pub fn run_benchmark(
     policy: &FanOutPolicy,
     metric: DistanceMetric,
 ) -> BenchmarkReport {
-    let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
-    let artifact_size_bytes: u64 = keys
-        .iter()
-        .filter_map(|k| store.get(k).ok())
-        .map(|b| b.len() as u64)
-        .sum();
+    let cost_metrics = compute_cost_metrics(store, searcher.manifest());
 
     if queries.is_empty() {
         return BenchmarkReport {
@@ -105,7 +186,7 @@ pub fn run_benchmark(
             mean_latency_us: 0.0,
             p99_latency_us: 0.0,
             throughput_qps: 0.0,
-            artifact_size_bytes,
+            cost_metrics,
         };
     }
 
@@ -142,7 +223,7 @@ pub fn run_benchmark(
         mean_latency_us: mean_latency,
         p99_latency_us: p99_latency,
         throughput_qps,
-        artifact_size_bytes,
+        cost_metrics,
     };
 
     info!(
@@ -150,7 +231,9 @@ pub fn run_benchmark(
         mean_latency_us = report.mean_latency_us,
         p99_latency_us = report.p99_latency_us,
         throughput_qps = report.throughput_qps,
-        artifact_size_bytes = report.artifact_size_bytes,
+        disk_footprint_bytes = report.cost_metrics.disk_footprint_bytes,
+        memory_usage_bytes = report.cost_metrics.memory_usage_bytes,
+        compression_ratio = report.cost_metrics.compression_ratio,
         "Benchmark complete"
     );
 
@@ -634,7 +717,7 @@ mod tests {
         assert!(report.p99_latency_us.is_finite());
         assert!(report.p99_latency_us >= 0.0);
         assert!(report.throughput_qps > 0.0);
-        assert!(report.artifact_size_bytes > 0);
+        assert!(report.cost_metrics.disk_footprint_bytes > 0);
     }
 
     #[test]
@@ -669,7 +752,7 @@ mod tests {
         assert_eq!(report.mean_latency_us, 0.0);
         assert_eq!(report.p99_latency_us, 0.0);
         assert_eq!(report.throughput_qps, 0.0);
-        assert!(report.artifact_size_bytes > 0);
+        assert!(report.cost_metrics.disk_footprint_bytes > 0);
     }
 
     #[test]
@@ -875,5 +958,131 @@ mod tests {
             err,
             PartitioningError::ApproximateSearch { query_id: 999, .. }
         ));
+    }
+
+    // ── compute_cost_metrics tests ────────────────────────────────────────────
+
+    #[test]
+    fn cost_metrics_uncompressed_index_has_ratio_one() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        // 10 records with 4 dimensions.
+        let records = make_records(10, 4);
+        let manifest = build_test_index(store.as_ref(), records, 1, tmp.path().to_path_buf());
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        // Uncompressed index → ratio must be exactly 1.0.
+        assert_eq!(metrics.compression_ratio, 1.0);
+        // Disk footprint must be positive (artifacts were written).
+        assert!(metrics.disk_footprint_bytes > 0);
+        // Memory usage = total_vectors × dims × 4 bytes.
+        let expected_memory: u64 = manifest.total_vector_count * u64::from(manifest.dims) * 4;
+        assert_eq!(metrics.memory_usage_bytes, expected_memory);
+    }
+
+    #[test]
+    fn cost_metrics_pq_index_has_compression_ratio_gt_one() {
+        use shardlake_index::pq::PqParams;
+
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        // 50 records with 8 dimensions; 2 sub-spaces so ratio = (8*4)/2 = 16.
+        let dims = 8usize;
+        let records = make_records(50, dims);
+        let num_subspaces = 2u32;
+        let codebook_size = 4u32; // keep small for test speed
+
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 5,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            pq_enabled: true,
+            pq_num_subspaces: num_subspaces,
+            pq_codebook_size: codebook_size,
+            ..SystemConfig::default()
+        };
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-pq".into()),
+                embedding_version: EmbeddingVersion("emb-pq".into()),
+                index_version: IndexVersion("idx-pq".into()),
+                metric: DistanceMetric::Euclidean,
+                dims,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-pq"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-pq"),
+                pq_params: Some(PqParams {
+                    num_subspaces: num_subspaces as usize,
+                    codebook_size: codebook_size as usize,
+                }),
+            })
+            .unwrap();
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        // compression_ratio = (dims × 4) / num_subspaces = (8 × 4) / 2 = 16.
+        let expected_ratio = (dims as f64 * 4.0) / num_subspaces as f64;
+        assert!(
+            (metrics.compression_ratio - expected_ratio).abs() < 1e-9,
+            "expected ratio {expected_ratio}, got {}",
+            metrics.compression_ratio
+        );
+        assert!(metrics.compression_ratio > 1.0);
+        assert!(metrics.disk_footprint_bytes > 0);
+
+        // PQ memory = encoded_bytes + codebook_bytes.
+        let total_vectors = manifest.total_vector_count;
+        let m = u64::from(num_subspaces);
+        let k = u64::from(codebook_size);
+        let sub_dims = dims as u64 / m;
+        let expected_memory = total_vectors * m + m * k * sub_dims * 4;
+        assert_eq!(metrics.memory_usage_bytes, expected_memory);
+    }
+
+    #[test]
+    fn cost_metrics_disk_footprint_matches_sum_of_artifacts() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest = build_test_index(store.as_ref(), records, 1, tmp.path().to_path_buf());
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        // Manually sum artifact sizes the same way compute_cost_metrics does.
+        let manual_sum: u64 = store_arc
+            .list(shardlake_storage::paths::indexes_prefix())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| store_arc.get(k).ok())
+            .map(|b| b.len() as u64)
+            .sum();
+
+        assert_eq!(metrics.disk_footprint_bytes, manual_sum);
+    }
+
+    #[test]
+    fn cost_metrics_zero_vector_index_has_zero_memory() {
+        // Build a manifest with zero vectors to verify the calculation does not panic.
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(4, 4);
+        let mut manifest = build_test_index(store.as_ref(), records, 1, tmp.path().to_path_buf());
+        // Artificially set vector count to 0.
+        manifest.total_vector_count = 0;
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        assert_eq!(metrics.memory_usage_bytes, 0);
+        assert_eq!(metrics.compression_ratio, 1.0);
     }
 }

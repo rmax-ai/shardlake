@@ -113,7 +113,18 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
             println!("  Mean latency:      {:.1} µs", report.mean_latency_us);
             println!("  P99  latency:      {:.1} µs", report.p99_latency_us);
             println!("  Throughput:        {:.1} qps", report.throughput_qps);
-            println!("  Artifact size:     {} bytes", report.artifact_size_bytes);
+            println!(
+                "  Disk footprint:    {} bytes",
+                report.cost_metrics.disk_footprint_bytes
+            );
+            println!(
+                "  Memory usage:      {} bytes",
+                report.cost_metrics.memory_usage_bytes
+            );
+            println!(
+                "  Compression ratio: {:.2}x",
+                report.cost_metrics.compression_ratio
+            );
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report)?);

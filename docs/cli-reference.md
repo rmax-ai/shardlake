@@ -265,8 +265,8 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k), throughput, and latency by comparing the index output
-against an exact brute-force baseline over a sample of the corpus.
+Measures approximate-search quality (Recall@k), throughput, latency, and cost-estimation metrics
+by comparing the index output against an exact brute-force baseline over a sample of the corpus.
 
 ### Usage
 
@@ -294,7 +294,9 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | Mean latency | Average per-query ANN search time in microseconds |
 | P99 latency | 99th-percentile per-query ANN search time in microseconds |
 | Throughput | Wall-clock query throughput in queries per second (qps) |
-| Artifact size | Total size of all index artifact files in bytes |
+| Disk footprint | Total size of all index artifact files on disk in bytes |
+| Memory usage | Estimated in-memory footprint of indexed vector data in bytes. For uncompressed indexes: `total_vectors × dims × 4`. For PQ-compressed indexes: `total_vectors × M` (codes) + codebook bytes. |
+| Compression ratio | Ratio of raw vector bytes to PQ-encoded vector bytes: `(dims × 4) / M`. Returns `1.0` for uncompressed indexes. |
 
 ### Output
 
@@ -309,7 +311,9 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
   Throughput:        23800.0 qps
-  Artifact size:     184320 bytes
+  Disk footprint:    184320 bytes
+  Memory usage:      12800000 bytes
+  Compression ratio: 1.00x
 ```
 
 **JSON (`--output json`):**
@@ -323,7 +327,21 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
   "mean_latency_us": 42.3,
   "p99_latency_us": 210.0,
   "throughput_qps": 23800.0,
-  "artifact_size_bytes": 184320
+  "cost_metrics": {
+    "memory_usage_bytes": 12800000,
+    "disk_footprint_bytes": 184320,
+    "compression_ratio": 1.0
+  }
+}
+```
+
+For a PQ-compressed index the `cost_metrics` block reflects the reduced in-memory representation:
+
+```json
+"cost_metrics": {
+  "memory_usage_bytes": 850000,
+  "disk_footprint_bytes": 184320,
+  "compression_ratio": 16.0
 }
 ```
 
