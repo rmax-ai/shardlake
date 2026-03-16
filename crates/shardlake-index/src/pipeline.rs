@@ -437,9 +437,12 @@ impl QueryPipeline {
                 let dispatch = dispatch.clone();
                 tracing::dispatcher::with_default(&dispatch, || {
                     let shard = self.loader.load(shard_id)?;
-                    let _span =
-                        debug_span!("ann_search", shard_id = shard_id.0, k = candidates_per_shard)
-                            .entered();
+                    let _span = debug_span!(
+                        "ann_search",
+                        shard_id = shard_id.0,
+                        k = candidates_per_shard
+                    )
+                    .entered();
                     let results = self.candidate_search.search(
                         &embedded,
                         &shard,
