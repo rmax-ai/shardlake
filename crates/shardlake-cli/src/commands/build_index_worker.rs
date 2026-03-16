@@ -1,6 +1,6 @@
 //! `shardlake build-index-worker` – distributed index build worker mode.
 //!
-//! This command drives the two-phase distributed build workflow:
+//! This command drives the three-phase distributed build workflow:
 //!
 //! * **`--mode plan`** – trains the IVF coarse quantizer, partitions shards
 //!   across workers, and writes a [`WorkerPlan`] to storage.  Run this once
@@ -10,6 +10,11 @@
 //!   the dataset vectors, builds the shards assigned to `--worker-id`, and
 //!   writes intermediate shard artifacts and an output-metadata JSON file to
 //!   storage.
+//!
+//! * **`--mode merge`** – loads the worker plan and all worker output
+//!   descriptors for an index version, validates completeness, and assembles
+//!   the final `manifest.json`.  Run this once after all workers have
+//!   finished.
 
 use std::{
     io::{BufRead, BufReader},
@@ -25,7 +30,10 @@ use shardlake_core::{
     config::SystemConfig,
     types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
 };
-use shardlake_index::{plan_workers, WorkerBuilder, WorkerPlan, WorkerPlanParams};
+use shardlake_index::{
+    merge_worker_outputs, plan_workers, MergeParams, WorkerBuilder, WorkerOutput, WorkerPlan,
+    WorkerPlanParams,
+};
 use shardlake_manifest::{DatasetManifest, ManifestError};
 use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
 
@@ -38,6 +46,11 @@ pub enum WorkerMode {
     /// Load a previously written plan and build the shards assigned to this
     /// worker, writing shard artifacts and output metadata to storage.
     Execute,
+    /// Collect all worker output descriptors and assemble the final manifest.
+    ///
+    /// Reads every `workers/<id>/output.json` file for the given index version
+    /// and combines them into a `manifest.json` that is written to storage.
+    Merge,
 }
 
 #[derive(Parser, Debug)]
@@ -91,12 +104,17 @@ pub struct BuildIndexWorkerArgs {
     /// Zero-based worker ID.  Required in `execute` mode.
     #[arg(long)]
     pub worker_id: Option<usize>,
+
+    /// Alias to record in the generated manifest.  Only used in `merge` mode.
+    #[arg(long, default_value = "latest")]
+    pub alias: String,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
     match args.mode {
         WorkerMode::Plan => run_plan(storage, args).await,
         WorkerMode::Execute => run_execute(storage, args).await,
+        WorkerMode::Merge => run_merge(storage, args).await,
     }
 }
 
@@ -271,6 +289,91 @@ async fn run_execute(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()>
     Ok(())
 }
 
+async fn run_merge(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
+    let index_version_str = args
+        .index_version
+        .ok_or_else(|| anyhow::anyhow!("--index-version is required in merge mode"))?;
+
+    let store = LocalObjectStore::new(&storage)?;
+    let index_ver = IndexVersion(index_version_str);
+
+    // Load the worker plan.
+    let plan_key = shardlake_storage::paths::worker_plan_key(&index_ver.0);
+    let plan_bytes = match store.get(&plan_key) {
+        Ok(b) => b,
+        Err(StorageError::NotFound(_)) => {
+            return Err(anyhow::anyhow!(
+                "Worker plan for index version '{}' not found; run `build-index-worker --mode plan` first",
+                index_ver.0
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let plan: WorkerPlan = serde_json::from_slice(&plan_bytes)?;
+
+    // Load all worker outputs.
+    let mut outputs: Vec<WorkerOutput> = Vec::with_capacity(plan.num_workers);
+    for worker_id in 0..plan.num_workers {
+        let output_key = shardlake_storage::paths::worker_output_key(&index_ver.0, worker_id);
+        let output_bytes = match store.get(&output_key) {
+            Ok(b) => b,
+            Err(StorageError::NotFound(_)) => {
+                return Err(anyhow::anyhow!(
+                    "Output for worker {} not found at '{}'; ensure all workers have completed",
+                    worker_id,
+                    output_key
+                ));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let output: WorkerOutput = serde_json::from_slice(&output_bytes)?;
+        outputs.push(output);
+    }
+
+    info!(
+        workers = plan.num_workers,
+        index_version = %index_ver.0,
+        "Merging worker outputs into final manifest"
+    );
+
+    let merge_params = MergeParams {
+        alias: args.alias,
+        built_at: Utc::now(),
+        builder_version: env!("CARGO_PKG_VERSION").to_string(),
+        num_kmeans_iters: args.kmeans_iters,
+        // Use the system default nprobe; the distributed plan does not capture
+        // the original nprobe value, so the merge step records the default.
+        nprobe_default: SystemConfig::default().nprobe,
+        // Wall-clock duration is not tracked across distributed workers; record
+        // zero to indicate this field was not measured for this build mode.
+        build_duration_secs: 0.0,
+    };
+
+    let manifest =
+        merge_worker_outputs(&plan, outputs, merge_params).map_err(anyhow::Error::new)?;
+
+    manifest
+        .save(&store)
+        .map_err(|e| anyhow::anyhow!("failed to save manifest: {e}"))?;
+
+    let manifest_key = shardlake_manifest::Manifest::storage_key(&manifest.index_version);
+    info!(key = %manifest_key, "Manifest written");
+
+    println!(
+        "Merge complete → index_version={}  {} shard(s)  {} vectors total",
+        manifest.index_version,
+        manifest.shards.len(),
+        manifest.total_vector_count,
+    );
+    for shard in &manifest.shards {
+        println!(
+            "  {} → {} vectors  fingerprint={}",
+            shard.shard_id, shard.vector_count, shard.fingerprint
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use shardlake_manifest::{DatasetManifest, DATASET_MANIFEST_VERSION};
@@ -342,6 +445,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 2,
                 worker_id: None,
+                alias: "latest".into(),
             },
         )
         .await
@@ -375,6 +479,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 2,
                 worker_id: None,
+                alias: "latest".into(),
             },
         )
         .await
@@ -401,6 +506,7 @@ mod tests {
                     kmeans_sample_size: None,
                     num_workers: 2,
                     worker_id: Some(w),
+                    alias: "latest".into(),
                 },
             )
             .await
@@ -431,6 +537,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 1,
                 worker_id: None,
+                alias: "latest".into(),
             },
         )
         .await
@@ -459,6 +566,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 1,
                 worker_id: Some(0),
+                alias: "latest".into(),
             },
         )
         .await
@@ -490,6 +598,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 2,
                 worker_id: None,
+                alias: "latest".into(),
             },
         )
         .await
@@ -509,6 +618,7 @@ mod tests {
                 kmeans_sample_size: None,
                 num_workers: 2,
                 worker_id: Some(999),
+                alias: "latest".into(),
             },
         )
         .await
@@ -517,6 +627,156 @@ mod tests {
         assert!(
             err.to_string().contains("out of range"),
             "expected out-of-range error, got: {err}"
+        );
+    }
+
+    /// Helper: plan + execute all workers for a given index version.
+    async fn plan_and_execute(
+        store_path: &std::path::Path,
+        dataset_version: &str,
+        index_version: &str,
+    ) -> WorkerPlan {
+        let store = LocalObjectStore::new(store_path).unwrap();
+
+        run(
+            store_path.to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Plan,
+                dataset_version: Some(dataset_version.into()),
+                index_version: Some(index_version.into()),
+                embedding_version: None,
+                metric: DistanceMetric::Euclidean,
+                num_shards: 2,
+                kmeans_iters: 20,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                num_workers: 2,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let plan_bytes = store.get(&paths::worker_plan_key(index_version)).unwrap();
+        let plan: WorkerPlan = serde_json::from_slice(&plan_bytes).unwrap();
+
+        for w in 0..plan.num_workers {
+            run(
+                store_path.to_path_buf(),
+                BuildIndexWorkerArgs {
+                    mode: WorkerMode::Execute,
+                    dataset_version: None,
+                    index_version: Some(index_version.into()),
+                    embedding_version: None,
+                    metric: DistanceMetric::Euclidean,
+                    num_shards: 2,
+                    kmeans_iters: 20,
+                    kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                    kmeans_sample_size: None,
+                    num_workers: 2,
+                    worker_id: Some(w),
+                    alias: "latest".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        plan
+    }
+
+    #[tokio::test]
+    async fn merge_mode_writes_manifest() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        write_test_dataset(&store, "ds-merge-cli", 2);
+
+        plan_and_execute(tmp.path(), "ds-merge-cli", "idx-merge-cli").await;
+
+        run(
+            tmp.path().to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Merge,
+                dataset_version: None,
+                index_version: Some("idx-merge-cli".into()),
+                embedding_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 2,
+                kmeans_iters: 20,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                num_workers: 2,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Manifest must be loadable.
+        let manifest_key = paths::index_manifest_key("idx-merge-cli");
+        let raw = store.get(&manifest_key).unwrap();
+        let manifest: shardlake_manifest::Manifest = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(manifest.index_version.0, "idx-merge-cli");
+        assert!(!manifest.shards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_mode_rejects_missing_plan() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Merge,
+                dataset_version: None,
+                index_version: Some("idx-no-plan-merge".into()),
+                embedding_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 2,
+                kmeans_iters: 5,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                num_workers: 1,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not found"),
+            "expected not-found error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_mode_rejects_missing_index_version_arg() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Merge,
+                dataset_version: None,
+                index_version: None, // missing
+                embedding_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 2,
+                kmeans_iters: 5,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                num_workers: 1,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("--index-version"),
+            "expected missing-arg error, got: {err}"
         );
     }
 }

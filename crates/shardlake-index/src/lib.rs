@@ -33,8 +33,8 @@ pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
 pub use validator::{ValidationFailure, ValidationReport};
 pub use worker::{
-    plan_workers, WorkerAssignment, WorkerBuilder, WorkerOutput, WorkerPlan, WorkerPlanParams,
-    WorkerShardOutput,
+    merge_worker_outputs, plan_workers, MergeParams, WorkerAssignment, WorkerBuilder, WorkerOutput,
+    WorkerPlan, WorkerPlanParams, WorkerShardOutput,
 };
 
 /// Codec identifier for 8-bit product quantisation.
