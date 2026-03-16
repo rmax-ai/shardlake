@@ -111,6 +111,10 @@ pub fn worker_plan_key(index_version: &str) -> String {
 /// shard-output descriptors for the shards it built.  The merge step
 /// reads these files to assemble the final manifest without re-reading the
 /// shard artifact bytes.
+///
+/// Worker IDs are zero-padded to 4 digits in the directory name
+/// (`workers/0000/`, `workers/0001/`, …).  Worker IDs ≥ 10 000 expand
+/// beyond four digits without truncation (`workers/10000/`).
 pub fn worker_output_key(index_version: &str, worker_id: usize) -> String {
     format!("indexes/{index_version}/workers/{worker_id:04}/output.json")
 }

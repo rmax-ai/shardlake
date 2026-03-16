@@ -150,8 +150,8 @@ async fn run_plan(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
     let vecs_bytes = store.get(&vectors_key)?;
     let reader = BufReader::new(vecs_bytes.as_slice());
     let mut records: Vec<VectorRecord> = Vec::new();
-    for line in reader.lines() {
-        let line: String = line?;
+    for line_result in reader.lines() {
+        let line: String = line_result?;
         if line.trim().is_empty() {
             continue;
         }
@@ -238,8 +238,8 @@ async fn run_execute(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()>
     let vecs_bytes = store.get(&plan.vectors_key)?;
     let reader = BufReader::new(vecs_bytes.as_slice());
     let mut records: Vec<VectorRecord> = Vec::new();
-    for line in reader.lines() {
-        let line: String = line?;
+    for line_result in reader.lines() {
+        let line: String = line_result?;
         if line.trim().is_empty() {
             continue;
         }
