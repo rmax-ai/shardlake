@@ -283,20 +283,30 @@ impl Bm25Index {
         buf.write_all(&self.avg_doc_len.to_le_bytes())?;
 
         // Document lengths
-        write_u64(&mut buf, self.doc_lengths.len() as u64)?;
-        for (&id, &len) in &self.doc_lengths {
+        let mut doc_lengths: Vec<_> = self
+            .doc_lengths
+            .iter()
+            .map(|(&id, &len)| (id, len))
+            .collect();
+        doc_lengths.sort_by_key(|(id, _)| id.0);
+        write_u64(&mut buf, doc_lengths.len() as u64)?;
+        for (id, len) in doc_lengths {
             write_u64(&mut buf, id.0)?;
             write_u32(&mut buf, len)?;
         }
 
         // Postings
-        write_u64(&mut buf, self.postings.len() as u64)?;
-        for (term, posting_list) in &self.postings {
+        let mut postings: Vec<_> = self.postings.iter().collect();
+        postings.sort_by(|(left, _), (right, _)| left.cmp(right));
+        write_u64(&mut buf, postings.len() as u64)?;
+        for (term, posting_list) in postings {
             let term_bytes = term.as_bytes();
             write_u32(&mut buf, term_bytes.len() as u32)?;
             buf.write_all(term_bytes)?;
-            write_u64(&mut buf, posting_list.len() as u64)?;
-            for &(id, tf) in posting_list {
+            let mut canonical_posting_list = posting_list.clone();
+            canonical_posting_list.sort_by_key(|(id, _)| id.0);
+            write_u64(&mut buf, canonical_posting_list.len() as u64)?;
+            for (id, tf) in canonical_posting_list {
                 write_u64(&mut buf, id.0)?;
                 write_u32(&mut buf, tf)?;
             }
@@ -647,6 +657,20 @@ mod tests {
         assert_eq!(loaded.num_docs(), 0);
         assert_eq!(loaded.num_terms(), 0);
         assert!(loaded.search("hello", 5).is_empty());
+    }
+
+    #[test]
+    fn to_bytes_is_deterministic_across_rebuilds() {
+        let docs = make_docs();
+
+        let first = Bm25Index::build(&docs, BM25Params::default())
+            .to_bytes()
+            .expect("serialise first build");
+        let second = Bm25Index::build(&docs, BM25Params::default())
+            .to_bytes()
+            .expect("serialise second build");
+
+        assert_eq!(first, second);
     }
 
     // ── ObjectStore integration ───────────────────────────────────────────────
