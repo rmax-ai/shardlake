@@ -32,7 +32,8 @@ pub use pipeline::{
     RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
 pub use plugin::{
-    AnnPlugin, AnnRegistry, DiskAnnPlugin, IvfFlatPlugin, IvfPqPlugin, DISKANN_DEFAULT_BEAM_WIDTH,
+    AnnPlugin, AnnRegistry, DiskAnnCandidateStage, DiskAnnPlugin, IvfFlatPlugin, IvfPqPlugin,
+    DISKANN_DEFAULT_BEAM_WIDTH,
 };
 pub use pq::{PqCodebook, PqParams};
 pub use query_plan::QueryPlan;

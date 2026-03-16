@@ -227,24 +227,35 @@ construct `IvfPqPlugin::new(codebook)` directly.
 ### DiskANN experiment
 
 `DiskAnnPlugin` and its `DiskAnnCandidateStage` implement an experimental
-beam-search approximation over each shard's flat vector list.  The algorithm
+bounded-probe approximation over each shard's flat vector list.  The algorithm
 is inspired by the DiskANN greedy search strategy but does not require a
-persisted navigating-spread-out graph (NSSG) artifact.
+persisted navigating graph.
+
+**Query semantics**
+
+For each probed shard the stage scores exactly `probe_count = max(k, beam_width).min(shard_size)` records,
+selected at evenly-spaced stride positions across the shard.  This bound means:
+
+- Per-shard work is `O(probe_count)`, not `O(shard_size)`.
+- When the shard has at least `k` records, the stage always returns exactly `k`
+  candidates — even when `k > beam_width`.
+- When `probe_count == shard_size` (small shards or large `k`/`beam_width`)
+  the stage falls back to an exact flat scan.
 
 **Constraints**
 
-- Only [`DistanceMetric::Euclidean`] is accepted.  Supplying a different metric
+- Only `DistanceMetric::Euclidean` is accepted.  Supplying a different metric
   causes `validate()` to return an error before any pipeline is constructed.
 
 **Beam width**
 
 The `beam_width` parameter controls the candidate budget:
 
-| `beam_width` | Behaviour |
+| Scenario | Behaviour |
 |---|---|
-| Small (e.g. 16) | Explores fewer vectors per shard → lower latency, lower recall |
-| Large (e.g. 512) | Explores more vectors → higher recall, higher latency |
-| ≥ shard size | Degrades to exact flat scan, matching `"ivf_flat"` quality |
+| `k ≤ beam_width` (typical) | `probe_count = beam_width` — bounded exploration independent of `k` |
+| `k > beam_width` | `probe_count = k` — probe set grows to satisfy the result count |
+| `probe_count ≥ shard_size` | Degrades to exact flat scan, matching `"ivf_flat"` quality |
 
 The default beam width used by `AnnRegistry::get_flat("diskann")` is
 `DISKANN_DEFAULT_BEAM_WIDTH` (64).  Override it by constructing the plugin

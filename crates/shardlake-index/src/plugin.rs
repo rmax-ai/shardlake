@@ -180,17 +180,19 @@ pub const DISKANN_DEFAULT_BEAM_WIDTH: usize = 64;
 
 /// ANN plugin for the experimental DiskANN-style backend.
 ///
-/// Implements a beam-search approximation over each shard's flat vector list,
-/// exercising the DiskANN-inspired query path without requiring a persisted
-/// navigating-graph artifact.  Only supports [`DistanceMetric::Euclidean`].
+/// Limits per-shard distance computations to a bounded probe set
+/// (`max(k, beam_width)` records per shard, spread evenly by stride),
+/// delivering approximate / lower-latency search without requiring a
+/// persisted navigating-graph artifact.  Only supports
+/// [`DistanceMetric::Euclidean`].
 ///
 /// The `beam_width` parameter controls the trade-off between query latency
 /// and recall quality:
-/// - A larger beam width explores more candidate vectors → higher recall,
+/// - A larger beam width probes more candidate vectors → higher recall,
 ///   higher per-shard latency.
 /// - A smaller beam width limits exploration → lower latency, lower recall.
-/// - When `beam_width` equals or exceeds the shard size the search degrades
-///   to an exact scan, matching `"ivf_flat"` behaviour.
+/// - When `max(k, beam_width) ≥ shard_size` the search degrades to an exact
+///   scan, matching `"ivf_flat"` behaviour.
 pub struct DiskAnnPlugin {
     beam_width: usize,
 }
@@ -239,21 +241,25 @@ impl AnnPlugin for DiskAnnPlugin {
 
 /// Beam-search candidate stage for the DiskANN experiment path.
 ///
-/// Explores each shard's flat vector list with a beam of `beam_width`
-/// candidates, approximating DiskANN's greedy graph traversal without
-/// requiring a persisted navigating graph.  Only Euclidean distance is
-/// supported; any other metric results in an [`IndexError`].
+/// Limits per-shard exploration to a bounded probe set rather than scoring
+/// every record in the shard, giving the approximate / lower-latency property
+/// claimed by DiskANN-style search without requiring a persisted navigating
+/// graph.  Only Euclidean distance is supported; any other metric results in
+/// an [`IndexError`].
 ///
 /// # Algorithm
 ///
-/// 1. Score the first `beam_width` vectors in the shard as the initial beam.
-/// 2. For each vector in the shard beyond the initial beam, greedily admit
-///    it into the beam if its distance is better than the current worst
-///    candidate.
-/// 3. Return the top-`k` results from the final beam.
+/// 1. Compute `probe_count = max(k, beam_width).min(shard_size)`.
+///    - This bounds the total number of distance computations to
+///      `probe_count` per shard (O(`probe_count`), not O(shard_size)).
+///    - It also guarantees the stage can return up to `k` candidates when
+///      the shard has at least `k` records.
+/// 2. Select `probe_count` record indices spread evenly across the shard
+///    using a stride of `shard_size / probe_count`.
+/// 3. Score only those records and return the top-`k` by distance.
 ///
-/// When the shard contains fewer vectors than `beam_width` the search is
-/// equivalent to an exact flat scan.
+/// When `probe_count == shard_size` (small shards or large `k`/`beam_width`)
+/// the stage falls back to an exact flat scan.
 pub struct DiskAnnCandidateStage {
     beam_width: usize,
 }
@@ -281,41 +287,42 @@ impl CandidateSearchStage for DiskAnnCandidateStage {
 
         let records = &shard.records;
 
-        // Fast path: shard fits inside the beam → exact scan.
-        if records.len() <= self.beam_width {
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // probe_count: total distance computations for this shard.
+        //
+        // - At least k so the caller's top_k request can always be satisfied.
+        // - At most beam_width (when k ≤ beam_width) so per-shard work is
+        //   O(beam_width) rather than O(shard_size), delivering the
+        //   approximate / bounded-exploration behaviour.
+        // - Capped at records.len() so we never request more than available.
+        let probe_count = k.max(self.beam_width).min(records.len());
+
+        // Fast path: probing every record → exact scan.
+        if probe_count == records.len() {
             return Ok(exact_search(query, records, metric, k));
         }
 
-        // Maintain the beam as a sorted list of (score, record_index) pairs,
-        // deferring metadata cloning until the final result construction so
-        // that only surviving top-k records incur the allocation cost.
-        let mut beam: Vec<(f32, usize)> = records
-            .iter()
-            .enumerate()
-            .take(self.beam_width)
-            .map(|(idx, r)| (distance(query, &r.data, metric), idx))
+        // Stride that spreads probe_count samples evenly across the whole
+        // shard instead of concentrating them at the front.
+        // stride >= 2 because probe_count < records.len().
+        let stride = records.len() / probe_count;
+
+        // Score the strided probe set.  Track (score, shard_index) to defer
+        // metadata cloning until the final top-k result construction.
+        let mut scored: Vec<(f32, usize)> = (0..probe_count)
+            .map(|i| {
+                let idx = (i * stride).min(records.len() - 1);
+                (distance(query, &records[idx].data, metric), idx)
+            })
             .collect();
 
-        beam.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
 
-        // Greedily admit remaining records that beat the current worst beam entry.
-        for (idx, record) in records.iter().enumerate().skip(self.beam_width) {
-            let d = distance(query, &record.data, metric);
-            let worst = beam.last().map_or(f32::MAX, |(s, _)| *s);
-            if d < worst {
-                beam.pop();
-                let pos = beam
-                    .binary_search_by(|(s, _)| {
-                        s.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or_else(|i| i);
-                beam.insert(pos, (d, idx));
-            }
-        }
-
-        // Build final results, cloning metadata only for top-k survivors.
-        beam.truncate(k);
-        Ok(beam
+        Ok(scored
             .into_iter()
             .map(|(score, idx)| {
                 let r = &records[idx];
