@@ -52,7 +52,8 @@ pub struct IndexSearcher {
 struct RouteResult {
     /// Shard IDs to probe after centroid selection and deduplication.
     probe_shards: Vec<ShardId>,
-    /// Centroid vectors that were selected (one per probe index, in selection order).
+    /// Centroid vectors that were selected (one per probe index, in selection
+    /// order). Populated only when the caller explicitly asks to capture them.
     selected_centroids: Vec<Vec<f32>>,
     /// Distance metric derived from the manifest.
     metric: DistanceMetric,
@@ -185,7 +186,7 @@ impl IndexSearcher {
         k: usize,
         policy: &FanOutPolicy,
     ) -> Result<Vec<SearchResult>> {
-        let routed = self.route_query(query, policy)?;
+        let routed = self.route_query(query, policy, false)?;
         if routed.probe_shards.is_empty() {
             return Ok(Vec::new());
         }
@@ -210,7 +211,7 @@ impl IndexSearcher {
         k: usize,
         policy: &FanOutPolicy,
     ) -> Result<QueryPlan> {
-        let routed = self.route_query(query, policy)?;
+        let routed = self.route_query(query, policy, true)?;
         if routed.probe_shards.is_empty() {
             return Ok(QueryPlan {
                 selected_centroids: Vec::new(),
@@ -231,7 +232,12 @@ impl IndexSearcher {
     ///
     /// Returns an empty `probe_shards` when no centroids are present (empty
     /// index), which callers must check before invoking [`Self::fan_out_search`].
-    fn route_query(&self, query: &[f32], policy: &FanOutPolicy) -> Result<RouteResult> {
+    fn route_query(
+        &self,
+        query: &[f32],
+        policy: &FanOutPolicy,
+        capture_selected_centroids: bool,
+    ) -> Result<RouteResult> {
         let expected_dims = self.manifest.dims as usize;
         if query.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
@@ -296,10 +302,14 @@ impl IndexSearcher {
         let n_centroids = (policy.candidate_centroids as usize).min(all_centroids.len());
         let probe_indices = top_n_centroids(query, &all_centroids, n_centroids);
 
-        let selected_centroids: Vec<Vec<f32>> = probe_indices
-            .iter()
-            .filter_map(|&i| all_centroids.get(i).cloned())
-            .collect();
+        let selected_centroids = if capture_selected_centroids {
+            probe_indices
+                .iter()
+                .filter_map(|&i| all_centroids.get(i).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Map centroid indices to shard ids and deduplicate.
         let mut probe_shards: Vec<ShardId> = probe_indices

@@ -158,17 +158,22 @@ In all cases, results are sorted ascending by score (best match first).
 
 ## `POST /debug/query-plan`
 
-Returns routing details captured during a single query execution.  Intended
-for offline debugging and introspection; not recommended for production query
+Returns routing details captured during a single query execution. Intended for
+offline debugging and introspection; not recommended for production query
 traffic.
 
-Accepts the same request body as `POST /query`.  The response includes the
-selected IVF centroids, the probed shard IDs, and the candidate vectors
-returned by the fan-out search (before any reranking).
+This route is exposed only when the server is started with
+`shardlake serve --enable-debug-routes`.
+
+Accepts the same request body as `POST /query`, except that `rerank` is ignored.
+The response includes the selected IVF centroids, the probed shard IDs, and the
+candidate vectors returned by the fan-out search before any reranking would
+occur.
 
 ### Request body
 
-Identical to [`POST /query`](#post-query).
+Identical to [`POST /query`](#post-query), except that `"rerank": true` does
+not change the response for this endpoint.
 
 ### Success response — `200 OK`
 

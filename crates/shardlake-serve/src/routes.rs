@@ -60,11 +60,16 @@ pub struct QueryPlanResponse {
 
 /// Build the axum router with all routes attached to `state`.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let debug_routes_enabled = state.debug_routes_enabled;
+    let router = Router::new()
         .route("/health", get(health_handler))
-        .route("/query", post(query_handler))
-        .route("/debug/query-plan", post(query_plan_handler))
-        .with_state(state)
+        .route("/query", post(query_handler));
+    let router = if debug_routes_enabled {
+        router.route("/debug/query-plan", post(query_plan_handler))
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -255,6 +260,12 @@ mod tests {
     use crate::AppState;
 
     fn make_test_router() -> (Router, tempfile::TempDir) {
+        make_test_router_with_debug_routes(false)
+    }
+
+    fn make_test_router_with_debug_routes(
+        debug_routes_enabled: bool,
+    ) -> (Router, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
         let config = SystemConfig {
@@ -301,6 +312,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            debug_routes_enabled,
         };
         (build_router(state), tmp)
     }
@@ -487,7 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_plan_route_returns_plan() {
-        let (app, _tmp) = make_test_router();
+        let (app, _tmp) = make_test_router_with_debug_routes(true);
         let response = app
             .oneshot(
                 Request::post("/debug/query-plan")
@@ -513,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_plan_route_rejects_zero_k() {
-        let (app, _tmp) = make_test_router();
+        let (app, _tmp) = make_test_router_with_debug_routes(true);
         let response = app
             .oneshot(
                 Request::post("/debug/query-plan")
@@ -534,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_plan_route_rejects_dimension_mismatch() {
-        let (app, _tmp) = make_test_router();
+        let (app, _tmp) = make_test_router_with_debug_routes(true);
         let response = app
             .oneshot(
                 Request::post("/debug/query-plan")
@@ -558,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_plan_route_searched_shards_subset_of_index_shards() {
-        let (app, _tmp) = make_test_router();
+        let (app, _tmp) = make_test_router_with_debug_routes(true);
         let response = app
             .oneshot(
                 Request::post("/debug/query-plan")
@@ -579,5 +591,21 @@ mod tests {
         for shard_id in &payload.plan.searched_shards {
             assert!(shard_id.0 < 2, "unexpected shard id {shard_id}");
         }
+    }
+
+    #[tokio::test]
+    async fn query_plan_route_disabled_by_default() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/debug/query-plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
