@@ -154,6 +154,7 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for K-means centroid initialisation. Use the same seed with identical inputs to reproduce shard layout and manifest fingerprints. |
 | `--kmeans-sample-size <N>` | u32 | use all vectors | Maximum number of vectors to use for K-means centroid training. Values must be greater than 0. When set below the dataset size, `build-index` draws a reproducible random sample using `--kmeans-seed` before training centroids, then still assigns every vector to its nearest centroid. |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
+| `--ann-family <FAMILY>` | enum | `ivf_flat` | ANN candidate-search algorithm to use within each shard: `ivf_flat` (exact brute-force, all metrics) or `hnsw` (HNSW graph-based, all metrics). The chosen family is recorded in `manifest.algorithm.algorithm` and used automatically at query and eval time. |
 
 ### Validation
 
@@ -182,6 +183,16 @@ shardlake build-index \
   --kmeans-sample-size 50000 \
   --metric cosine \
   --nprobe 3
+```
+
+To build an HNSW-labelled index:
+
+```bash
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric cosine \
+  --num-shards 8 \
+  --ann-family hnsw
 ```
 
 ---

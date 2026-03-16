@@ -207,13 +207,47 @@ HNSW-specific construction and search parameters:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `m` | `16` | Number of bi-directional links per graph node (`M`). Higher values increase recall but use more memory. Range: 1–64. |
+| `m` | `16` | Number of bi-directional links per graph node (`M`). Higher values increase recall but use more memory. Must be ≥ 1. |
 | `ef_construction` | `200` | Beam width during graph construction. Must be ≥ `m`. Higher values improve recall at the cost of build speed. |
 | `ef_search` | `50` | Beam width during query time. Must be ≥ 1. Higher values improve recall at the cost of query latency. |
 
-Configuration is validated by `HnswPlugin::validate()` before any build or query
-proceeds.  Invalid combinations (e.g. `m = 0` or `ef_construction < m`) return a
-descriptive `IndexError` immediately.
+Configuration is validated before any build or query proceeds.  Invalid
+combinations (e.g. `m = 0` or `ef_construction < m`) return a descriptive
+`IndexError` immediately so misconfigured indexes are caught before any artifact
+is written.
+
+**HNSW build and search path:**
+- Pass `ann_family: Some(AnnFamily::Hnsw)` and (optionally) `hnsw_config:
+  Some(HnswConfig { … })` to `BuildParams`.  The builder records
+  `algorithm.algorithm = "hnsw"` in the manifest together with the HNSW
+  parameters.  The IVF coarse quantizer is still written and used for shard
+  routing; the HNSW label controls only the per-shard candidate-search stage.
+- At query time, `IndexSearcher` reads the `algorithm.algorithm` field from the
+  manifest and automatically instantiates `HnswPlugin` (exact-search baseline)
+  for `"hnsw"` indexes.  No caller-side branching is needed.
+- All distance metrics are supported for HNSW.
+
+**Current implementation note:** The `HnswCandidateSearch` stage uses exact
+(brute-force) distance scoring within each IVF-partitioned shard as a correct
+baseline.  The HNSW graph hyperparameters (`m`, `ef_construction`, `ef_search`)
+are persisted in the manifest and exposed through the plugin for evaluation
+tooling, and will drive a proper graph-traversal implementation in a future PR.
+
+### CLI – building an HNSW index
+
+Pass `--ann-family hnsw` to `build-index` to produce an HNSW-labelled manifest:
+
+```sh
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric cosine \
+  --num-shards 8 \
+  --ann-family hnsw
+```
+
+The resulting manifest records `algorithm.algorithm = "hnsw"`.  Querying and
+evaluating the index with `eval-ann` proceeds automatically using the backend
+recorded in the manifest—no extra flags are needed.
 
 ### `AnnRegistry`
 

@@ -418,6 +418,11 @@ impl Manifest {
                 "algorithm 'ivf-flat' requires coarse_quantizer_key".into(),
             ));
         }
+        if self.algorithm.algorithm == "hnsw" && self.coarse_quantizer_key.is_none() {
+            return Err(ManifestError::Validation(
+                "algorithm 'hnsw' requires coarse_quantizer_key".into(),
+            ));
+        }
 
         if let Some(summary) = &self.shard_summary {
             let actual_num_shards = self.shards.len() as u32;

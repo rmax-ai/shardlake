@@ -72,6 +72,8 @@ fn build_test_index(
             vectors_key: "ds/vectors.jsonl".into(),
             metadata_key: "ds/metadata.json".into(),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap()
 }

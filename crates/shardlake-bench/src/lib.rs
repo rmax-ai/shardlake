@@ -1025,6 +1025,8 @@ mod tests {
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-test"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-test"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap()
     }
@@ -1410,6 +1412,8 @@ mod tests {
                     num_subspaces: num_subspaces as usize,
                     codebook_size: codebook_size as usize,
                 }),
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 
@@ -1479,6 +1483,8 @@ mod tests {
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-other"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-other"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 
@@ -1548,6 +1554,8 @@ mod tests {
                 vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-local-path"),
                 metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-local-path"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
 

@@ -182,7 +182,7 @@ pub struct HnswConfig {
     /// Number of bi-directional links created for each inserted node (`M`).
     ///
     /// Higher values increase memory use and build time but improve recall.
-    /// Typical range: 4–64, default: 16.
+    /// Must be ≥ 1.  Typical values: 8–32, default: 16.
     pub m: usize,
     /// Size of the dynamic candidate list used during graph construction
     /// (`efConstruction`).

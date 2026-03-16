@@ -139,6 +139,8 @@ fn test_build_and_search() {
             vectors_key: paths::dataset_vectors_key("ds-test"),
             metadata_key: paths::dataset_metadata_key("ds-test"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -202,6 +204,8 @@ fn test_search_does_not_load_non_probed_shards() {
             vectors_key: paths::dataset_vectors_key("ds-lazy"),
             metadata_key: paths::dataset_metadata_key("ds-lazy"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -277,6 +281,8 @@ fn test_candidate_shards_cap_keeps_nearest_shard_order() {
             vectors_key: paths::dataset_vectors_key("ds-order"),
             metadata_key: paths::dataset_metadata_key("ds-order"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -346,6 +352,8 @@ fn test_build_is_deterministic() {
                 vectors_key: paths::dataset_vectors_key("ds-det"),
                 metadata_key: paths::dataset_metadata_key("ds-det"),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap()
     };
@@ -436,6 +444,8 @@ fn test_pq_build_and_search() {
                 num_subspaces: 4,
                 codebook_size: 8,
             }),
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -521,6 +531,8 @@ fn test_pq_build_via_config() {
             vectors_key: paths::dataset_vectors_key("ds-pqcfg"),
             metadata_key: paths::dataset_metadata_key("ds-pqcfg"),
             pq_params: None, // rely on config
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -564,6 +576,8 @@ fn test_pq_build_is_deterministic() {
                     num_subspaces: 4,
                     codebook_size: 8,
                 }),
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap()
     };
@@ -636,6 +650,8 @@ fn test_pq_search_preserves_metadata() {
                 num_subspaces: 4,
                 codebook_size: 8,
             }),
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -677,7 +693,163 @@ fn test_pq_build_rejects_non_euclidean_metric() {
                 num_subspaces: 4,
                 codebook_size: 8,
             }),
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap_err();
     assert!(err.to_string().contains("only euclidean distance"));
+}
+
+// ── HNSW end-to-end integration ───────────────────────────────────────────────
+
+/// Build an HNSW-labelled index and verify the manifest records `algorithm =
+/// "hnsw"` with the expected HNSW parameters.
+#[test]
+fn hnsw_build_emits_hnsw_algorithm_in_manifest() {
+    use shardlake_core::types::AnnFamily;
+    use shardlake_index::plugin::HnswConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 5,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
+        ..SystemConfig::default()
+    };
+    let records = make_records(20, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records,
+            dataset_version: DatasetVersion("ds-hnsw".into()),
+            embedding_version: EmbeddingVersion("emb-hnsw".into()),
+            index_version: IndexVersion("idx-hnsw".into()),
+            metric: DistanceMetric::Cosine,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-hnsw"),
+            metadata_key: paths::dataset_metadata_key("ds-hnsw"),
+            pq_params: None,
+            ann_family: Some(AnnFamily::Hnsw),
+            hnsw_config: Some(HnswConfig {
+                m: 8,
+                ef_construction: 100,
+                ef_search: 40,
+            }),
+        })
+        .unwrap();
+
+    assert_eq!(manifest.algorithm.algorithm, "hnsw");
+    assert_eq!(manifest.algorithm.params["hnsw_m"].as_u64().unwrap(), 8);
+    assert_eq!(
+        manifest.algorithm.params["hnsw_ef_construction"]
+            .as_u64()
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        manifest.algorithm.params["hnsw_ef_search"]
+            .as_u64()
+            .unwrap(),
+        40
+    );
+    // The coarse quantizer is still written for IVF-based shard routing.
+    assert!(manifest.coarse_quantizer_key.is_some());
+}
+
+/// Build an HNSW index then query it; the searcher must select HnswPlugin
+/// from the manifest and return results.
+#[test]
+fn hnsw_searcher_uses_hnsw_plugin_for_hnsw_manifest() {
+    use shardlake_core::types::AnnFamily;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 5,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
+        ..SystemConfig::default()
+    };
+    let records = make_records(20, 4);
+
+    let manifest = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: records.clone(),
+            dataset_version: DatasetVersion("ds-hnsw-s".into()),
+            embedding_version: EmbeddingVersion("emb-hnsw-s".into()),
+            index_version: IndexVersion("idx-hnsw-s".into()),
+            metric: DistanceMetric::Cosine,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-hnsw-s"),
+            metadata_key: paths::dataset_metadata_key("ds-hnsw-s"),
+            pq_params: None,
+            ann_family: Some(AnnFamily::Hnsw),
+            hnsw_config: None, // defaults
+        })
+        .unwrap();
+
+    assert_eq!(manifest.algorithm.algorithm, "hnsw");
+
+    let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+    let query = records[0].data.clone();
+    let policy = FanOutPolicy {
+        candidate_centroids: 2,
+        ..FanOutPolicy::default()
+    };
+    let results = searcher.search(&query, 3, &policy).unwrap();
+
+    assert!(!results.is_empty(), "HNSW searcher must return results");
+    assert!(results.len() <= 3);
+}
+
+/// Build an HNSW index with an invalid config (m=0) and verify it is
+/// rejected before any artifact is written.
+#[test]
+fn hnsw_build_rejects_invalid_hnsw_config() {
+    use shardlake_core::types::AnnFamily;
+    use shardlake_index::plugin::HnswConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 5,
+        nprobe: 2,
+        kmeans_seed: SystemConfig::default_kmeans_seed(),
+        kmeans_sample_size: None,
+        ..SystemConfig::default()
+    };
+
+    let err = IndexBuilder::new(store.as_ref(), &config)
+        .build(BuildParams {
+            records: make_records(20, 4),
+            dataset_version: DatasetVersion("ds-hnsw-inv".into()),
+            embedding_version: EmbeddingVersion("emb-hnsw-inv".into()),
+            index_version: IndexVersion("idx-hnsw-inv".into()),
+            metric: DistanceMetric::Cosine,
+            dims: 4,
+            vectors_key: paths::dataset_vectors_key("ds-hnsw-inv"),
+            metadata_key: paths::dataset_metadata_key("ds-hnsw-inv"),
+            pq_params: None,
+            ann_family: Some(AnnFamily::Hnsw),
+            hnsw_config: Some(HnswConfig {
+                m: 0,
+                ef_construction: 200,
+                ef_search: 50,
+            }),
+        })
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("m must be"),
+        "invalid HNSW config should be rejected: {err}"
+    );
 }

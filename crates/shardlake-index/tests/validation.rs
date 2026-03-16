@@ -65,6 +65,8 @@ fn build_index(tmp: &std::path::Path) -> (Arc<LocalObjectStore>, shardlake_manif
             vectors_key: paths::dataset_vectors_key("ds-v1"),
             metadata_key: paths::dataset_metadata_key("ds-v1"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
     (store, manifest)

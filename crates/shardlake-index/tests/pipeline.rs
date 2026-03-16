@@ -79,6 +79,8 @@ fn build_index(
             vectors_key: format!("datasets/{dataset_tag}/vectors.jsonl"),
             metadata_key: format!("datasets/{dataset_tag}/metadata.json"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
     (store, manifest, tmp)
@@ -454,6 +456,8 @@ fn test_mmap_loader_returns_same_results_as_cached_loader() {
             vectors_key: paths::dataset_vectors_key("ds-mmap-cmp"),
             metadata_key: paths::dataset_metadata_key("ds-mmap-cmp"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -532,6 +536,8 @@ fn test_mmap_loader_fallback_for_small_files() {
             vectors_key: paths::dataset_vectors_key("ds-mmap-small"),
             metadata_key: paths::dataset_metadata_key("ds-mmap-small"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 
@@ -592,6 +598,8 @@ fn test_mmap_loader_caches_shards() {
             vectors_key: paths::dataset_vectors_key("ds-mmap-cache"),
             metadata_key: paths::dataset_metadata_key("ds-mmap-cache"),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
 

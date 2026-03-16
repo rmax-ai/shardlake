@@ -254,6 +254,8 @@ mod tests {
                 vectors_key: paths::dataset_vectors_key(dataset_ver),
                 metadata_key,
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap()
     }

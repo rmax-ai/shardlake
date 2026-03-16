@@ -103,6 +103,8 @@ fn build_index(
             vectors_key: paths::dataset_vectors_key(tag),
             metadata_key: paths::dataset_metadata_key(tag),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
     let (counting, counter) = CountingStore::new(base as Arc<dyn ObjectStore>);

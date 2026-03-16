@@ -976,6 +976,8 @@ mod tests {
                 vectors_key: "datasets/ds-pipeline/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-pipeline/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         std::mem::forget(tmp);
@@ -1132,6 +1134,8 @@ mod tests {
                 vectors_key: "datasets/ds-oversample/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-oversample/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let pipeline = QueryPipeline::builder(store, manifest)
@@ -1246,6 +1250,8 @@ mod tests {
                 vectors_key: "datasets/ds-rerank-spans/vectors.jsonl".into(),
                 metadata_key: "datasets/ds-rerank-spans/metadata.json".into(),
                 pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
             })
             .unwrap();
         let pipeline = QueryPipeline::builder(store, manifest)

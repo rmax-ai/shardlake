@@ -12,7 +12,9 @@ use tracing::info;
 
 use shardlake_core::{
     config::SystemConfig,
-    types::{DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord},
+    types::{
+        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord,
+    },
 };
 use shardlake_index::{BuildParams, IndexBuilder};
 use shardlake_manifest::{DatasetManifest, ManifestError};
@@ -54,6 +56,12 @@ pub struct BuildIndexArgs {
     /// All vectors are still assigned to the nearest centroid after training.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub kmeans_sample_size: Option<u32>,
+    /// ANN algorithm family to use for candidate search within each shard.
+    ///
+    /// `ivf_flat` (default): exact brute-force distance scoring, all metrics.
+    /// `hnsw`: HNSW graph-based candidate search, all metrics.
+    #[arg(long, default_value = "ivf_flat")]
+    pub ann_family: AnnFamily,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
@@ -123,6 +131,8 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
         vectors_key,
         metadata_key,
         pq_params: None,
+        ann_family: Some(args.ann_family),
+        hnsw_config: None,
     })?;
 
     println!(
@@ -186,6 +196,7 @@ mod tests {
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
             },
         )
         .await
@@ -211,6 +222,7 @@ mod tests {
                 nprobe: 2,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: Some(0),
+                ann_family: AnnFamily::IvfFlat,
             },
         )
         .await
@@ -268,6 +280,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
             },
         )
         .await
@@ -301,6 +314,7 @@ mod tests {
                 nprobe: 1,
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
             },
         )
         .await

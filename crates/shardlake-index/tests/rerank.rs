@@ -41,6 +41,8 @@ fn make_searcher(
             vectors_key: "datasets/ds-rr/vectors.jsonl".into(),
             metadata_key: "datasets/ds-rr/metadata.json".into(),
             pq_params: None,
+            ann_family: None,
+            hnsw_config: None,
         })
         .unwrap();
     IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
