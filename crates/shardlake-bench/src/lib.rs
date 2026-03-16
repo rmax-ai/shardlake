@@ -3,7 +3,7 @@
 
 pub mod generate;
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -17,6 +17,7 @@ use shardlake_index::{
     kmeans::top_n_centroids,
     IndexSearcher, Result as IndexResult,
 };
+use shardlake_manifest::Manifest;
 use shardlake_storage::{paths, ObjectStore};
 
 /// Errors that can arise while evaluating partition quality.
@@ -74,6 +75,234 @@ pub struct EvalAnnReport {
     pub mean_latency_us: f64,
     /// 99th-percentile per-query ANN search latency in microseconds.
     pub p99_latency_us: f64,
+}
+
+/// Workload simulation mode for benchmark runs.
+///
+/// Controls whether the shard cache is pre-warmed, cleared, or left to warm
+/// organically so that benchmark results reflect cache-cold, cache-warm, or
+/// realistic mixed serving behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadMode {
+    /// Cold workload: the shard cache is empty at the start of every query.
+    ///
+    /// Simulates a freshly started process with no pre-warmed state.  A new
+    /// [`IndexSearcher`] is created for each query so that no shard data is
+    /// carried across requests.
+    Cold,
+    /// Warm workload: the shard cache is fully pre-loaded before the timed run.
+    ///
+    /// Simulates a long-running process where all accessed shards are already
+    /// resident in memory.  An un-timed warm-up pass is executed first;
+    /// latencies measured thereafter reflect pure in-memory query costs.
+    Warm,
+    /// Mixed workload: no explicit pre-warming or cache clearing.
+    ///
+    /// The cache transitions from cold to warm as queries progress, combining
+    /// cold-start behaviour in the early queries with warm-cache behaviour in
+    /// later queries.  This mirrors a typical serving process that starts cold
+    /// and gradually warms up.
+    Mixed,
+}
+
+impl fmt::Display for WorkloadMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkloadMode::Cold => write!(f, "cold"),
+            WorkloadMode::Warm => write!(f, "warm"),
+            WorkloadMode::Mixed => write!(f, "mixed"),
+        }
+    }
+}
+
+/// Summary statistics for a workload-aware benchmark run.
+///
+/// Extends [`BenchmarkReport`] with the workload mode and observed cache hit
+/// rate, making the scenario under test explicit in every output line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkloadReport {
+    /// The workload simulation mode used for this run.
+    pub workload: WorkloadMode,
+    /// Observed cache hit rate during the measured pass (0.0 – 1.0).
+    ///
+    /// For [`WorkloadMode::Cold`] this is always `0.0` (fresh cache per
+    /// query).  For [`WorkloadMode::Warm`] it will be close to `1.0` after
+    /// the warm-up pass.  For [`WorkloadMode::Mixed`] it reflects the
+    /// aggregate proportion of shard accesses that were served from cache.
+    pub cache_hit_rate: f64,
+    /// Core benchmark statistics (flattened into this struct for JSON output).
+    #[serde(flatten)]
+    pub benchmark: BenchmarkReport,
+}
+
+/// Run a workload-aware benchmark that simulates cold, warm, or mixed cache
+/// behaviour.
+///
+/// # Arguments
+///
+/// * `store`    – Object store holding the index artifacts.
+/// * `manifest` – Loaded manifest for the index under test.
+/// * `queries`  – Query vectors used for recall and latency measurement.
+/// * `corpus`   – Full corpus used to compute exact ground-truth top-k.
+/// * `k`        – Number of nearest neighbours to retrieve per query.
+/// * `policy`   – Fan-out policy (centroid/shard/vector limits).
+/// * `metric`   – Distance metric for ground-truth computation.
+/// * `workload` – Workload simulation mode (cold / warm / mixed).
+///
+/// # Panics
+///
+/// Does not panic; returns a zeroed report when `queries` is empty.
+#[allow(clippy::too_many_arguments)]
+pub fn run_workload_benchmark(
+    store: &Arc<dyn ObjectStore>,
+    manifest: &Manifest,
+    queries: &[VectorRecord],
+    corpus: &[VectorRecord],
+    k: usize,
+    policy: &FanOutPolicy,
+    metric: DistanceMetric,
+    workload: WorkloadMode,
+) -> WorkloadReport {
+    let keys = store.list(paths::indexes_prefix()).unwrap_or_default();
+    let artifact_size_bytes: u64 = keys
+        .iter()
+        .filter_map(|key| store.get(key).ok())
+        .map(|b| b.len() as u64)
+        .sum();
+
+    if queries.is_empty() {
+        return WorkloadReport {
+            workload,
+            cache_hit_rate: 0.0,
+            benchmark: BenchmarkReport {
+                num_queries: 0,
+                k,
+                nprobe: policy.candidate_centroids as usize,
+                recall_at_k: 0.0,
+                mean_latency_us: 0.0,
+                p99_latency_us: 0.0,
+                throughput_qps: 0.0,
+                artifact_size_bytes,
+            },
+        };
+    }
+
+    let (latencies_us, recalls, cache_hit_rate, wall_elapsed_secs) = match workload {
+        WorkloadMode::Cold => {
+            // Create a fresh IndexSearcher for every query to guarantee an
+            // empty shard cache at the start of each request.
+            let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+            let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+
+            let wall_start = Instant::now();
+            for query in queries {
+                let searcher = IndexSearcher::new(Arc::clone(store), manifest.clone());
+                let gt = exact_search(&query.data, corpus, metric, k);
+                let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+                let t0 = Instant::now();
+                let approx = searcher.search(&query.data, k, policy).unwrap_or_default();
+                latencies_us.push(t0.elapsed().as_micros() as f64);
+
+                let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
+                recalls.push(recall_at_k(&gt_ids, &approx_ids));
+            }
+            let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
+
+            // By construction the cache is always empty at the start of each
+            // query, so the effective hit rate across the run is 0.0.
+            (latencies_us, recalls, 0.0_f64, wall_elapsed_secs)
+        }
+
+        WorkloadMode::Warm => {
+            // Create a single searcher and run an un-timed warm-up pass so
+            // that all accessed shards are resident before measurement begins.
+            let searcher = IndexSearcher::new(Arc::clone(store), manifest.clone());
+
+            for query in queries {
+                let _ = searcher.search(&query.data, k, policy);
+            }
+
+            // Measured pass – shards should now be in the LRU cache.
+            let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+            let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+
+            let wall_start = Instant::now();
+            for query in queries {
+                let gt = exact_search(&query.data, corpus, metric, k);
+                let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+                let t0 = Instant::now();
+                let approx = searcher.search(&query.data, k, policy).unwrap_or_default();
+                latencies_us.push(t0.elapsed().as_micros() as f64);
+
+                let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
+                recalls.push(recall_at_k(&gt_ids, &approx_ids));
+            }
+            let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
+            let cache_hit_rate = searcher.cache_hit_rate();
+
+            (latencies_us, recalls, cache_hit_rate, wall_elapsed_secs)
+        }
+
+        WorkloadMode::Mixed => {
+            // Create a single searcher without any pre-warming.  The cache
+            // transitions organically from cold to warm as the run progresses.
+            let searcher = IndexSearcher::new(Arc::clone(store), manifest.clone());
+
+            let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
+            let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+
+            let wall_start = Instant::now();
+            for query in queries {
+                let gt = exact_search(&query.data, corpus, metric, k);
+                let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+                let t0 = Instant::now();
+                let approx = searcher.search(&query.data, k, policy).unwrap_or_default();
+                latencies_us.push(t0.elapsed().as_micros() as f64);
+
+                let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
+                recalls.push(recall_at_k(&gt_ids, &approx_ids));
+            }
+            let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
+            let cache_hit_rate = searcher.cache_hit_rate();
+
+            (latencies_us, recalls, cache_hit_rate, wall_elapsed_secs)
+        }
+    };
+
+    let mut latencies_us = latencies_us;
+    let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    let mean_latency = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
+    let p99_latency = nearest_rank_percentile(&mut latencies_us, 0.99);
+    let throughput_qps = queries.len() as f64 / wall_elapsed_secs.max(f64::EPSILON);
+
+    let report = WorkloadReport {
+        workload,
+        cache_hit_rate,
+        benchmark: BenchmarkReport {
+            num_queries: queries.len(),
+            k,
+            nprobe: policy.candidate_centroids as usize,
+            recall_at_k: mean_recall,
+            mean_latency_us: mean_latency,
+            p99_latency_us: p99_latency,
+            throughput_qps,
+            artifact_size_bytes,
+        },
+    };
+
+    info!(
+        workload = %workload,
+        recall_at_k = report.benchmark.recall_at_k,
+        mean_latency_us = report.benchmark.mean_latency_us,
+        cache_hit_rate = report.cache_hit_rate,
+        "Workload benchmark complete"
+    );
+
+    report
 }
 
 /// Run benchmark comparing approximate search against exact baseline.
@@ -875,5 +1104,212 @@ mod tests {
             err,
             PartitioningError::ApproximateSearch { query_id: 999, .. }
         ));
+    }
+
+    // ── WorkloadMode / run_workload_benchmark ─────────────────────────────────
+
+    #[test]
+    fn workload_mode_display_labels_are_correct() {
+        assert_eq!(WorkloadMode::Cold.to_string(), "cold");
+        assert_eq!(WorkloadMode::Warm.to_string(), "warm");
+        assert_eq!(WorkloadMode::Mixed.to_string(), "mixed");
+    }
+
+    #[test]
+    fn workload_mode_serialises_to_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&WorkloadMode::Cold).unwrap(),
+            "\"cold\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkloadMode::Warm).unwrap(),
+            "\"warm\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkloadMode::Mixed).unwrap(),
+            "\"mixed\""
+        );
+    }
+
+    #[test]
+    fn run_workload_benchmark_empty_queries_returns_zero_metrics_for_all_modes() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 1, tmp.path().to_path_buf());
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        for mode in [WorkloadMode::Cold, WorkloadMode::Warm, WorkloadMode::Mixed] {
+            let report = run_workload_benchmark(
+                &store_arc,
+                &manifest,
+                &[],
+                &records,
+                3,
+                &policy,
+                DistanceMetric::Euclidean,
+                mode,
+            );
+            assert_eq!(
+                report.workload, mode,
+                "workload field must match requested mode"
+            );
+            assert_eq!(report.benchmark.num_queries, 0);
+            assert_eq!(report.benchmark.recall_at_k, 0.0);
+            assert_eq!(report.benchmark.mean_latency_us, 0.0);
+            assert_eq!(report.benchmark.throughput_qps, 0.0);
+        }
+    }
+
+    #[test]
+    fn run_workload_benchmark_cold_mode_records_zero_cache_hit_rate() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        let report = run_workload_benchmark(
+            &store_arc,
+            &manifest,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            WorkloadMode::Cold,
+        );
+
+        assert_eq!(report.workload, WorkloadMode::Cold);
+        assert_eq!(
+            report.cache_hit_rate, 0.0,
+            "cold workload must have 0.0 hit rate"
+        );
+        assert_eq!(report.benchmark.num_queries, 5);
+        assert!((0.0..=1.0).contains(&report.benchmark.recall_at_k));
+        assert!(report.benchmark.throughput_qps > 0.0);
+    }
+
+    #[test]
+    fn run_workload_benchmark_warm_mode_yields_high_cache_hit_rate() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        // nprobe covers both shards so the warm-up will load everything.
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        let report = run_workload_benchmark(
+            &store_arc,
+            &manifest,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            WorkloadMode::Warm,
+        );
+
+        assert_eq!(report.workload, WorkloadMode::Warm);
+        // After a full warm-up pass all shard loads in the measured pass should
+        // be cache hits, so the hit rate must be > 0.0.
+        assert!(
+            report.cache_hit_rate > 0.0,
+            "warm workload must have a positive cache hit rate, got {}",
+            report.cache_hit_rate
+        );
+        assert_eq!(report.benchmark.num_queries, 5);
+        assert!(report.benchmark.throughput_qps > 0.0);
+    }
+
+    #[test]
+    fn run_workload_benchmark_mixed_mode_runs_without_errors() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        let report = run_workload_benchmark(
+            &store_arc,
+            &manifest,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            WorkloadMode::Mixed,
+        );
+
+        assert_eq!(report.workload, WorkloadMode::Mixed);
+        assert_eq!(report.benchmark.num_queries, 5);
+        assert!((0.0..=1.0).contains(&report.benchmark.recall_at_k));
+        assert!((0.0..=1.0).contains(&report.cache_hit_rate));
+        assert!(report.benchmark.throughput_qps > 0.0);
+    }
+
+    #[test]
+    fn run_workload_benchmark_report_field_workload_matches_requested_mode() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+
+        let queries: Vec<VectorRecord> = records[..3].to_vec();
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        for mode in [WorkloadMode::Cold, WorkloadMode::Warm, WorkloadMode::Mixed] {
+            let report = run_workload_benchmark(
+                &store_arc,
+                &manifest,
+                &queries,
+                &records,
+                3,
+                &policy,
+                DistanceMetric::Euclidean,
+                mode,
+            );
+            assert_eq!(
+                report.workload, mode,
+                "WorkloadReport.workload must equal the requested mode"
+            );
+        }
     }
 }
