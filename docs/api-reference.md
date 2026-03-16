@@ -122,7 +122,7 @@ computation before returning results.  Three retrieval modes are supported:
 | `400 Bad Request` | `{"error": "invalid query config: rerank_limit must be ≥ 1 when set"}` | `rerank_limit` is 0 |
 | `400 Bad Request` | `{"error": "query vector dimensions do not match the index"}` | Query vector length differs from the manifest `dims` |
 | `400 Bad Request` | `{"error": "PQ-compressed indexes currently support only euclidean distance queries"}` | Request overrides `distance_metric` to a non-euclidean value against a PQ-compressed index |
-| `422 Unprocessable Entity` | JSON parse error | `query_mode` contains an unrecognised value |
+| `422 Unprocessable Entity` | JSON parse error | `query_mode` contains an unrecognized value |
 | `500 Internal Server Error` | `{"error": "<message>"}` | Internal search failure |
 
 ### Example

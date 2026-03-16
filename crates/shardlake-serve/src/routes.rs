@@ -133,6 +133,9 @@ async fn query_handler(
             .into_response();
     }
 
+    // `true` when `query_text` is absent or empty.
+    let query_text_missing = req.query_text.as_deref().map(str::is_empty).unwrap_or(true);
+
     // Validate mode-specific field requirements.
     let query_mode = req.query_mode;
     match query_mode {
@@ -146,7 +149,7 @@ async fn query_handler(
             }
         }
         QueryMode::Lexical => {
-            if req.query_text.as_deref().map(str::is_empty).unwrap_or(true) {
+            if query_text_missing {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "error": "query_text is required for lexical mode" })),
@@ -171,7 +174,7 @@ async fn query_handler(
                 )
                     .into_response();
             }
-            if req.query_text.as_deref().map(str::is_empty).unwrap_or(true) {
+            if query_text_missing {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "error": "query_text is required for hybrid mode" })),
@@ -291,11 +294,13 @@ async fn query_handler(
                 let v = vector.expect("vector validated above");
                 let bm25 = bm25_index.expect("bm25 index validated above");
                 let text = query_text.expect("query_text validated above");
+                // Fetch up to `candidate_k` vector results so the hybrid merger
+                // has a wide candidate pool when `rerank_limit` > `k`.
                 let ann_results = searcher.search_with_metric(&v, candidate_k, &policy, metric)?;
                 let vector_results = if rerank {
-                    let mut reranked = searcher.rerank_with_metric(&v, ann_results, metric)?;
-                    reranked.truncate(candidate_k);
-                    reranked
+                    // Exact-rerank the ANN candidates; pass the full pool to
+                    // rank_hybrid so it can select the best hybrid top-k.
+                    searcher.rerank_with_metric(&v, ann_results, metric)?
                 } else {
                     ann_results
                 };
