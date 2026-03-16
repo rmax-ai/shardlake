@@ -68,14 +68,24 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let body = state.metrics.gather();
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        body,
-    )
+    match state.searcher.cached_shard_bytes() {
+        Ok(retained_bytes) => {
+            let body = state.metrics.gather(retained_bytes);
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to gather metrics: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn query_handler(
@@ -536,6 +546,17 @@ mod tests {
         assert!(
             body_str.contains("shardlake_query_results_total 1"),
             "expected query_results_total=1 after one result, got:\n{body_str}"
+        );
+        assert!(
+            body_str
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("shardlake_shard_cache_retained_bytes ")
+                        .map(str::trim)
+                })
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0),
+            "expected shardlake_shard_cache_retained_bytes > 0 after one query, got:\n{body_str}"
         );
     }
 }

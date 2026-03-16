@@ -6,9 +6,9 @@
 //! endpoint is scraped to obtain the current Prometheus text format payload.
 //!
 //! Cache-related counters are refreshed from the live [`CacheMetrics`]
-//! snapshot at scrape time, so they always reflect the values accumulated
-//! inside [`IndexSearcher`](shardlake_index::IndexSearcher) without any
-//! additional per-query overhead.
+//! snapshot at scrape time, and the retained-bytes gauge is supplied by the
+//! caller from the live shard caches. This keeps observability updates out of
+//! the hot query path.
 
 use std::sync::Arc;
 
@@ -146,16 +146,16 @@ impl PrometheusMetrics {
     /// Refresh the cache-related gauges from the live snapshot and encode all
     /// registered metrics in Prometheus text exposition format (version 0.0.4).
     ///
-    /// This is the body returned by the `GET /metrics` handler.
-    pub fn gather(&self) -> String {
+    /// `retained_bytes` should be computed from the searcher's currently cached
+    /// shard artifacts at scrape time.
+    pub fn gather(&self, retained_bytes: u64) -> String {
         let snap = self.cache_metrics.snapshot();
         self.shard_cache_hits.set(snap.hits as i64);
         self.shard_cache_misses.set(snap.misses as i64);
         self.shard_load_count.set(snap.total_load_count as i64);
         self.shard_load_latency_ns_total
             .set(snap.total_load_latency_ns as i64);
-        self.shard_cache_retained_bytes
-            .set(snap.retained_bytes as i64);
+        self.shard_cache_retained_bytes.set(retained_bytes as i64);
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn gather_returns_expected_metric_families() {
         let m = make_metrics();
-        let output = m.gather();
+        let output = m.gather(0);
         assert!(
             output.contains("shardlake_query_duration_seconds"),
             "missing query_duration_seconds in:\n{output}"
@@ -221,7 +221,7 @@ mod tests {
         cache.record_load_attempt(1_000_000);
 
         let m = PrometheusMetrics::new(Arc::clone(&cache));
-        let output = m.gather();
+        let output = m.gather(0);
 
         assert!(
             output.contains("shardlake_shard_cache_hits_total 2"),
@@ -240,7 +240,7 @@ mod tests {
         m.queries_total.inc();
         m.query_results_total.inc_by(5);
 
-        let output = m.gather();
+        let output = m.gather(0);
         assert!(
             output.contains("shardlake_queries_total 2"),
             "expected queries_total=2 in:\n{output}"
@@ -248,6 +248,17 @@ mod tests {
         assert!(
             output.contains("shardlake_query_results_total 5"),
             "expected query_results_total=5 in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn gather_uses_supplied_retained_bytes() {
+        let m = make_metrics();
+        let output = m.gather(4096);
+
+        assert!(
+            output.contains("shardlake_shard_cache_retained_bytes 4096"),
+            "expected retained bytes in:\n{output}"
         );
     }
 }

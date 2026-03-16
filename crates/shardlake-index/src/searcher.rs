@@ -167,6 +167,15 @@ impl IndexSearcher {
         Arc::clone(&self.cache_metrics)
     }
 
+    /// Return the serialized size of all currently cached shard artifacts.
+    ///
+    /// Both raw-vector and PQ shard caches are included so the serving layer can
+    /// expose an accurate scrape-time retained-bytes gauge.
+    pub fn cached_shard_bytes(&self) -> Result<u64> {
+        Ok(self.cache.retained_bytes(ShardIndex::encoded_len)?
+            + self.pq_shard_cache.retained_bytes(PqShard::encoded_len)?)
+    }
+
     /// Perform approximate top-k search using the provided [`FanOutPolicy`].
     ///
     /// The policy controls:

@@ -181,10 +181,12 @@ The response body is plain text following the
 | `shardlake_shard_load_latency_ns_total` | gauge | Cumulative shard-load wall-clock time in nanoseconds since server start. |
 | `shardlake_shard_cache_retained_bytes` | gauge | Total raw bytes currently retained in the in-process shard cache. |
 
-> **Note:** Cache-related metrics (`shardlake_shard_cache_*`) are exposed as
-> gauges because they are read from monotonically increasing atomic counters
-> inside the searcher; they always reflect cumulative totals since the process
-> started, not deltas.
+> **Note:** Cache hit/miss/load metrics (`shardlake_shard_cache_hits_total`,
+> `shardlake_shard_cache_misses_total`, and `shardlake_shard_load_*`) are
+> exposed as gauges because they are read from monotonically increasing atomic
+> counters inside the searcher at scrape time. By contrast,
+> `shardlake_shard_cache_retained_bytes` is recomputed from the live shard
+> caches on each scrape and reflects the bytes currently resident in-process.
 
 ### Example
 

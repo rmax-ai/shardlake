@@ -87,6 +87,20 @@ impl ShardIndex {
         Ok(buf)
     }
 
+    /// Return the serialized size of this shard in bytes.
+    #[must_use]
+    pub fn encoded_len(&self) -> u64 {
+        let header_bytes = SHARD_MAGIC.len() as u64
+            + std::mem::size_of::<u32>() as u64 * 3
+            + std::mem::size_of::<u64>() as u64;
+        let centroid_bytes =
+            self.centroids.len() as u64 * self.dims as u64 * std::mem::size_of::<f32>() as u64;
+        let record_bytes = self.records.len() as u64
+            * (std::mem::size_of::<u64>() as u64
+                + self.dims as u64 * std::mem::size_of::<f32>() as u64);
+        header_bytes + centroid_bytes + record_bytes
+    }
+
     /// Deserialise a format-version-1 shard from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = Cursor::new(bytes);
@@ -184,6 +198,19 @@ impl PqShard {
         }
 
         Ok(buf)
+    }
+
+    /// Return the serialized size of this PQ shard in bytes.
+    #[must_use]
+    pub fn encoded_len(&self) -> u64 {
+        let header_bytes = SHARD_MAGIC.len() as u64
+            + std::mem::size_of::<u32>() as u64 * 5
+            + std::mem::size_of::<u64>() as u64;
+        let centroid_bytes =
+            self.centroids.len() as u64 * self.dims as u64 * std::mem::size_of::<f32>() as u64;
+        let entry_bytes =
+            self.entries.len() as u64 * (std::mem::size_of::<u64>() as u64 + self.pq_m as u64);
+        header_bytes + centroid_bytes + entry_bytes
     }
 
     /// Deserialise a format-version-2 shard from bytes.
