@@ -1,6 +1,7 @@
 pub mod benchmark;
 pub mod build_index;
 pub mod build_index_worker;
+pub mod compare_ann;
 pub mod eval_ann;
 pub mod evaluate_partitioning;
 pub mod generate;

@@ -1,7 +1,7 @@
 # CLI Reference
 
 `shardlake` is the single binary that drives the entire pipeline: ingest → build-index →
-publish → serve → benchmark → eval-ann.
+publish → serve → benchmark → eval-ann → compare-ann.
 
 ## Global flags
 
@@ -679,6 +679,121 @@ shardlake eval-ann --k 10 --nprobe 4 --max-queries 500
 
 # Machine-readable JSON for CI regression tracking
 shardlake eval-ann --k 10 --nprobe 4 --max-queries 500 --output json
+```
+
+---
+
+## `shardlake compare-ann`
+
+Compares multiple ANN families (IVF-PQ, HNSW, DiskANN, or any combination) in one
+reproducible evaluation run.  Each supplied alias is evaluated against the same exact
+brute-force baseline and the results are printed side-by-side, making it straightforward
+to assess quality/latency trade-offs across families.
+
+All compared indexes must reference the same dataset (the corpus is loaded once from the
+first alias).  Each index should have been built with a different `--ann-family` flag so
+that the comparison is meaningful.
+
+### Usage
+
+```
+shardlake [--storage <PATH>] compare-ann --alias <ALIAS>... [OPTIONS]
+```
+
+### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--alias <STRING>` | string (repeatable) | *(required)* | One or more index aliases to compare. Pass the flag multiple times for each alias. |
+| `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve per query |
+| `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
+| `--max-queries <N>` | usize | `0` | Maximum query vectors to evaluate (0 = min(corpus size, 100)) |
+| `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Family | Canonical ANN algorithm family name extracted from the manifest |
+| Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Precision@k | Fraction of retrieved results that are true top-k neighbours |
+| Mean Lat | Average per-query ANN search time in microseconds |
+| P99 Lat | 99th-percentile per-query ANN search time in microseconds |
+
+### Output
+
+**Text (default):**
+
+```
+=== ANN Family Comparison ===
+  Queries:  100  k:  10  nprobe:  2
+
+  Family           Alias                  Recall@k   Precision@k     Mean Lat      P99 Lat
+  -----------------------------------------------------------------------------------------
+  ivf_flat         latest                    0.8400       0.8400      42.3 µs    210.0 µs
+  ivf_pq           pq-idx                    0.7900       0.7900      28.1 µs    150.0 µs
+  hnsw             hnsw-idx                  0.9500       0.9500      35.5 µs    180.0 µs
+  diskann          da-idx                    0.9100       0.9100      38.0 µs    195.0 µs
+```
+
+**JSON (`--output json`):**
+
+```json
+{
+  "entries": [
+    {
+      "alias": "latest",
+      "ann_family": "ivf_flat",
+      "num_queries": 100,
+      "k": 10,
+      "nprobe": 2,
+      "recall_at_k": 0.84,
+      "precision_at_k": 0.84,
+      "mean_latency_us": 42.3,
+      "p99_latency_us": 210.0
+    },
+    {
+      "alias": "hnsw-idx",
+      "ann_family": "hnsw",
+      "num_queries": 100,
+      "k": 10,
+      "nprobe": 2,
+      "recall_at_k": 0.95,
+      "precision_at_k": 0.95,
+      "mean_latency_us": 35.5,
+      "p99_latency_us": 180.0
+    }
+  ]
+}
+```
+
+### Example
+
+```bash
+# Build three indexes with different ANN families first
+shardlake build-index --dataset-version ds-v1 --ann-family ivf_flat \
+  --index-version idx-ivf && shardlake publish --index-version idx-ivf --alias ivf-idx
+
+shardlake build-index --dataset-version ds-v1 --ann-family hnsw \
+  --index-version idx-hnsw && shardlake publish --index-version idx-hnsw --alias hnsw-idx
+
+shardlake build-index --dataset-version ds-v1 --ann-family diskann \
+  --index-version idx-da && shardlake publish --index-version idx-da --alias da-idx
+
+# Compare all three in one run (text table)
+shardlake compare-ann \
+  --alias ivf-idx \
+  --alias hnsw-idx \
+  --alias da-idx \
+  --k 10 --nprobe 4 --max-queries 500
+
+# Machine-readable JSON for CI regression tracking
+shardlake compare-ann \
+  --alias ivf-idx \
+  --alias hnsw-idx \
+  --alias da-idx \
+  --k 10 --nprobe 4 --max-queries 500 \
+  --output json
 ```
 
 ---

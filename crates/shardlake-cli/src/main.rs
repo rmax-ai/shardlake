@@ -37,6 +37,8 @@ enum Commands {
     Benchmark(commands::benchmark::BenchmarkArgs),
     /// Evaluate ANN quality: recall@k, precision@k, and latency.
     EvalAnn(commands::eval_ann::EvalAnnArgs),
+    /// Compare multiple ANN families: IVF-PQ, HNSW, DiskANN, and others.
+    CompareAnn(commands::compare_ann::CompareAnnArgs),
     /// Validate dataset and/or index manifests against stored artifacts.
     ValidateManifest(commands::validate_manifest::ValidateManifestArgs),
     /// Evaluate partition quality: shard size distribution, routing accuracy,
@@ -63,6 +65,7 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
         Commands::EvalAnn(args) => commands::eval_ann::run(cli.storage, args).await,
+        Commands::CompareAnn(args) => commands::compare_ann::run(cli.storage, args).await,
         Commands::ValidateManifest(args) => {
             commands::validate_manifest::run(cli.storage, args).await
         }

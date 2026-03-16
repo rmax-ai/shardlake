@@ -246,6 +246,47 @@ pub struct EvalAnnReport {
     pub p99_latency_us: f64,
 }
 
+/// One row in an ANN family comparison report.
+///
+/// Captures the alias and ANN family name together with the evaluation metrics
+/// for that family, allowing callers to compare results across families in a
+/// single [`CompareAnnReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnFamilyReport {
+    /// Alias used to load the index (e.g. `"latest"`, `"hnsw-exp"`).
+    pub alias: String,
+    /// Canonical ANN algorithm family name recorded in the manifest
+    /// (e.g. `"ivf_flat"`, `"ivf_pq"`, `"hnsw"`, `"diskann"`).
+    pub ann_family: String,
+    /// Evaluation metrics for this family.
+    #[serde(flatten)]
+    pub eval: EvalAnnReport,
+}
+
+/// Comparison report across multiple ANN families.
+///
+/// Produced by running [`run_eval_ann`] once per alias and collecting the
+/// results into a single document.  Each entry corresponds to one index alias
+/// and includes the ANN family name extracted from the manifest, making it
+/// straightforward to compare quality and latency across families.
+///
+/// # Example (JSON)
+///
+/// ```json
+/// {
+///   "entries": [
+///     { "alias": "ivf-idx",  "ann_family": "ivf_flat", "num_queries": 100, ... },
+///     { "alias": "hnsw-idx", "ann_family": "hnsw",     "num_queries": 100, ... }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareAnnReport {
+    /// One entry per evaluated alias / ANN family, in the order they were
+    /// supplied to the CLI.
+    pub entries: Vec<AnnFamilyReport>,
+}
+
 /// Workload simulation mode for benchmark runs.
 ///
 /// Controls whether the shard cache is pre-warmed, cleared, or left to warm
@@ -1823,5 +1864,73 @@ mod tests {
                 "WorkloadReport.workload must equal the requested mode"
             );
         }
+    }
+
+    // ── CompareAnnReport / AnnFamilyReport ────────────────────────────────────
+
+    #[test]
+    fn ann_family_report_flattens_eval_fields_in_json() {
+        let eval = EvalAnnReport {
+            num_queries: 10,
+            k: 5,
+            nprobe: 2,
+            recall_at_k: 0.9,
+            precision_at_k: 0.85,
+            mean_latency_us: 50.0,
+            p99_latency_us: 200.0,
+        };
+        let entry = AnnFamilyReport {
+            alias: "hnsw-idx".into(),
+            ann_family: "hnsw".into(),
+            eval,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        // Flattened: eval fields appear at the top level.
+        assert_eq!(json["alias"], "hnsw-idx");
+        assert_eq!(json["ann_family"], "hnsw");
+        assert_eq!(json["num_queries"], 10);
+        assert_eq!(json["recall_at_k"], 0.9);
+        assert_eq!(json["precision_at_k"], 0.85);
+    }
+
+    #[test]
+    fn compare_ann_report_serialises_all_entries() {
+        let make_entry = |alias: &str, family: &str, recall: f64| AnnFamilyReport {
+            alias: alias.into(),
+            ann_family: family.into(),
+            eval: EvalAnnReport {
+                num_queries: 5,
+                k: 3,
+                nprobe: 1,
+                recall_at_k: recall,
+                precision_at_k: recall,
+                mean_latency_us: 10.0,
+                p99_latency_us: 30.0,
+            },
+        };
+
+        let report = CompareAnnReport {
+            entries: vec![
+                make_entry("ivf-idx", "ivf_flat", 0.8),
+                make_entry("hnsw-idx", "hnsw", 0.95),
+                make_entry("da-idx", "diskann", 0.88),
+            ],
+        };
+
+        let json = serde_json::to_value(&report).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["ann_family"], "ivf_flat");
+        assert_eq!(entries[1]["ann_family"], "hnsw");
+        assert_eq!(entries[2]["ann_family"], "diskann");
+        assert_eq!(entries[1]["recall_at_k"], 0.95);
+    }
+
+    #[test]
+    fn compare_ann_report_empty_entries_round_trips() {
+        let report = CompareAnnReport { entries: vec![] };
+        let json = serde_json::to_string(&report).unwrap();
+        let decoded: CompareAnnReport = serde_json::from_str(&json).unwrap();
+        assert!(decoded.entries.is_empty());
     }
 }
