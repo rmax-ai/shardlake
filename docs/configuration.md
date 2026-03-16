@@ -235,7 +235,8 @@ best-first search.
 **Query semantics**
 
 For each probed shard the stage scores exactly `probe_count = max(k, beam_width).min(shard_size)` records,
-selected at evenly-spaced stride positions across the shard.  This bound means:
+selected at evenly-spaced positions across the shard, including both endpoints
+when more than one record is probed. This bound means:
 
 - Per-shard work is `O(probe_count)`, not `O(shard_size)`.
 - When the shard has at least `k` records, the stage always returns exactly `k`

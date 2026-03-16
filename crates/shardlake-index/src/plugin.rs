@@ -257,7 +257,8 @@ impl AnnPlugin for DiskAnnPlugin {
 ///    - It also guarantees the stage can return up to `k` candidates when
 ///      the shard has at least `k` records.
 /// 2. Select `probe_count` record indices spread evenly across the shard
-///    using a stride of `shard_size / probe_count`.
+///    with an endpoint-inclusive sampler so the probe set spans the full
+///    record range.
 /// 3. Score only those records and return the top-`k` by distance.
 ///
 /// When `probe_count == shard_size` (small shards or large `k`/`beam_width`)
@@ -269,7 +270,16 @@ pub struct DiskAnnCandidateStage {
 impl DiskAnnCandidateStage {
     /// Create a new stage with the given `beam_width`.
     pub fn new(beam_width: usize) -> Self {
+        assert!(beam_width > 0, "beam_width must be greater than zero");
         Self { beam_width }
+    }
+
+    fn probe_index(record_count: usize, probe_count: usize, probe_idx: usize) -> usize {
+        if probe_count <= 1 {
+            return 0;
+        }
+
+        probe_idx * (record_count - 1) / (probe_count - 1)
     }
 }
 
@@ -289,7 +299,7 @@ impl CandidateSearchStage for DiskAnnCandidateStage {
 
         let records = &shard.records;
 
-        if records.is_empty() {
+        if k == 0 || records.is_empty() {
             return Ok(vec![]);
         }
 
@@ -307,16 +317,13 @@ impl CandidateSearchStage for DiskAnnCandidateStage {
             return Ok(exact_search(query, records, metric, k));
         }
 
-        // Stride that spreads probe_count samples evenly across the whole
-        // shard instead of concentrating them at the front.
-        // stride >= 2 because probe_count < records.len().
-        let stride = records.len() / probe_count;
-
-        // Score the strided probe set.  Track (score, shard_index) to defer
+        // Score an endpoint-inclusive probe set so bounded exploration spans
+        // the full shard range instead of skipping the tail.
+        // Track (score, shard_index) to defer
         // metadata cloning until the final top-k result construction.
         let mut scored: Vec<(f32, usize)> = (0..probe_count)
             .map(|i| {
-                let idx = (i * stride).min(records.len() - 1);
+                let idx = Self::probe_index(records.len(), probe_count, i);
                 (distance(query, &records[idx].data, metric), idx)
             })
             .collect();

@@ -197,8 +197,9 @@ fn diskann_stage_small_shard_returns_all_available() {
 /// We verify this behaviourally: construct a shard of 200 records with the
 /// true nearest neighbour sitting exactly in the middle (position 100).
 /// With beam_width=5 and k=3, only max(3,5)=5 strided positions are scored.
-/// The strided positions cannot include index 100 (stride = 200/5 = 40,
-/// so positions are 0, 40, 80, 120, 160), so the true nearest neighbour
+/// The endpoint-inclusive positions cannot include index 100
+/// (`i * (len - 1) / (probe_count - 1)` gives 0, 49, 99, 149, 199), so the
+/// true nearest neighbour
 /// should NOT be in the result set — confirming that only the probe set was
 /// scored and no full scan occurred.
 #[test]
@@ -232,7 +233,7 @@ fn diskann_stage_does_not_scan_full_shard_when_beam_is_small() {
         .search(&query, &shard, DistanceMetric::Euclidean, k)
         .unwrap();
 
-    // With stride=40, probed indices are 0, 40, 80, 120, 160.
+    // With endpoint-inclusive sampling, probed indices are 0, 49, 99, 149, 199.
     // Index 100 is NOT probed, so the true nearest neighbour should not
     // appear in the results — confirming bounded (not full) exploration.
     assert_eq!(results.len(), k, "should return k results");
@@ -243,6 +244,47 @@ fn diskann_stage_does_not_scan_full_shard_when_beam_is_small() {
          its strided position is not probed — if it appears the stage \
          is performing a full scan. Got ids: {ids:?}"
     );
+}
+
+#[test]
+fn diskann_stage_probe_set_reaches_last_record() {
+    let beam_width = 3;
+    let k = 3;
+    let dims = 2;
+    let n_records = 10;
+    let last_idx = n_records - 1;
+    let query = vec![0.0f32, 0.0];
+
+    let records: Vec<VectorRecord> = (0..n_records)
+        .map(|i| VectorRecord {
+            id: VectorId(i as u64),
+            data: if i == last_idx {
+                vec![0.001, 0.001]
+            } else {
+                vec![10.0 + i as f32, 10.0 + i as f32]
+            },
+            metadata: None,
+        })
+        .collect();
+
+    let shard = make_shard(records, dims);
+    let stage = DiskAnnCandidateStage::new(beam_width);
+
+    let results = stage
+        .search(&query, &shard, DistanceMetric::Euclidean, k)
+        .unwrap();
+    let ids: Vec<u64> = results.iter().map(|r| r.id.0).collect();
+
+    assert!(
+        ids.contains(&(last_idx as u64)),
+        "endpoint-inclusive probe set should include the tail record; got ids: {ids:?}"
+    );
+}
+
+#[test]
+fn diskann_stage_rejects_zero_beam_width() {
+    let panic = std::panic::catch_unwind(|| DiskAnnCandidateStage::new(0));
+    assert!(panic.is_err(), "beam_width = 0 must panic");
 }
 
 /// Verify that the returned candidate count equals `min(k, shard.len())`
@@ -277,6 +319,22 @@ fn diskann_stage_result_count_is_min_k_shard_len() {
             results.len()
         );
     }
+}
+
+#[test]
+fn diskann_stage_zero_k_returns_no_results() {
+    let beam_width = 8;
+    let dims = 2;
+    let records = make_records(30, dims);
+    let shard = make_shard(records.clone(), dims);
+    let stage = DiskAnnCandidateStage::new(beam_width);
+    let query = records[0].data.clone();
+
+    let results = stage
+        .search(&query, &shard, DistanceMetric::Euclidean, 0)
+        .unwrap();
+
+    assert!(results.is_empty(), "k = 0 should return no results");
 }
 
 // ── DiskAnnPlugin – pipeline wiring ──────────────────────────────────────────
