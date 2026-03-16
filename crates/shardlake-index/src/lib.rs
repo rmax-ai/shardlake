@@ -1,5 +1,6 @@
 //! Index building and approximate nearest-neighbour search.
 
+pub mod bm25;
 pub mod builder;
 pub mod cache;
 pub mod exact;
@@ -13,6 +14,7 @@ pub mod searcher;
 pub mod shard;
 pub mod validator;
 
+pub use bm25::{tokenize, BM25Params, Bm25Index, BM25_MAGIC};
 pub use builder::{BuildParams, IndexBuilder};
 pub use cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY};
 pub use exact::ExactSearcher;
