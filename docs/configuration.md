@@ -157,7 +157,7 @@ framework.
 |---------|-----------|-------------|
 | `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
 | `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
-| `DiskAnn` | `"diskann"` | Experimental beam-search backend inspired by the DiskANN algorithm. Euclidean metric only. See [DiskANN experiment](#diskann-experiment) below. |
+| `DiskAnn` | `"diskann"` | Experimental strided-probe backend loosely inspired by DiskANN. Euclidean metric only. See [DiskANN experiment](#diskann-experiment) below. |
 
 Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
 `CoreError::Other` with the list of valid choices.
@@ -227,9 +227,10 @@ construct `IvfPqPlugin::new(codebook)` directly.
 ### DiskANN experiment
 
 `DiskAnnPlugin` and its `DiskAnnCandidateStage` implement an experimental
-bounded-probe approximation over each shard's flat vector list.  The algorithm
-is inspired by the DiskANN greedy search strategy but does not require a
-persisted navigating graph.
+bounded-probe approximation over each shard's flat vector list. The algorithm
+uses deterministic strided sampling across each shard; it is only loosely
+inspired by DiskANN and does not implement DiskANN's navigable graph or greedy
+best-first search.
 
 **Query semantics**
 

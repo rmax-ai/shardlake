@@ -13,7 +13,7 @@
 //! |--------|--------|-------|
 //! | `"ivf_flat"` | [`IvfFlatPlugin`] | Exact (flat) distance scoring, all metrics supported |
 //! | `"ivf_pq"` | [`IvfPqPlugin`] | Product-quantised scoring, Euclidean only |
-//! | `"diskann"` | [`DiskAnnPlugin`] | Beam-search experiment, Euclidean only |
+//! | `"diskann"` | [`DiskAnnPlugin`] | Strided-probe experiment, Euclidean only |
 //!
 //! # Example – selecting a backend via the registry
 //!
@@ -183,7 +183,8 @@ pub const DISKANN_DEFAULT_BEAM_WIDTH: usize = 64;
 /// Limits per-shard distance computations to a bounded probe set
 /// (`max(k, beam_width)` records per shard, spread evenly by stride),
 /// delivering approximate / lower-latency search without requiring a
-/// persisted navigating-graph artifact.  Only supports
+/// persisted navigating-graph artifact.  This is a strided-probe experiment,
+/// not a graph-based beam search. Only supports
 /// [`DistanceMetric::Euclidean`].
 ///
 /// The `beam_width` parameter controls the trade-off between query latency
@@ -239,13 +240,14 @@ impl AnnPlugin for DiskAnnPlugin {
     }
 }
 
-/// Beam-search candidate stage for the DiskANN experiment path.
+/// Strided-probe candidate stage for the DiskANN experiment path.
 ///
 /// Limits per-shard exploration to a bounded probe set rather than scoring
 /// every record in the shard, giving the approximate / lower-latency property
-/// claimed by DiskANN-style search without requiring a persisted navigating
-/// graph.  Only Euclidean distance is supported; any other metric results in
-/// an [`IndexError`].
+/// claimed by this DiskANN-inspired experiment without requiring a persisted
+/// navigating graph. It does not implement DiskANN's graph traversal or greedy
+/// best-first search. Only Euclidean distance is supported; any other metric
+/// results in an [`IndexError`].
 ///
 /// # Algorithm
 ///

@@ -73,11 +73,12 @@ pub enum AnnFamily {
     IvfFlat,
     /// IVF with product-quantised distance scoring within each shard.
     IvfPq,
-    /// Experimental disk-based ANN backend inspired by the DiskANN algorithm.
+    /// Experimental ANN backend loosely inspired by DiskANN.
     ///
-    /// Uses a beam-search strategy over each shard's flat vector list.
-    /// Supports Euclidean distance only.  The beam width controls the
-    /// trade-off between query latency and recall quality.
+    /// Uses a bounded strided probe over each shard's flat vector list rather
+    /// than a navigable graph search. Supports Euclidean distance only. The
+    /// beam width acts as a probe budget that trades query latency against
+    /// recall quality.
     DiskAnn,
 }
 
