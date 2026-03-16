@@ -63,7 +63,7 @@ Execution guidance:
 - Use this fixed collection pipeline:
    1. Run `gh issue list --state open --limit 200 --json number,title,labels,assignees,author` once and derive the open `ready-to-implement` set, the open `implementation-in-progress` set, the open `epic` set, open issues without a parent epic, issues already assigned to `copilot-swe-agent`, and issues whose author login is outside the allowed set from that snapshot.
    2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
-   3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocking` and treat only blockers with `state != "closed"` as open blockers.
+   3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocked_by` and treat only blockers with `state != "closed"` as open blockers.
 - Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
 
 ```bash

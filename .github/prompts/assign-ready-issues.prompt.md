@@ -43,7 +43,7 @@ Execution guidance:
   1. Run `gh issue list --state open --label ready-to-implement --limit 200 --json number,title,assignees,labels,author` once to collect candidate issues.
   2. Run one fixed `gh api graphql` query over the repository's open epic issues to collect each epic's `subIssues` and each child issue's `number`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
   3. Derive whether each candidate still has a parent epic from that GraphQL sub-issue snapshot instead of from `gh issue view` JSON fields.
-  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints and treat only blockers with `state != "closed"` as open blockers.
+  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints by calling `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocked_by`, and treat only blockers with `state != "closed"` as open blockers.
 - Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
 
 ```bash
