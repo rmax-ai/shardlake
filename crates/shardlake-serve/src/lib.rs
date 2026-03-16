@@ -18,6 +18,8 @@ pub struct AppState {
     /// Default fan-out policy used when the query request does not supply
     /// per-request overrides.
     pub fan_out: FanOutPolicy,
+    /// Whether diagnostic HTTP routes are exposed.
+    pub debug_routes_enabled: bool,
     /// Prometheus metrics registry updated by request handlers.
     pub metrics: Arc<PrometheusMetrics>,
 }

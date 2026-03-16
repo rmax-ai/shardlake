@@ -10,6 +10,7 @@ pub mod merge;
 pub mod metrics;
 pub mod pipeline;
 pub mod pq;
+pub mod query_plan;
 pub mod ranking;
 pub mod searcher;
 pub mod shard;
@@ -30,6 +31,7 @@ pub use pipeline::{
     RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
 pub use pq::{PqCodebook, PqParams};
+pub use query_plan::QueryPlan;
 pub use ranking::{rank_hybrid, HybridRankingPolicy};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};

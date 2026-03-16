@@ -359,12 +359,14 @@ shardlake [--storage <PATH>] serve [OPTIONS]
 | `--candidate-shards <N>` | u32 | `0` | Cap the number of distinct shards probed after centroid-to-shard deduplication; `0` means no cap |
 | `--max-vectors-per-shard <N>` | u32 | `0` | Limit how many vectors are scored inside each probed shard; `0` means score the full shard |
 | `--shard-cache-capacity <N>` | usize | `128` | Maximum number of loaded shard indexes retained in the in-memory LRU cache |
+| `--enable-debug-routes` | bool flag | `false` | Expose diagnostic HTTP routes such as `POST /debug/query-plan`; disabled by default because they reveal internal routing details |
 
 ### Validation
 
 - `--nprobe` must be greater than or equal to 1.
 - `--candidate-shards` and `--max-vectors-per-shard` may be `0` to disable their respective caps.
 - `--shard-cache-capacity` must be greater than or equal to 1.
+- Diagnostic routes remain unavailable unless `--enable-debug-routes` is set explicitly.
 
 ### Example
 
@@ -375,6 +377,9 @@ shardlake serve \
   --bind 127.0.0.1:9090 \
   --nprobe 4 \
   --shard-cache-capacity 256
+
+# Opt in to local debug-only HTTP routes
+shardlake serve --enable-debug-routes
 ```
 
 See [API Reference](api-reference.md) for the HTTP endpoints.
