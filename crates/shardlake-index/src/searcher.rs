@@ -520,29 +520,32 @@ impl IndexSearcher {
 
             self.cache_metrics.record_miss();
             let started = Instant::now();
-            let bytes = self.store.get(&shard_def.artifact_key)?;
+            let load_result = (|| {
+                let bytes = self.store.get(&shard_def.artifact_key)?;
+                let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+                if shard.dims != self.manifest.dims as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} dims {} do not match manifest dims {}",
+                        shard.dims, self.manifest.dims
+                    )));
+                }
+                if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
+                        shard.pq_m, self.manifest.compression.pq_num_subspaces
+                    )));
+                }
+                if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
+                        shard.pq_k, self.manifest.compression.pq_codebook_size
+                    )));
+                }
+                Ok(shard)
+            })();
             self.cache_metrics
                 .record_load_attempt(started.elapsed().as_nanos() as u64);
-            let shard = Arc::new(PqShard::from_bytes(&bytes)?);
-            if shard.dims != self.manifest.dims as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} dims {} do not match manifest dims {}",
-                    shard.dims, self.manifest.dims
-                )));
-            }
-            if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
-                    shard.pq_m, self.manifest.compression.pq_num_subspaces
-                )));
-            }
-            if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
-                    shard.pq_k, self.manifest.compression.pq_codebook_size
-                )));
-            }
-            Ok(shard)
+            load_result
         })?;
 
         if matches!(access, crate::cache::CacheAccess::Hit) {
@@ -650,10 +653,10 @@ impl IndexSearcher {
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
             self.cache_metrics.record_miss();
             let started = Instant::now();
-            let result = self.load_raw_shard_uncached(&shard_def.artifact_key)?;
+            let result = self.load_raw_shard_uncached(&shard_def.artifact_key);
             self.cache_metrics
                 .record_load_attempt(started.elapsed().as_nanos() as u64);
-            Ok(Arc::new(result))
+            result.map(Arc::new)
         })?;
 
         match access {
@@ -772,6 +775,40 @@ mod tests {
         }
     }
 
+    struct FailingGetStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl ObjectStore for FailingGetStore {
+        fn put(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), StorageError> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> std::result::Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotFound(key.to_string()))
+        }
+
+        fn exists(&self, key: &str) -> std::result::Result<bool, StorageError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StorageError> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn local_path_for(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<std::path::PathBuf>, StorageError> {
+            let _ = key;
+            Ok(None)
+        }
+    }
+
     fn build_test_searcher(tmp: &tempfile::TempDir) -> IndexSearcher {
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
@@ -821,6 +858,51 @@ mod tests {
             })
             .unwrap();
         IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
+    }
+
+    fn build_metric_test_manifest(
+        tmp: &tempfile::TempDir,
+        index_version: &str,
+        pq_params: Option<crate::pq::PqParams>,
+    ) -> (Arc<LocalObjectStore>, shardlake_manifest::Manifest) {
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0, 0.5, 0.5],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0, 0.5, 0.5],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion(format!("ds-{index_version}")),
+                embedding_version: EmbeddingVersion(format!("emb-{index_version}")),
+                index_version: IndexVersion(index_version.into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: format!("datasets/ds-{index_version}/vectors.jsonl"),
+                metadata_key: format!("datasets/ds-{index_version}/metadata.json"),
+                pq_params,
+            })
+            .unwrap();
+        (store, manifest)
     }
 
     #[test]
@@ -1157,5 +1239,50 @@ mod tests {
             before,
             "hot shard should be cache-resident after warming"
         );
+    }
+
+    #[test]
+    fn load_shard_records_load_attempt_on_storage_error() {
+        let tmp = tempdir().unwrap();
+        let (store, manifest) = build_metric_test_manifest(&tmp, "idx-load-error-raw", None);
+        let failing_store = Arc::new(FailingGetStore {
+            inner: store as Arc<dyn ObjectStore>,
+        });
+        let searcher = IndexSearcher::new(failing_store as Arc<dyn ObjectStore>, manifest.clone());
+
+        let err = searcher
+            .load_shard(manifest.shards[0].shard_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("key not found"));
+
+        let snapshot = searcher.cache_metrics().snapshot();
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.total_load_count, 1);
+    }
+
+    #[test]
+    fn load_pq_shard_records_load_attempt_on_storage_error() {
+        let tmp = tempdir().unwrap();
+        let (store, manifest) = build_metric_test_manifest(
+            &tmp,
+            "idx-load-error-pq",
+            Some(crate::pq::PqParams {
+                num_subspaces: 2,
+                codebook_size: 4,
+            }),
+        );
+        let failing_store = Arc::new(FailingGetStore {
+            inner: store as Arc<dyn ObjectStore>,
+        });
+        let searcher = IndexSearcher::new(failing_store as Arc<dyn ObjectStore>, manifest.clone());
+
+        let err = searcher
+            .load_pq_shard(manifest.shards[0].shard_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("key not found"));
+
+        let snapshot = searcher.cache_metrics().snapshot();
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.total_load_count, 1);
     }
 }

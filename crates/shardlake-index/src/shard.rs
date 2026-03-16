@@ -91,7 +91,7 @@ impl ShardIndex {
     #[must_use]
     pub fn encoded_len(&self) -> u64 {
         let header_bytes = SHARD_MAGIC.len() as u64
-            + std::mem::size_of::<u32>() as u64 * 3
+            + std::mem::size_of::<u32>() as u64 * 4
             + std::mem::size_of::<u64>() as u64;
         let centroid_bytes =
             self.centroids.len() as u64 * self.dims as u64 * std::mem::size_of::<f32>() as u64;
@@ -204,7 +204,7 @@ impl PqShard {
     #[must_use]
     pub fn encoded_len(&self) -> u64 {
         let header_bytes = SHARD_MAGIC.len() as u64
-            + std::mem::size_of::<u32>() as u64 * 5
+            + std::mem::size_of::<u32>() as u64 * 6
             + std::mem::size_of::<u64>() as u64;
         let centroid_bytes =
             self.centroids.len() as u64 * self.dims as u64 * std::mem::size_of::<f32>() as u64;
@@ -340,6 +340,30 @@ mod tests {
     }
 
     #[test]
+    fn encoded_len_matches_serialized_size_for_raw_shards() {
+        let idx = ShardIndex {
+            shard_id: ShardId(7),
+            dims: 3,
+            centroids: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+            records: vec![
+                VectorRecord {
+                    id: VectorId(1),
+                    data: vec![1.0, 0.0, 0.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(2),
+                    data: vec![0.0, 1.0, 0.0],
+                    metadata: None,
+                },
+            ],
+        };
+
+        let bytes = idx.to_bytes().unwrap();
+        assert_eq!(idx.encoded_len(), bytes.len() as u64);
+    }
+
+    #[test]
     fn pq_shard_roundtrip() {
         let shard = PqShard {
             shard_id: ShardId(1),
@@ -365,6 +389,21 @@ mod tests {
         assert_eq!(decoded.entries[0].1, vec![3, 7]);
         assert_eq!(decoded.entries[1].0, VectorId(11));
         assert_eq!(decoded.entries[1].1, vec![0, 1]);
+    }
+
+    #[test]
+    fn encoded_len_matches_serialized_size_for_pq_shards() {
+        let shard = PqShard {
+            shard_id: ShardId(3),
+            dims: 4,
+            pq_m: 2,
+            pq_k: 8,
+            centroids: vec![vec![0.1, 0.2, 0.3, 0.4], vec![0.4, 0.3, 0.2, 0.1]],
+            entries: vec![(VectorId(10), vec![3, 7]), (VectorId(11), vec![0, 1])],
+        };
+
+        let bytes = shard.to_bytes().unwrap();
+        assert_eq!(shard.encoded_len(), bytes.len() as u64);
     }
 
     #[test]
