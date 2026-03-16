@@ -157,6 +157,7 @@ framework.
 |---------|-----------|-------------|
 | `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
 | `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
+| `DiskAnn` | `"diskann"` | Experimental beam-search backend inspired by the DiskANN algorithm. Euclidean metric only. See [DiskANN experiment](#diskann-experiment) below. |
 
 Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
 `CoreError::Other` with the list of valid choices.
@@ -184,7 +185,7 @@ constructed.  Then call `plugin.candidate_stage()` to wire the backend into a
 `QueryPipeline` without algorithm-specific branching:
 
 ```rust
-// No branching—both families use the same interface.
+// No branching—all families use the same interface.
 let plugin: &dyn AnnPlugin = &IvfFlatPlugin;
 plugin.validate(dims, DistanceMetric::Cosine).unwrap();
 let pipeline = QueryPipeline::builder(store, manifest)
@@ -198,6 +199,7 @@ let pipeline = QueryPipeline::builder(store, manifest)
 |--------|--------|-------|
 | `IvfFlatPlugin` | `"ivf_flat"` | No extra data needed; constructed directly. |
 | `IvfPqPlugin::new(codebook)` | `"ivf_pq"` | Requires a pre-trained `PqCodebook` loaded from storage. |
+| `DiskAnnPlugin::new(beam_width)` | `"diskann"` | Experiment; constructed directly with a beam width. |
 
 ### `AnnRegistry`
 
@@ -210,15 +212,53 @@ for name in AnnRegistry::families() { println!("{name}"); }
 
 // Check if a name is known.
 assert!(AnnRegistry::exists("ivf_flat"));
+assert!(AnnRegistry::exists("diskann"));
 assert!(!AnnRegistry::exists("hnsw"));
 
-// Get the IvfFlatPlugin directly (no runtime artifact needed).
+// Get a plugin that needs no runtime artifact.
 let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
+let plugin = AnnRegistry::get_flat("diskann").unwrap();
 ```
 
 For `"ivf_pq"`, `AnnRegistry::get_flat` returns a helpful error message
 explaining that the codebook must be supplied, which guides callers to
 construct `IvfPqPlugin::new(codebook)` directly.
+
+### DiskANN experiment
+
+`DiskAnnPlugin` and its `DiskAnnCandidateStage` implement an experimental
+beam-search approximation over each shard's flat vector list.  The algorithm
+is inspired by the DiskANN greedy search strategy but does not require a
+persisted navigating-spread-out graph (NSSG) artifact.
+
+**Constraints**
+
+- Only [`DistanceMetric::Euclidean`] is accepted.  Supplying a different metric
+  causes `validate()` to return an error before any pipeline is constructed.
+
+**Beam width**
+
+The `beam_width` parameter controls the candidate budget:
+
+| `beam_width` | Behaviour |
+|---|---|
+| Small (e.g. 16) | Explores fewer vectors per shard → lower latency, lower recall |
+| Large (e.g. 512) | Explores more vectors → higher recall, higher latency |
+| ≥ shard size | Degrades to exact flat scan, matching `"ivf_flat"` quality |
+
+The default beam width used by `AnnRegistry::get_flat("diskann")` is
+`DISKANN_DEFAULT_BEAM_WIDTH` (64).  Override it by constructing the plugin
+directly:
+
+```rust
+use shardlake_index::DiskAnnPlugin;
+
+let plugin = DiskAnnPlugin::new(128);
+plugin.validate(dims, DistanceMetric::Euclidean)?;
+let pipeline = QueryPipeline::builder(store, manifest)
+    .candidate_stage(plugin.candidate_stage())
+    .build();
+```
 
 ### Extending with a new backend
 

@@ -73,6 +73,12 @@ pub enum AnnFamily {
     IvfFlat,
     /// IVF with product-quantised distance scoring within each shard.
     IvfPq,
+    /// Experimental disk-based ANN backend inspired by the DiskANN algorithm.
+    ///
+    /// Uses a beam-search strategy over each shard's flat vector list.
+    /// Supports Euclidean distance only.  The beam width controls the
+    /// trade-off between query latency and recall quality.
+    DiskAnn,
 }
 
 impl AnnFamily {
@@ -81,6 +87,7 @@ impl AnnFamily {
         match self {
             Self::IvfFlat => "ivf_flat",
             Self::IvfPq => "ivf_pq",
+            Self::DiskAnn => "diskann",
         }
     }
 }
@@ -104,8 +111,9 @@ impl std::str::FromStr for AnnFamily {
         match s {
             "ivf_flat" => Ok(Self::IvfFlat),
             "ivf_pq" => Ok(Self::IvfPq),
+            "diskann" => Ok(Self::DiskAnn),
             other => Err(crate::error::CoreError::Other(format!(
-                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq"
+                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, diskann"
             ))),
         }
     }
