@@ -419,3 +419,33 @@ fn merge_produces_correct_shard_summary() {
     assert_eq!(summary.min_shard_vector_count, actual_min);
     assert_eq!(summary.max_shard_vector_count, actual_max);
 }
+
+#[test]
+fn merge_preserves_plan_build_metadata() {
+    let tmp = tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+    let config = SystemConfig {
+        storage_root: tmp.path().to_path_buf(),
+        num_shards: 2,
+        kmeans_iters: 7,
+        nprobe: 5,
+        kmeans_seed: 1234,
+        kmeans_sample_size: Some(10),
+        ..SystemConfig::default()
+    };
+    let records = two_cluster_records();
+
+    let (plan, outputs) = plan_and_execute_all(&store, &config, &records, "idx-merge-meta");
+    let manifest = merge_worker_outputs(&plan, outputs, default_merge_params()).unwrap();
+
+    assert_eq!(manifest.build_metadata.num_kmeans_iters, 7);
+    assert_eq!(manifest.build_metadata.nprobe_default, 5);
+    assert_eq!(
+        manifest.algorithm.params.get("kmeans_seed"),
+        Some(&serde_json::json!(1234))
+    );
+    assert_eq!(
+        manifest.algorithm.params.get("kmeans_sample_size"),
+        Some(&serde_json::json!(10))
+    );
+}

@@ -118,6 +118,19 @@ pub struct WorkerPlan {
     /// Number of workers actually used (may be less than requested when there
     /// are fewer non-empty shards than requested workers).
     pub num_workers: usize,
+    /// Number of K-means iterations used during planning.
+    #[serde(default = "default_kmeans_iters")]
+    pub kmeans_iters: u32,
+    /// RNG seed used for K-means centroid initialisation.
+    #[serde(default = "default_kmeans_seed")]
+    pub kmeans_seed: u64,
+    /// Effective bounded sample size used during centroid training, when
+    /// sampling actually occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kmeans_sample_size: Option<u32>,
+    /// Default `nprobe` value to record in the final manifest.
+    #[serde(default = "default_nprobe")]
+    pub nprobe_default: u32,
     /// Storage key of the trained IVF coarse-quantizer artifact.
     pub coarse_quantizer_key: String,
     /// All non-empty shard centroids, one per shard, in `ShardId` order.
@@ -135,6 +148,18 @@ impl WorkerPlan {
     pub fn assignment(&self, worker_id: usize) -> Option<&WorkerAssignment> {
         self.assignments.get(worker_id)
     }
+}
+
+fn default_kmeans_iters() -> u32 {
+    20
+}
+
+fn default_kmeans_seed() -> u64 {
+    shardlake_core::config::DEFAULT_KMEANS_SEED
+}
+
+fn default_nprobe() -> u32 {
+    SystemConfig::default().nprobe
 }
 
 // ─── Output types ────────────────────────────────────────────────────────────
@@ -353,10 +378,11 @@ pub fn merge_worker_outputs(
     let mut algo_params = std::collections::BTreeMap::new();
     algo_params.insert("num_clusters".into(), serde_json::json!(total_shards));
     algo_params.insert("num_shards".into(), serde_json::json!(total_shards));
-    algo_params.insert(
-        "kmeans_iters".into(),
-        serde_json::json!(params.num_kmeans_iters),
-    );
+    algo_params.insert("kmeans_iters".into(), serde_json::json!(plan.kmeans_iters));
+    algo_params.insert("kmeans_seed".into(), serde_json::json!(plan.kmeans_seed));
+    if let Some(sample_size) = plan.kmeans_sample_size {
+        algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
+    }
 
     let manifest = Manifest {
         manifest_version: 4,
@@ -373,8 +399,8 @@ pub fn merge_worker_outputs(
         build_metadata: BuildMetadata {
             built_at: params.built_at,
             builder_version: params.builder_version,
-            num_kmeans_iters: params.num_kmeans_iters,
-            nprobe_default: params.nprobe_default,
+            num_kmeans_iters: plan.kmeans_iters,
+            nprobe_default: plan.nprobe_default,
             build_duration_secs: params.build_duration_secs,
         },
         algorithm: AlgorithmMetadata {
@@ -459,24 +485,28 @@ pub fn plan_workers(
     let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
     // Optionally sample a subset for centroid training (same logic as IndexBuilder).
-    let sampled: Option<Vec<Vec<f32>>> = match config.kmeans_sample_size {
-        Some(0) => {
-            return Err(IndexError::Other(
-                "kmeans_sample_size must be greater than 0".into(),
-            ))
-        }
-        Some(max_samples) => {
-            let sample_size = (max_samples as usize).min(vecs.len());
-            if sample_size >= vecs.len() {
-                None
-            } else {
-                let mut indices: Vec<usize> = (0..vecs.len()).collect();
-                let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
-                Some(shuffled.iter().map(|&i| vecs[i].clone()).collect())
+    let (sampled, effective_sample_size): (Option<Vec<Vec<f32>>>, Option<u32>) =
+        match config.kmeans_sample_size {
+            Some(0) => {
+                return Err(IndexError::Other(
+                    "kmeans_sample_size must be greater than 0".into(),
+                ))
             }
-        }
-        None => None,
-    };
+            Some(max_samples) => {
+                let sample_size = (max_samples as usize).min(vecs.len());
+                if sample_size >= vecs.len() {
+                    (None, None)
+                } else {
+                    let mut indices: Vec<usize> = (0..vecs.len()).collect();
+                    let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
+                    (
+                        Some(shuffled.iter().map(|&i| vecs[i].clone()).collect()),
+                        Some(sample_size as u32),
+                    )
+                }
+            }
+            None => (None, None),
+        };
     let training_vecs: &[Vec<f32>] = sampled.as_deref().unwrap_or(&vecs);
 
     info!(
@@ -563,6 +593,10 @@ pub fn plan_workers(
         vectors_key: params.vectors_key,
         metadata_key: params.metadata_key,
         num_workers,
+        kmeans_iters: config.kmeans_iters,
+        kmeans_seed: config.kmeans_seed,
+        kmeans_sample_size: effective_sample_size,
+        nprobe_default: config.nprobe,
         coarse_quantizer_key: cq_key,
         shard_centroids,
         assignments,
@@ -974,6 +1008,34 @@ mod tests {
             all_shard_ids, expected,
             "every shard must be assigned exactly once"
         );
+    }
+
+    #[test]
+    fn plan_workers_records_build_metadata() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 7,
+            nprobe: 5,
+            kmeans_seed: 1234,
+            kmeans_sample_size: Some(10),
+            ..SystemConfig::default()
+        };
+
+        let plan = plan_workers(
+            &store,
+            &config,
+            &two_cluster_records(),
+            plan_params("idx-plan-meta"),
+        )
+        .unwrap();
+
+        assert_eq!(plan.kmeans_iters, 7);
+        assert_eq!(plan.kmeans_seed, 1234);
+        assert_eq!(plan.kmeans_sample_size, Some(10));
+        assert_eq!(plan.nprobe_default, 5);
     }
 
     #[test]

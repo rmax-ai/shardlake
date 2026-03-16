@@ -323,6 +323,10 @@ dataset vectors without reloading the coarse-quantizer artifact.
   "vectors_key": "datasets/ds-v1/vectors.jsonl",
   "metadata_key": "datasets/ds-v1/metadata.json",
   "num_workers": 2,
+  "kmeans_iters": 20,
+  "kmeans_seed": 3735928559,
+  "kmeans_sample_size": 50000,
+  "nprobe_default": 2,
   "coarse_quantizer_key": "indexes/idx-v1/coarse_quantizer.cq",
   "shard_centroids": [[0.1, 0.2, ...], [0.9, 0.8, ...]],
   "assignments": [
@@ -342,6 +346,10 @@ dataset vectors without reloading the coarse-quantizer artifact.
 | `vectors_key` | Storage key of the dataset vectors JSONL file. |
 | `metadata_key` | Storage key of the dataset metadata JSON file. |
 | `num_workers` | Actual number of workers (may be less than requested when fewer shards exist). |
+| `kmeans_iters` | Number of K-means iterations used during planning. Reused by merge when writing `build_metadata.num_kmeans_iters`. |
+| `kmeans_seed` | RNG seed used for centroid initialisation. Reused by merge when writing `algorithm.params.kmeans_seed`. |
+| `kmeans_sample_size` | Effective bounded sample size used for centroid training, when sampling actually occurred. |
+| `nprobe_default` | Default `nprobe` captured during planning and copied into the final manifest. |
 | `coarse_quantizer_key` | Storage key of the trained IVF coarse-quantizer artifact. |
 | `shard_centroids` | All non-empty shard centroids, one per shard, in `shard_id` order. Inline so workers do not need to load the `.cq` file. |
 | `assignments` | Per-worker shard assignments. |

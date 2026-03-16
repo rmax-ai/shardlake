@@ -340,10 +340,8 @@ async fn run_merge(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
         alias: args.alias,
         built_at: Utc::now(),
         builder_version: env!("CARGO_PKG_VERSION").to_string(),
-        num_kmeans_iters: args.kmeans_iters,
-        // Use the system default nprobe; the distributed plan does not capture
-        // the original nprobe value, so the merge step records the default.
-        nprobe_default: SystemConfig::default().nprobe,
+        num_kmeans_iters: plan.kmeans_iters,
+        nprobe_default: plan.nprobe_default,
         // Wall-clock duration is not tracked across distributed workers; record
         // zero to indicate this field was not measured for this build mode.
         build_duration_secs: 0.0,
@@ -720,6 +718,94 @@ mod tests {
         let manifest: shardlake_manifest::Manifest = serde_json::from_slice(&raw).unwrap();
         assert_eq!(manifest.index_version.0, "idx-merge-cli");
         assert!(!manifest.shards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_mode_preserves_plan_build_metadata() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        write_test_dataset(&store, "ds-merge-meta", 2);
+
+        run(
+            tmp.path().to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Plan,
+                dataset_version: Some("ds-merge-meta".into()),
+                index_version: Some("idx-merge-meta".into()),
+                embedding_version: None,
+                metric: DistanceMetric::Euclidean,
+                num_shards: 2,
+                kmeans_iters: 7,
+                kmeans_seed: 1234,
+                kmeans_sample_size: Some(10),
+                num_workers: 2,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let plan_bytes = store
+            .get(&paths::worker_plan_key("idx-merge-meta"))
+            .unwrap();
+        let plan: WorkerPlan = serde_json::from_slice(&plan_bytes).unwrap();
+
+        for worker_id in 0..plan.num_workers {
+            run(
+                tmp.path().to_path_buf(),
+                BuildIndexWorkerArgs {
+                    mode: WorkerMode::Execute,
+                    dataset_version: None,
+                    index_version: Some("idx-merge-meta".into()),
+                    embedding_version: None,
+                    metric: DistanceMetric::Euclidean,
+                    num_shards: 2,
+                    kmeans_iters: 999,
+                    kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                    kmeans_sample_size: None,
+                    num_workers: 2,
+                    worker_id: Some(worker_id),
+                    alias: "latest".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        run(
+            tmp.path().to_path_buf(),
+            BuildIndexWorkerArgs {
+                mode: WorkerMode::Merge,
+                dataset_version: None,
+                index_version: Some("idx-merge-meta".into()),
+                embedding_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 2,
+                kmeans_iters: 999,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                num_workers: 1,
+                worker_id: None,
+                alias: "latest".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest_key = paths::index_manifest_key("idx-merge-meta");
+        let raw = store.get(&manifest_key).unwrap();
+        let manifest: shardlake_manifest::Manifest = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(manifest.build_metadata.num_kmeans_iters, 7);
+        assert_eq!(manifest.build_metadata.nprobe_default, 2);
+        assert_eq!(
+            manifest.algorithm.params.get("kmeans_seed"),
+            Some(&serde_json::json!(1234))
+        );
+        assert_eq!(
+            manifest.algorithm.params.get("kmeans_sample_size"),
+            Some(&serde_json::json!(10))
+        );
     }
 
     #[tokio::test]
