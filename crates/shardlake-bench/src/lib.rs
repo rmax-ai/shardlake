@@ -126,10 +126,12 @@ pub struct WorkloadReport {
     pub workload: WorkloadMode,
     /// Observed cache hit rate during the measured pass (0.0 – 1.0).
     ///
-    /// For [`WorkloadMode::Cold`] this is always `0.0` (fresh cache per
-    /// query).  For [`WorkloadMode::Warm`] it will be close to `1.0` after
-    /// the warm-up pass.  For [`WorkloadMode::Mixed`] it reflects the
-    /// aggregate proportion of shard accesses that were served from cache.
+    /// For [`WorkloadMode::Cold`] the cache starts empty before every query,
+    /// but legacy manifests may still observe intra-query hits when routing
+    /// and scoring touch the same shard. For [`WorkloadMode::Warm`] it will be
+    /// close to `1.0` after the warm-up pass. For [`WorkloadMode::Mixed`] it
+    /// reflects the aggregate proportion of shard accesses that were served
+    /// from cache.
     pub cache_hit_rate: f64,
     /// Core benchmark statistics (flattened into this struct for JSON output).
     #[serde(flatten)]
@@ -150,9 +152,9 @@ pub struct WorkloadReport {
 /// * `metric`   – Distance metric for ground-truth computation.
 /// * `workload` – Workload simulation mode (cold / warm / mixed).
 ///
-/// # Panics
+/// # Returns
 ///
-/// Does not panic; returns a zeroed report when `queries` is empty.
+/// Returns a zeroed report when `queries` is empty.
 #[allow(clippy::too_many_arguments)]
 pub fn run_workload_benchmark(
     store: &Arc<dyn ObjectStore>,
@@ -194,6 +196,8 @@ pub fn run_workload_benchmark(
             // empty shard cache at the start of each request.
             let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
             let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
+            let mut total_hits = 0_u64;
+            let mut total_misses = 0_u64;
 
             let wall_start = Instant::now();
             for query in queries {
@@ -207,12 +211,18 @@ pub fn run_workload_benchmark(
 
                 let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
                 recalls.push(recall_at_k(&gt_ids, &approx_ids));
+                let (hits, misses) = searcher.cache_access_counts();
+                total_hits = total_hits.saturating_add(hits);
+                total_misses = total_misses.saturating_add(misses);
             }
             let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
 
-            // By construction the cache is always empty at the start of each
-            // query, so the effective hit rate across the run is 0.0.
-            (latencies_us, recalls, 0.0_f64, wall_elapsed_secs)
+            (
+                latencies_us,
+                recalls,
+                hit_rate(total_hits, total_misses),
+                wall_elapsed_secs,
+            )
         }
 
         WorkloadMode::Warm => {
@@ -1184,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn run_workload_benchmark_cold_mode_records_zero_cache_hit_rate() {
+    fn run_workload_benchmark_cold_mode_starts_with_a_fresh_cache_per_query() {
         let tmp = tempdir().unwrap();
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let records = make_records(20, 4);
@@ -1211,13 +1221,49 @@ mod tests {
         );
 
         assert_eq!(report.workload, WorkloadMode::Cold);
-        assert_eq!(
-            report.cache_hit_rate, 0.0,
-            "cold workload must have 0.0 hit rate"
-        );
         assert_eq!(report.benchmark.num_queries, 5);
+        assert!((0.0..=1.0).contains(&report.cache_hit_rate));
         assert!((0.0..=1.0).contains(&report.benchmark.recall_at_k));
         assert!(report.benchmark.throughput_qps > 0.0);
+    }
+
+    #[test]
+    fn run_workload_benchmark_cold_mode_counts_intra_query_hits_for_legacy_manifests() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let mut manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        manifest.manifest_version = 1;
+        for shard in &mut manifest.shards {
+            shard.centroid.clear();
+        }
+
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let store_arc: Arc<dyn ObjectStore> = store;
+
+        let report = run_workload_benchmark(
+            &store_arc,
+            &manifest,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            WorkloadMode::Cold,
+        );
+
+        assert_eq!(report.workload, WorkloadMode::Cold);
+        assert!(
+            report.cache_hit_rate > 0.0,
+            "legacy manifests should count intra-query cache hits in cold mode"
+        );
+        assert!(report.cache_hit_rate < 1.0);
     }
 
     #[test]

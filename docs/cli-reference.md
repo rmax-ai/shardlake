@@ -301,7 +301,7 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 |--------|-------------|
 | Workload | Simulation mode used (`cold`, `warm`, or `mixed`) |
 | Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
-| Cache hit rate | Fraction of shard loads served from in-memory cache (0.0 = fully cold, 1.0 = fully warm) |
+| Cache hit rate | Fraction of raw-shard loads served from in-memory cache during the measured pass; lower values indicate colder behaviour, while `cold` mode still resets the cache before each query |
 | Mean latency | Average per-query ANN search time in microseconds |
 | P99 latency | 99th-percentile per-query ANN search time in microseconds |
 | Throughput | Wall-clock query throughput in queries per second (qps) |
