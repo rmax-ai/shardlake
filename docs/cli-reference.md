@@ -193,7 +193,7 @@ multiple independent workers, each responsible for a subset of shards.  Use
 this instead of `build-index` when the dataset is too large to build on a
 single machine, or when you want to parallelize shard construction.
 
-The workflow has two phases: **`plan`** and **`execute`**.
+The workflow has three phases: **`plan`**, **`execute`**, and **`merge`**.
 
 ### Phase 1 – `plan`
 
@@ -300,6 +300,58 @@ for WORKER_ID in 0 1 2 3; do
     --index-version idx-v1 \
     --worker-id $WORKER_ID
 done
+```
+
+---
+
+### Phase 3 – `merge`
+
+Collects all worker `output.json` descriptors for the given index version,
+validates that every shard in the plan is covered exactly once, and assembles
+the final `manifest.json`.  Run this **once** after all workers have finished
+their `execute` phase.
+
+#### Usage
+
+```
+shardlake [--storage <PATH>] build-index-worker --mode merge \
+  --index-version <STRING> [OPTIONS]
+```
+
+#### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(required)* | Index version to merge (must match the prior `plan` and `execute` runs) |
+| `--alias <STRING>` | string | `latest` | Alias to record in the generated manifest |
+
+#### Output
+
+Writes to `<storage>/indexes/<index-version>/`:
+
+| File | Description |
+|------|-------------|
+| `manifest.json` | Final index manifest (shard list, vector counts, fingerprints, centroids) |
+
+#### Validation
+
+The merge step rejects inputs that are incomplete, duplicate, or inconsistent:
+
+| Error | Condition |
+|-------|-----------|
+| Missing worker output | A `workers/<id>/output.json` file is absent for any worker ID in `0..num_workers` |
+| Duplicate shard | The same `shard_id` appears in more than one worker's output |
+| Missing shard | A shard in the plan has no corresponding entry in any worker output |
+| Index version mismatch | A worker output's `index_version` differs from the plan |
+| Out-of-range worker ID | A worker output's `worker_id` is ≥ `num_workers` |
+
+#### Example
+
+```bash
+# After all workers have completed the execute phase:
+shardlake build-index-worker --mode merge \
+  --index-version idx-v1 \
+  --alias latest
 ```
 
 ---
