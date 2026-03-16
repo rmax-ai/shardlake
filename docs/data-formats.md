@@ -607,12 +607,15 @@ you can combine them with an explicit weighted policy using
 lists independently (min–max, lower-is-better) and then blends them:
 
 ```
-hybrid_score = vector_weight × vector_norm + bm25_weight × bm25_norm
+hybrid_score =
+  (vector_weight × vector_norm + bm25_weight × bm25_norm)
+  / (vector_weight + bm25_weight)
 ```
 
 A candidate that appears in only one list receives a normalized score of `1.0`
 (worst) for the missing signal.  Ties are broken by `VectorId` ascending for
-a fully deterministic order.
+a fully deterministic order, and the final score stays in `[0, 1]` even when
+the weights do not sum to `1.0`.
 
 ```rust
 use shardlake_core::types::{SearchResult, VectorId};

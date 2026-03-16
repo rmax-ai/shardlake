@@ -27,11 +27,15 @@
 //! The hybrid score for each candidate is:
 //!
 //! ```text
-//! hybrid_score = vector_weight × vector_norm + bm25_weight × bm25_norm
+//! hybrid_score =
+//!   (vector_weight × vector_norm + bm25_weight × bm25_norm)
+//!   / (vector_weight + bm25_weight)
 //! ```
 //!
 //! where `vector_norm` and `bm25_norm` are the normalized scores for that
-//! candidate.  A lower `hybrid_score` still means a better result.
+//! candidate. This keeps the output score in the `[0, 1]` range even when the
+//! weights do not sum to `1.0`. A lower `hybrid_score` still means a better
+//! result.
 //!
 //! # Missing-signal behavior
 //!
@@ -168,8 +172,8 @@ impl Default for HybridRankingPolicy {
 /// 0 or both input lists are empty.
 ///
 /// The output `score` field on each returned [`SearchResult`] contains the raw
-/// **hybrid score** (the weighted sum of the two normalized scores, in the
-/// \[0, 1\] range).  A lower score means a better result.
+/// **hybrid score** (the weighted average of the two normalized scores, in the
+/// \[0, 1\] range). A lower score means a better result.
 ///
 /// Metadata is preserved: if a candidate appears in both lists, the metadata
 /// from `vector_results` takes precedence; if it appears in only one list its
@@ -200,10 +204,10 @@ pub fn rank_hybrid(
         .map(|(r, norm)| (r.id, (norm, r.metadata)))
         .collect();
 
-    let bm25_map: HashMap<VectorId, f32> = bm25_results
+    let bm25_map: HashMap<VectorId, (f32, Option<serde_json::Value>)> = bm25_results
         .into_iter()
         .zip(bm25_norm)
-        .map(|(r, norm)| (r.id, norm))
+        .map(|(r, norm)| (r.id, (norm, r.metadata)))
         .collect();
 
     // Collect the union of all candidate IDs.
@@ -222,21 +226,28 @@ pub fn rank_hybrid(
     // Use `remove` on `vector_map` to take ownership of each entry's metadata
     // rather than cloning it out of a shared reference.
     let mut vector_map = vector_map;
+    let mut bm25_map = bm25_map;
+    let total_weight = policy.vector_weight + policy.bm25_weight;
     let mut candidates: Vec<SearchResult> = all_ids
         .into_iter()
         .map(|id| {
-            let (v_norm, metadata) = vector_map.remove(&id).unwrap_or((1.0_f32, None));
-            let b_norm = bm25_map.get(&id).copied().unwrap_or(1.0_f32);
+            let (v_norm, vector_metadata) = vector_map.remove(&id).unwrap_or((1.0_f32, None));
+            let (b_norm, bm25_metadata) = bm25_map.remove(&id).unwrap_or((1.0_f32, None));
 
             // If both weights are concentrated on one signal, only that
             // signal's score participates (missing signal contributes 0 × 1.0
             // when the weight for that signal is 0.0, which is correct).
-            let hybrid_score = policy.vector_weight * v_norm + policy.bm25_weight * b_norm;
+            let weighted_sum = policy.vector_weight * v_norm + policy.bm25_weight * b_norm;
+            let hybrid_score = if total_weight.is_finite() && total_weight > 0.0 {
+                weighted_sum / total_weight
+            } else {
+                weighted_sum
+            };
 
             SearchResult {
                 id,
                 score: hybrid_score,
-                metadata,
+                metadata: vector_metadata.or(bm25_metadata),
             }
         })
         .collect();
@@ -258,40 +269,41 @@ pub fn rank_hybrid(
 /// Min–max normalize a slice of [`SearchResult`] scores to the \[0, 1\] range.
 ///
 /// Returns a `Vec<f32>` of the same length as `results`, each value in \[0, 1\].
-/// When `results` is empty or all scores are identical (or NaN), every
-/// normalized value is `0.0`.
+/// When `results` is empty or every score is `NaN`, every normalized value is
+/// `0.0`. If at least one finite score exists, `NaN` entries are treated as the
+/// worst possible normalized value (`1.0`).
 fn normalize_scores(results: &[SearchResult]) -> Vec<f32> {
     if results.is_empty() {
         return Vec::new();
     }
 
-    // Fold to find min and max, treating NaN as worst (positive infinity).
-    let (min_score, max_score) =
-        results
-            .iter()
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |acc, r| {
-                let s = if r.score.is_nan() {
-                    f32::INFINITY
-                } else {
-                    r.score
-                };
-                (acc.0.min(s), acc.1.max(s))
-            });
+    let mut finite_scores = results.iter().filter_map(|result| {
+        if result.score.is_nan() {
+            None
+        } else {
+            Some(result.score)
+        }
+    });
+
+    let Some(first_score) = finite_scores.next() else {
+        return vec![0.0_f32; results.len()];
+    };
+
+    let (min_score, max_score) = finite_scores.fold((first_score, first_score), |acc, score| {
+        (acc.0.min(score), acc.1.max(score))
+    });
 
     let range = max_score - min_score;
 
     results
         .iter()
         .map(|r| {
-            let s = if r.score.is_nan() {
-                f32::INFINITY
-            } else {
-                r.score
-            };
-            if range == 0.0 || range.is_nan() {
+            if r.score.is_nan() {
+                1.0_f32
+            } else if range == 0.0 || range.is_nan() {
                 0.0_f32
             } else {
-                (s - min_score) / range
+                (r.score - min_score) / range
             }
         })
         .collect()
@@ -420,6 +432,22 @@ mod tests {
         let norms = normalize_scores(&results);
         assert!((norms[0] - 0.0).abs() < 1e-6); // best → 0
         assert!((norms[2] - 1.0).abs() < 1e-6); // worst → 1
+    }
+
+    #[test]
+    fn normalize_nan_scores_with_finite_scores_penalizes_nan_entries() {
+        let results = vec![sr(1, 0.2), sr(2, f32::NAN), sr(3, 0.8)];
+        let norms = normalize_scores(&results);
+        assert!((norms[0] - 0.0).abs() < 1e-6);
+        assert!((norms[1] - 1.0).abs() < 1e-6);
+        assert!((norms[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_all_nan_scores_returns_zeroes() {
+        let results = vec![sr(1, f32::NAN), sr(2, f32::NAN)];
+        let norms = normalize_scores(&results);
+        assert_eq!(norms, vec![0.0, 0.0]);
     }
 
     // ── rank_hybrid ───────────────────────────────────────────────────────────
@@ -634,5 +662,39 @@ mod tests {
                 r.id
             );
         }
+    }
+
+    #[test]
+    fn rank_hybrid_non_unit_weights_still_return_zero_one_scores() {
+        let policy = HybridRankingPolicy {
+            vector_weight: 3.0,
+            bm25_weight: 7.0,
+        };
+        let vector = vec![sr(1, 0.0), sr(2, 1.0)];
+        let bm25 = vec![sr(1, -4.0), sr(2, -1.0)];
+        let ranked = rank_hybrid(vector, bm25, &policy, 2);
+        for result in ranked {
+            assert!(
+                result.score >= 0.0 && result.score <= 1.0,
+                "hybrid score out of [0,1]: {} for id {}",
+                result.score,
+                result.id
+            );
+        }
+    }
+
+    #[test]
+    fn rank_hybrid_preserves_bm25_only_metadata() {
+        let policy = HybridRankingPolicy::default();
+        let bm25 = vec![SearchResult {
+            id: VectorId(7),
+            score: -2.0,
+            metadata: Some(serde_json::json!({"source": "bm25"})),
+        }];
+        let ranked = rank_hybrid(vec![], bm25, &policy, 1);
+        assert_eq!(
+            ranked[0].metadata,
+            Some(serde_json::json!({"source": "bm25"}))
+        );
     }
 }

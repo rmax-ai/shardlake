@@ -164,11 +164,14 @@ reusable from any query or search path and is independent of transport layers.
 
 2. **Combine** — the hybrid score for each candidate is:
 
-   ```
-   hybrid_score = vector_weight × vector_norm + bm25_weight × bm25_norm
-   ```
+    ```
+    hybrid_score =
+      (vector_weight × vector_norm + bm25_weight × bm25_norm)
+      / (vector_weight + bm25_weight)
+    ```
 
-   A lower `hybrid_score` remains the best result.
+    This keeps the final score in the `[0, 1]` range even when the weights do
+    not sum to `1.0`. A lower `hybrid_score` remains the best result.
 
 3. **Missing-signal handling** — a candidate that appears in only one list
    receives a normalized score of `1.0` (worst) for the missing signal.
