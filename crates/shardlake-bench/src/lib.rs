@@ -78,13 +78,17 @@ pub struct CostMetrics {
 /// * `store` – Object store used to list and measure artifact sizes.
 /// * `manifest` – Manifest of the index being measured.
 pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -> CostMetrics {
-    let disk_footprint_bytes: u64 = store
-        .list(paths::indexes_prefix())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|k| store.get(k).ok())
-        .map(|b| b.len() as u64)
-        .sum();
+    let disk_footprint_bytes: u64 = match store.list(paths::indexes_prefix()) {
+        Ok(keys) => keys
+            .iter()
+            .filter_map(|k| store.get(k).ok())
+            .map(|b| b.len() as u64)
+            .sum(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list index artifacts; disk_footprint_bytes will be 0");
+            0
+        }
+    };
 
     let total_vectors = manifest.total_vector_count;
     let dims = manifest.dims as u64;
@@ -95,8 +99,13 @@ pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -
         if manifest.compression.enabled && manifest.compression.codec == "pq8" {
             let m = manifest.compression.pq_num_subspaces as u64;
             let k = manifest.compression.pq_codebook_size as u64;
-            // Guard against a zero-subspace value (malformed manifest).
+            // Guard against a zero-subspace value (malformed manifest): fall back
+            // to the uncompressed estimate and warn the caller.
             if m == 0 {
+                tracing::warn!(
+                    "manifest has pq8 compression enabled but pq_num_subspaces is 0; \
+                     falling back to uncompressed memory estimate"
+                );
                 (raw_vector_bytes, 1.0)
             } else {
                 let sub_dims = dims / m;
