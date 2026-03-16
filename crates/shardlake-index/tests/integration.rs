@@ -852,4 +852,22 @@ fn hnsw_build_rejects_invalid_hnsw_config() {
         err.to_string().contains("m must be"),
         "invalid HNSW config should be rejected: {err}"
     );
+    assert!(
+        !store
+            .exists(&paths::index_shard_key("idx-hnsw-inv", 0))
+            .unwrap(),
+        "invalid HNSW config must fail before shard artifacts are written"
+    );
+    assert!(
+        !store
+            .exists(&paths::index_coarse_quantizer_key("idx-hnsw-inv"))
+            .unwrap(),
+        "invalid HNSW config must fail before the coarse quantizer is written"
+    );
+    assert!(
+        !store
+            .exists(&paths::index_manifest_key("idx-hnsw-inv"))
+            .unwrap(),
+        "invalid HNSW config must fail before the manifest is written"
+    );
 }

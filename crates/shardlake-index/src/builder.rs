@@ -138,6 +138,20 @@ impl<'a> IndexBuilder<'a> {
             ));
         }
 
+        let resolved_ann_family = ann_family.unwrap_or(AnnFamily::IvfFlat);
+        let resolved_hnsw_config = match resolved_ann_family {
+            AnnFamily::Hnsw => {
+                let config = hnsw_config.unwrap_or_default();
+                config.validate()?;
+                Some(config)
+            }
+            AnnFamily::DiskAnn => {
+                AnnRegistry::get_flat(AnnFamily::DiskAnn.as_str())?.validate(dims, metric)?;
+                None
+            }
+            _ => None,
+        };
+
         let build_start = std::time::Instant::now();
 
         let n = records.len();
@@ -350,11 +364,11 @@ impl<'a> IndexBuilder<'a> {
         }
 
         // Select the algorithm name and record backend-specific params when requested.
-        let algo_name = match ann_family {
-            Some(AnnFamily::Hnsw) => {
-                let hnsw = hnsw_config.unwrap_or_default();
-                hnsw.validate()
-                    .map_err(|e| IndexError::Other(e.to_string()))?;
+        let algo_name = match resolved_ann_family {
+            AnnFamily::Hnsw => {
+                let hnsw = resolved_hnsw_config
+                    .as_ref()
+                    .expect("resolved HNSW config must exist for HNSW family");
                 algo_params.insert("hnsw_m".into(), serde_json::json!(hnsw.m));
                 algo_params.insert(
                     "hnsw_ef_construction".into(),
@@ -363,11 +377,8 @@ impl<'a> IndexBuilder<'a> {
                 algo_params.insert("hnsw_ef_search".into(), serde_json::json!(hnsw.ef_search));
                 "hnsw"
             }
-            Some(AnnFamily::DiskAnn) => {
-                AnnRegistry::get_flat(AnnFamily::DiskAnn.as_str())?.validate(dims, metric)?;
-                "diskann"
-            }
-            _ => "ivf-flat",
+            AnnFamily::DiskAnn => "diskann",
+            AnnFamily::IvfFlat | AnnFamily::IvfPq => "ivf-flat",
         };
 
         let compression = if let Some(ref cb) = codebook {

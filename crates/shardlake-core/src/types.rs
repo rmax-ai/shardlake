@@ -121,7 +121,7 @@ impl std::str::FromStr for AnnFamily {
             "hnsw" => Ok(Self::Hnsw),
             "diskann" => Ok(Self::DiskAnn),
             other => Err(crate::error::CoreError::Other(format!(
-                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, diskann"
+                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, hnsw, diskann"
             ))),
         }
     }
