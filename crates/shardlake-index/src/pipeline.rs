@@ -24,7 +24,7 @@ use rayon::prelude::*;
 use tracing::{debug, debug_span};
 
 use shardlake_core::{
-    config::PrefetchPolicy,
+    config::{PrefetchPolicy, QueryConfig},
     error::CoreError,
     types::{DistanceMetric, SearchResult, ShardId, VectorRecord},
 };
@@ -123,8 +123,8 @@ impl RouteStage for CentroidRouter {
             .into_iter()
             .filter_map(|index| centroid_to_shard.get(index).copied())
             .collect();
-        shard_ids.sort();
-        shard_ids.dedup();
+        let mut seen = HashSet::new();
+        shard_ids.retain(|shard_id| seen.insert(*shard_id));
         shard_ids
     }
 }
@@ -327,6 +327,7 @@ pub const MMAP_MIN_SIZE_BYTES: u64 = 1024 * 1024;
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
+/// use shardlake_core::config::QueryConfig;
 /// use shardlake_index::pipeline::{MmapShardLoader, QueryPipeline};
 /// use shardlake_manifest::Manifest;
 /// use shardlake_storage::LocalObjectStore;
@@ -335,7 +336,8 @@ pub const MMAP_MIN_SIZE_BYTES: u64 = 1024 * 1024;
 ///     let pipeline = QueryPipeline::builder(Arc::clone(&store) as Arc<_>, manifest.clone())
 ///         .with_loader(Box::new(MmapShardLoader::new(store, manifest)))
 ///         .build();
-///     let results = pipeline.run(&[1.0, 0.0], 10, 2).unwrap();
+///     let config = QueryConfig { top_k: 10, ..QueryConfig::default() };
+///     let results = pipeline.run(&[1.0, 0.0], &config).unwrap();
 ///     println!("{} results", results.len());
 /// }
 /// ```
@@ -602,9 +604,22 @@ impl QueryPipeline {
     }
 
     /// Execute a query through all pipeline stages.
-    pub fn run(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
+    ///
+    /// `config` controls every aspect of query execution:
+    /// - [`QueryConfig::top_k`] — number of results to return.
+    /// - [`QueryConfig::fan_out`] — centroid / shard fan-out policy;
+    ///   `candidate_shards` cap is applied after routing.
+    /// - [`QueryConfig::rerank_limit`] — absolute cap on candidates passed to
+    ///   the reranker; falls back to `top_k × rerank_oversample` when `None`.
+    /// - [`QueryConfig::distance_metric`] — per-query metric override;
+    ///   defaults to the manifest metric when `None`.
+    pub fn run(&self, query: &[f32], config: &QueryConfig) -> Result<Vec<SearchResult>> {
+        config.validate()?;
+        let k = config.top_k;
         let expected_dims = self.manifest.dims as usize;
-        let metric = self.manifest.distance_metric;
+        let metric = config
+            .distance_metric
+            .unwrap_or(self.manifest.distance_metric);
 
         let embedded = self.embedder.embed(query)?;
         if embedded.len() != expected_dims {
@@ -643,16 +658,30 @@ impl QueryPipeline {
             return Ok(Vec::new());
         }
 
-        let probe_shards = self
-            .router
-            .route(&embedded, &all_centroids, &centroid_to_shard, nprobe);
+        let nprobe = config.fan_out.candidate_centroids as usize;
+        let mut probe_shards =
+            self.router
+                .route(&embedded, &all_centroids, &centroid_to_shard, nprobe);
+
+        // Apply candidate_shards cap (0 = no cap).
+        if config.fan_out.candidate_shards > 0 {
+            probe_shards.truncate(config.fan_out.candidate_shards as usize);
+        }
+
         debug!(n_shards = probe_shards.len(), "Probing shards");
 
-        let candidates_per_shard = if self.reranker.is_some() {
-            k.saturating_mul(self.rerank_oversample).max(k)
+        // Determine how many candidates to collect per shard before merging.
+        // When a reranker is active, collect more candidates so the reranker
+        // has a richer pool to choose from.
+        let rerank_target = if self.reranker.is_some() {
+            config.rerank_limit.map_or_else(
+                || k.saturating_mul(self.rerank_oversample).max(k),
+                |limit| limit.max(k),
+            )
         } else {
             k
         };
+        let candidates_per_shard = rerank_target;
 
         type PerShardSearchOutput = (Vec<SearchResult>, Option<Arc<ShardIndex>>);
 
@@ -695,7 +724,7 @@ impl QueryPipeline {
             }
         }
 
-        let merged = self.merge.merge(all_results, candidates_per_shard);
+        let merged = self.merge.merge(all_results, rerank_target);
         if let Some(reranker) = &self.reranker {
             let candidate_ids: HashSet<_> = merged.iter().map(|result| result.id).collect();
             let mut probed_records = Vec::with_capacity(candidate_ids.len());
@@ -716,9 +745,9 @@ impl QueryPipeline {
         }
     }
 
-    /// Backward-compatible alias for [`QueryPipeline::run`].
-    pub fn search(&self, query: &[f32], k: usize, nprobe: usize) -> Result<Vec<SearchResult>> {
-        self.run(query, k, nprobe)
+    /// Alias for [`QueryPipeline::run`].
+    pub fn search(&self, query: &[f32], config: &QueryConfig) -> Result<Vec<SearchResult>> {
+        self.run(query, config)
     }
 }
 
@@ -871,7 +900,7 @@ mod tests {
     use super::*;
     use crate::builder::{BuildParams, IndexBuilder};
     use shardlake_core::{
-        config::SystemConfig,
+        config::{QueryConfig, SystemConfig},
         types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId},
     };
     use shardlake_storage::LocalObjectStore;
@@ -937,6 +966,43 @@ mod tests {
     }
 
     #[test]
+    fn centroid_router_preserves_probe_order_when_deduplicating() {
+        let router = CentroidRouter;
+        let shards = router.route(
+            &[0.0, 0.0],
+            &[
+                vec![10.0, 10.0],
+                vec![0.0, 0.0],
+                vec![0.2, 0.2],
+                vec![0.1, 0.1],
+            ],
+            &[ShardId(9), ShardId(2), ShardId(9), ShardId(1)],
+            4,
+        );
+        assert_eq!(shards, vec![ShardId(2), ShardId(1), ShardId(9)]);
+    }
+
+    #[test]
+    fn run_rejects_invalid_query_config() {
+        let records = make_records(10, 4);
+        let query = records[0].data.clone();
+        let pipeline = build_pipeline(records);
+        let error = pipeline
+            .run(
+                &query,
+                &QueryConfig {
+                    top_k: 0,
+                    ..QueryConfig::default()
+                },
+            )
+            .expect_err("invalid config should be rejected");
+        assert!(matches!(
+            error,
+            IndexError::Core(CoreError::InvalidQueryConfig(_))
+        ));
+    }
+
+    #[test]
     fn exact_candidate_search_returns_nearest() {
         let stage = ExactCandidateSearch;
         let shard = ShardIndex {
@@ -981,8 +1047,24 @@ mod tests {
         let records = make_records(10, 4);
         let query = records[0].data.clone();
         let pipeline = build_pipeline(records);
-        let from_run = pipeline.run(&query, 3, 2).unwrap();
-        let from_search = pipeline.search(&query, 3, 2).unwrap();
+        let from_run = pipeline
+            .run(
+                &query,
+                &QueryConfig {
+                    top_k: 3,
+                    ..QueryConfig::default()
+                },
+            )
+            .unwrap();
+        let from_search = pipeline
+            .search(
+                &query,
+                &QueryConfig {
+                    top_k: 3,
+                    ..QueryConfig::default()
+                },
+            )
+            .unwrap();
         let run_ids: Vec<_> = from_run.iter().map(|result| result.id).collect();
         let search_ids: Vec<_> = from_search.iter().map(|result| result.id).collect();
         assert_eq!(run_ids, search_ids);
@@ -1020,7 +1102,19 @@ mod tests {
             .rerank_stage(Arc::new(NoopReranker))
             .rerank_oversample(0)
             .build();
-        let results = pipeline.run(&query, 3, 1).unwrap();
+        let results = pipeline
+            .run(
+                &query,
+                &QueryConfig {
+                    top_k: 3,
+                    fan_out: shardlake_core::config::FanOutPolicy {
+                        candidate_centroids: 1,
+                        ..Default::default()
+                    },
+                    ..QueryConfig::default()
+                },
+            )
+            .unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -1066,7 +1160,17 @@ mod tests {
         let records = make_records(10, 4);
         let query = records[0].data.clone();
         let pipeline = build_pipeline(records);
-        let (_, span_names) = collect_spans(|| pipeline.run(&query, 3, 2).unwrap());
+        let (_, span_names) = collect_spans(|| {
+            pipeline
+                .run(
+                    &query,
+                    &QueryConfig {
+                        top_k: 3,
+                        ..QueryConfig::default()
+                    },
+                )
+                .unwrap()
+        });
 
         assert!(
             span_names.iter().any(|name| name == "shard_load"),
@@ -1112,7 +1216,17 @@ mod tests {
             .rerank_stage(Arc::new(ExactRerankStage))
             .rerank_oversample(2)
             .build();
-        let (_, span_names) = collect_spans(|| pipeline.run(&query, 3, 2).unwrap());
+        let (_, span_names) = collect_spans(|| {
+            pipeline
+                .run(
+                    &query,
+                    &QueryConfig {
+                        top_k: 3,
+                        ..QueryConfig::default()
+                    },
+                )
+                .unwrap()
+        });
 
         assert!(
             span_names.iter().any(|name| name == "rerank"),

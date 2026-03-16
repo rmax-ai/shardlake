@@ -194,6 +194,20 @@ impl IndexSearcher {
         k: usize,
         policy: &FanOutPolicy,
     ) -> Result<Vec<SearchResult>> {
+        self.search_with_metric(query, k, policy, self.manifest.distance_metric)
+    }
+
+    /// Perform approximate top-k search using an explicit distance `metric`.
+    ///
+    /// This is primarily used by callers that expose per-query metric overrides
+    /// while reusing the same loaded index artifacts.
+    pub fn search_with_metric(
+        &self,
+        query: &[f32],
+        k: usize,
+        policy: &FanOutPolicy,
+        metric: DistanceMetric,
+    ) -> Result<Vec<SearchResult>> {
         let expected_dims = self.manifest.dims as usize;
         if query.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
@@ -202,7 +216,6 @@ impl IndexSearcher {
             }));
         }
 
-        let metric: DistanceMetric = self.manifest.distance_metric;
         let pq_enabled =
             self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
@@ -377,7 +390,20 @@ impl IndexSearcher {
     pub fn rerank(
         &self,
         query: &[f32],
+        candidates: Vec<SearchResult>,
+    ) -> Result<Vec<SearchResult>> {
+        self.rerank_with_metric(query, candidates, self.manifest.distance_metric)
+    }
+
+    /// Rerank ANN candidates using an explicit distance `metric`.
+    ///
+    /// This allows transport layers to honor per-query metric overrides without
+    /// rebuilding the index or mutating the manifest-wide default.
+    pub fn rerank_with_metric(
+        &self,
+        query: &[f32],
         mut candidates: Vec<SearchResult>,
+        metric: DistanceMetric,
     ) -> Result<Vec<SearchResult>> {
         if candidates.is_empty() {
             return Ok(candidates);
@@ -391,7 +417,6 @@ impl IndexSearcher {
             }));
         }
 
-        let metric = self.manifest.distance_metric;
         let mut remaining_ids: HashSet<VectorId> =
             candidates.iter().map(|result| result.id).collect();
 
