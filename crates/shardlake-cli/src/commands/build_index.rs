@@ -71,9 +71,10 @@ pub struct BuildIndexArgs {
     ///
     /// When set, the build is driven through the distributed worker pipeline
     /// (plan → parallel execute → merge) entirely in-process, distributing
-    /// shard construction across `--num-workers` Rayon threads.  The produced
-    /// manifest is identical to a sequential `build-index` run with the same
-    /// arguments.
+    /// shard construction across `--num-workers` Rayon threads. It produces
+    /// equivalent shard artifacts to a sequential `build-index` run with the
+    /// same arguments, although build metadata like timestamps and duration can
+    /// differ.
     ///
     /// Omit this flag (default) to use the classic single-threaded
     /// [`IndexBuilder`] path.
@@ -93,6 +94,7 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
     validate_kmeans_sample_size(args.kmeans_sample_size)?;
     if let Some(nw) = args.num_workers {
         anyhow::ensure!(nw > 0, "--num-workers must be greater than 0");
+        anyhow::ensure!(args.parallel, "--num-workers requires --parallel");
     }
 
     let store = LocalObjectStore::new(&storage)?;
@@ -222,6 +224,7 @@ fn run_parallel_build(
         effective_workers > 0,
         "--num-workers must be greater than 0"
     );
+    let start = Instant::now();
 
     info!(
         effective_workers,
@@ -244,6 +247,11 @@ fn run_parallel_build(
         },
     )?;
 
+    let plan_key = shardlake_storage::paths::worker_plan_key(&index_ver.0);
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    store.put(&plan_key, plan_bytes)?;
+    info!(key = %plan_key, "Parallel build: worker plan written");
+
     info!(
         workers = plan.num_workers,
         shards = plan.shard_centroids.len(),
@@ -254,8 +262,6 @@ fn run_parallel_build(
     // Wrap records in an Arc so each Rayon task can borrow them cheaply.
     // The store reference is shared directly; LocalObjectStore is Send + Sync.
     let records_arc = Arc::new(records);
-
-    let start = Instant::now();
 
     // Execute all workers in parallel using Rayon.  Each worker is
     // independent: it builds its assigned shards and writes shard artifacts
@@ -380,6 +386,33 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--kmeans-sample-size must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_num_workers_without_parallel_before_loading_dataset() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexArgs {
+                dataset_version: "missing-dataset".into(),
+                embedding_version: None,
+                index_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 1,
+                kmeans_iters: 20,
+                nprobe: 2,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                parallel: false,
+                num_workers: Some(1),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--num-workers requires --parallel"));
     }
 
     #[tokio::test]
@@ -545,8 +578,15 @@ mod tests {
         .unwrap();
 
         let manifest = Manifest::load(&store, &IndexVersion("idx-par".into())).unwrap();
+        let plan_bytes = store
+            .get(&paths::worker_plan_key("idx-par"))
+            .expect("parallel build should persist worker plan");
+        let plan: shardlake_index::WorkerPlan = serde_json::from_slice(&plan_bytes).unwrap();
+
         assert_eq!(manifest.total_vector_count, 4);
         assert!(!manifest.shards.is_empty());
+        assert_eq!(plan.index_version.0, "idx-par");
+        assert_eq!(plan.num_workers, 2);
     }
 
     #[tokio::test]
