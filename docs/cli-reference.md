@@ -338,10 +338,12 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 For a PQ-compressed index the `cost_metrics` block reflects the reduced in-memory representation:
 
 ```json
-"cost_metrics": {
-  "memory_usage_bytes": 850000,
-  "disk_footprint_bytes": 184320,
-  "compression_ratio": 16.0
+{
+  "cost_metrics": {
+    "memory_usage_bytes": 850000,
+    "disk_footprint_bytes": 184320,
+    "compression_ratio": 16.0
+  }
 }
 ```
 

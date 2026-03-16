@@ -1,5 +1,5 @@
-//! Benchmark harness: recall@k vs exact baseline, latency, artifact size.
-//! Also provides partition evaluation utilities and cost-estimation metrics.
+//! Benchmark harness: recall@k vs exact baseline, latency, and cost metrics.
+//! Also provides partition evaluation utilities.
 
 pub mod generate;
 
@@ -19,7 +19,7 @@ use shardlake_core::{
 use shardlake_index::{
     exact::{exact_search, precision_at_k, recall_at_k},
     kmeans::top_n_centroids,
-    IndexSearcher, Result as IndexResult,
+    IndexSearcher, Result as IndexResult, PQ8_CODEC,
 };
 use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
@@ -84,8 +84,8 @@ pub struct CostMetrics {
 pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -> CostMetrics {
     let disk_footprint_bytes: u64 = index_artifact_keys(manifest)
         .into_iter()
-        .filter_map(|key| match store.get(&key) {
-            Ok(bytes) => Some(bytes.len() as u64),
+        .filter_map(|key| match artifact_size_bytes(store.as_ref(), &key) {
+            Ok(size) => Some(size),
             Err(err) => {
                 tracing::warn!(
                     artifact_key = %key,
@@ -100,10 +100,10 @@ pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -
     let total_vectors = manifest.total_vector_count;
     let dims = manifest.dims as u64;
     // f32 is 4 bytes per component.
-    let raw_vector_bytes = total_vectors * dims * 4;
+    let raw_vector_bytes = saturating_product(&[total_vectors, dims, 4], "raw_vector_bytes");
 
     let (memory_usage_bytes, compression_ratio) =
-        if manifest.compression.enabled && manifest.compression.codec == "pq8" {
+        if manifest.compression.enabled && manifest.compression.codec == PQ8_CODEC {
             let m = manifest.compression.pq_num_subspaces as u64;
             let k = manifest.compression.pq_codebook_size as u64;
             // Guard against a zero-subspace value (malformed manifest): fall back
@@ -117,10 +117,10 @@ pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -
             } else {
                 let sub_dims = dims / m;
                 // Encoded vectors: one byte per sub-space per vector.
-                let encoded_bytes = total_vectors * m;
+                let encoded_bytes = saturating_product(&[total_vectors, m], "encoded_bytes");
                 // Codebook: M centroids-tables each with K × sub_dims f32 values.
-                let codebook_bytes = m * k * sub_dims * 4;
-                let memory = encoded_bytes + codebook_bytes;
+                let codebook_bytes = saturating_product(&[m, k, sub_dims, 4], "codebook_bytes");
+                let memory = saturating_add(encoded_bytes, codebook_bytes, "memory_usage_bytes");
                 let ratio = (dims as f64 * 4.0) / m as f64;
                 (memory, ratio)
             }
@@ -133,6 +133,51 @@ pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -
         disk_footprint_bytes,
         compression_ratio,
     }
+}
+
+fn artifact_size_bytes(store: &dyn ObjectStore, key: &str) -> shardlake_storage::Result<u64> {
+    if let Some(path) = store.local_path_for(key)? {
+        match std::fs::metadata(&path) {
+            Ok(metadata) => return Ok(metadata.len()),
+            Err(err) => {
+                tracing::warn!(
+                    artifact_key = %key,
+                    path = %path.display(),
+                    error = %err,
+                    "failed to stat local artifact path while computing disk footprint; falling back to object read"
+                );
+            }
+        }
+    }
+
+    store.get(key).map(|bytes| bytes.len() as u64)
+}
+
+fn saturating_product(parts: &[u64], metric_name: &str) -> u64 {
+    parts
+        .iter()
+        .copied()
+        .try_fold(1_u64, |acc, value| acc.checked_mul(value))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                metric = metric_name,
+                factors = ?parts,
+                "overflow while computing benchmark cost metrics; saturating to u64::MAX"
+            );
+            u64::MAX
+        })
+}
+
+fn saturating_add(left: u64, right: u64, metric_name: &str) -> u64 {
+    left.checked_add(right).unwrap_or_else(|| {
+        tracing::warn!(
+            metric = metric_name,
+            left,
+            right,
+            "overflow while computing benchmark cost metrics; saturating to u64::MAX"
+        );
+        u64::MAX
+    })
 }
 
 fn index_artifact_keys(manifest: &Manifest) -> BTreeSet<String> {
@@ -613,7 +658,13 @@ pub fn evaluate_partitioning(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use super::nearest_rank_percentile;
     use super::*;
@@ -629,6 +680,51 @@ mod tests {
     };
     use shardlake_storage::{LocalObjectStore, ObjectStore};
     use tempfile::tempdir;
+
+    struct CountingLocalPathStore {
+        inner: LocalObjectStore,
+        get_calls: AtomicUsize,
+    }
+
+    impl CountingLocalPathStore {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                inner: LocalObjectStore::new(root).unwrap(),
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ObjectStore for CountingLocalPathStore {
+        fn put(&self, key: &str, data: Vec<u8>) -> shardlake_storage::Result<()> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> shardlake_storage::Result<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+
+        fn exists(&self, key: &str) -> shardlake_storage::Result<bool> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> shardlake_storage::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> shardlake_storage::Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn local_path_for(&self, key: &str) -> shardlake_storage::Result<Option<PathBuf>> {
+            self.inner.local_path_for(key)
+        }
+    }
 
     fn make_records(n: usize, dims: usize) -> Vec<VectorRecord> {
         (0..n)
@@ -1165,6 +1261,62 @@ mod tests {
         let metrics = compute_cost_metrics(&store_arc, &manifest);
 
         assert_eq!(metrics.memory_usage_bytes, 0);
+        assert_eq!(metrics.compression_ratio, 1.0);
+    }
+
+    #[test]
+    fn cost_metrics_use_local_paths_without_reading_artifacts() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(CountingLocalPathStore::new(tmp.path()));
+        let records = make_records(10, 4);
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            pq_enabled: false,
+            pq_num_subspaces: SystemConfig::default_pq_num_subspaces(),
+            pq_codebook_size: SystemConfig::default_pq_codebook_size(),
+            ..SystemConfig::default()
+        };
+        let manifest = IndexBuilder::new(&store.inner, &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-local-path".into()),
+                embedding_version: EmbeddingVersion("emb-local-path".into()),
+                index_version: IndexVersion("idx-local-path".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-local-path"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-local-path"),
+                pq_params: None,
+            })
+            .unwrap();
+
+        let store_arc: Arc<dyn ObjectStore> = store.clone();
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        assert!(metrics.disk_footprint_bytes > 0);
+        assert_eq!(store.get_calls(), 0);
+    }
+
+    #[test]
+    fn cost_metrics_saturate_on_overflow() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(4, 4);
+        let mut manifest = build_test_index(store.as_ref(), records, 1, tmp.path().to_path_buf());
+        manifest.total_vector_count = u64::MAX;
+        manifest.dims = u32::MAX;
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &manifest);
+
+        assert_eq!(metrics.memory_usage_bytes, u64::MAX);
         assert_eq!(metrics.compression_ratio, 1.0);
     }
 }
