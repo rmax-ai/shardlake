@@ -126,12 +126,151 @@ mod tests {
     }
 
     #[test]
+    fn test_distance_euclidean() {
+        let a = [3.0f32, 4.0];
+        let b = [0.0f32, 0.0];
+        let dist = distance(&a, &b, DistanceMetric::Euclidean);
+        assert!((dist - 5.0).abs() < 1e-6, "expected 5.0, got {dist}");
+    }
+
+    #[test]
+    fn test_distance_cosine_identical_direction() {
+        // Parallel vectors have cosine distance 0.
+        let a = [1.0f32, 0.0];
+        let b = [2.0f32, 0.0];
+        let dist = distance(&a, &b, DistanceMetric::Cosine);
+        assert!(dist.abs() < 1e-6, "expected 0.0, got {dist}");
+    }
+
+    #[test]
+    fn test_distance_cosine_orthogonal() {
+        // Orthogonal vectors have cosine similarity 0, so distance = 1.
+        let a = [1.0f32, 0.0];
+        let b = [0.0f32, 1.0];
+        let dist = distance(&a, &b, DistanceMetric::Cosine);
+        assert!((dist - 1.0).abs() < 1e-6, "expected 1.0, got {dist}");
+    }
+
+    #[test]
+    fn test_distance_cosine_opposite_direction() {
+        // Antiparallel vectors have cosine similarity -1, so distance = 2.
+        let a = [1.0f32, 0.0];
+        let b = [-1.0f32, 0.0];
+        let dist = distance(&a, &b, DistanceMetric::Cosine);
+        assert!((dist - 2.0).abs() < 1e-6, "expected 2.0, got {dist}");
+    }
+
+    #[test]
+    fn test_distance_cosine_zero_vector_returns_one() {
+        // When either vector is the zero vector the distance is 1.0 by convention.
+        let a = [0.0f32, 0.0];
+        let b = [1.0f32, 0.0];
+        let dist = distance(&a, &b, DistanceMetric::Cosine);
+        assert!((dist - 1.0).abs() < 1e-6, "expected 1.0, got {dist}");
+    }
+
+    #[test]
+    fn test_distance_inner_product_negated_dot() {
+        // InnerProduct returns -dot(a, b) so that lower = better.
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
+        let expected = -(1.0 * 4.0 + 2.0 * 5.0 + 3.0 * 6.0); // -32
+        let dist = distance(&a, &b, DistanceMetric::InnerProduct);
+        assert!(
+            (dist - expected).abs() < 1e-5,
+            "expected {expected}, got {dist}"
+        );
+    }
+
+    #[test]
     fn test_exact_search_euclidean() {
         let records = make_records();
         let query = [1.0f32, 0.1];
         let results = exact_search(&query, &records, DistanceMetric::Euclidean, 2);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, VectorId(1));
+    }
+
+    #[test]
+    fn test_exact_search_cosine() {
+        // query points mostly along x-axis: id=1 ([1,0]) should be the closest by
+        // cosine similarity, and id=2 ([0,1]) should be the farthest.
+        let records = make_records();
+        let query = [1.0f32, 0.0];
+        let results = exact_search(&query, &records, DistanceMetric::Cosine, 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].id,
+            VectorId(1),
+            "id=1 should be nearest by cosine"
+        );
+        // id=2 is orthogonal (distance=1.0); id=3 is at 45° (distance < 1.0)
+        assert_eq!(
+            results[2].id,
+            VectorId(2),
+            "id=2 (orthogonal) should be farthest by cosine"
+        );
+    }
+
+    #[test]
+    fn test_exact_search_inner_product() {
+        // For inner product (negated dot), the vector with the largest dot product
+        // with the query wins (has the smallest/most-negative score).
+        // query = [1, 1], records: id=1 [1,0] dot=1, id=2 [0,1] dot=1, id=3 [1,1] dot=2
+        let records = make_records();
+        let query = [1.0f32, 1.0];
+        let results = exact_search(&query, &records, DistanceMetric::InnerProduct, 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].id,
+            VectorId(3),
+            "id=3 ([1,1]) has the largest dot product with [1,1]"
+        );
+    }
+
+    #[test]
+    fn test_exact_search_cosine_vs_euclidean_differ() {
+        // Construct records where cosine and euclidean rankings differ:
+        //   id=1: [10, 0]  — far from query [1, 0] in L2, but identical direction (cosine dist=0)
+        //   id=2: [1, 0]   — nearest in L2 as well, identical direction (cosine dist=0)
+        //   id=3: [0.1, 1.0] — mixed angle: closer in L2 than id=1, but nonzero cosine distance
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![10.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![0.1, 1.0],
+                metadata: None,
+            },
+        ];
+        let query = [1.0f32, 0.0];
+
+        let euclidean = exact_search(&query, &records, DistanceMetric::Euclidean, 3);
+        let cosine = exact_search(&query, &records, DistanceMetric::Cosine, 3);
+
+        // Euclidean: id=2 (dist 0) < id=1 (dist 9) < id=3 (dist ~1.0)
+        assert_eq!(euclidean[0].id, VectorId(2));
+        // Cosine: id=1 and id=2 are tied (same direction); id=3 has nonzero angle
+        // Both id=1 and id=2 have cosine distance 0 from [1,0]; id=3 is farther.
+        let cosine_top2_ids: std::collections::HashSet<_> =
+            cosine[..2].iter().map(|r| r.id).collect();
+        assert!(
+            cosine_top2_ids.contains(&VectorId(1)),
+            "id=1 should be in top-2 by cosine"
+        );
+        assert!(
+            cosine_top2_ids.contains(&VectorId(2)),
+            "id=2 should be in top-2 by cosine"
+        );
+        assert_eq!(cosine[2].id, VectorId(3), "id=3 should be last by cosine");
     }
 
     #[test]
