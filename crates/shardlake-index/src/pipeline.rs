@@ -31,6 +31,7 @@ use shardlake_storage::ObjectStore;
 use crate::{
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    merge::GlobalMerge,
     metrics::CacheMetrics,
     pq::PqCodebook,
     shard::ShardIndex,
@@ -272,11 +273,14 @@ impl CandidateSearchStage for PqCandidateStage {
 }
 
 /// Merge stage that keeps the best `k` scored candidates with deduplication.
+///
+/// Delegates to [`GlobalMerge`] so ordering is deterministic: results are
+/// sorted by score ascending with vector ID as a tie-breaker.
 pub struct TopKMerge;
 
 impl MergeStage for TopKMerge {
     fn merge(&self, results: Vec<SearchResult>, k: usize) -> Vec<SearchResult> {
-        merge_top_k(results, k)
+        GlobalMerge.merge(results, k)
     }
 }
 
@@ -460,7 +464,7 @@ impl QueryPipelineBuilder {
             router: Arc::new(CentroidRouter),
             loader: None,
             candidate_search: Arc::new(ExactCandidateSearch),
-            merge: Arc::new(TopKMerge),
+            merge: Arc::new(GlobalMerge),
             reranker: None,
             rerank_oversample: 1,
         }

@@ -4,6 +4,7 @@ pub mod builder;
 pub mod exact;
 pub mod ivf;
 pub mod kmeans;
+pub mod merge;
 pub mod metrics;
 pub mod pipeline;
 pub mod pq;
@@ -14,6 +15,7 @@ pub mod validator;
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
+pub use merge::GlobalMerge;
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,

@@ -137,8 +137,15 @@ fn pipeline_matches_searcher_results() {
         };
         let searcher_results = searcher.search(&query, 5, &policy).unwrap();
         let pipeline_results = pipeline.run(&query, 5, 2).unwrap();
-        let searcher_ids: Vec<VectorId> = searcher_results.iter().map(|result| result.id).collect();
-        let pipeline_ids: Vec<VectorId> = pipeline_results.iter().map(|result| result.id).collect();
+        let mut searcher_ids: Vec<VectorId> =
+            searcher_results.iter().map(|result| result.id).collect();
+        let mut pipeline_ids: Vec<VectorId> =
+            pipeline_results.iter().map(|result| result.id).collect();
+        // Sort both before comparing: the two implementations may break ties
+        // between equidistant vectors differently due to floating-point
+        // precision, so we only verify that the same candidate set is found.
+        searcher_ids.sort();
+        pipeline_ids.sort();
         assert_eq!(
             searcher_ids, pipeline_ids,
             "query {index} should match searcher results"
