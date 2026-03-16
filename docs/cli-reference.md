@@ -154,13 +154,35 @@ shardlake [--storage <PATH>] build-index --dataset-version <STRING> [OPTIONS]
 | `--kmeans-seed <N>` | u64 | `3735928559` | RNG seed for K-means centroid initialisation. Use the same seed with identical inputs to reproduce shard layout and manifest fingerprints. |
 | `--kmeans-sample-size <N>` | u32 | use all vectors | Maximum number of vectors to use for K-means centroid training. Values must be greater than 0. When set below the dataset size, `build-index` draws a reproducible random sample using `--kmeans-seed` before training centroids, then still assigns every vector to its nearest centroid. |
 | `--nprobe <N>` | u32 | `2` | Default number of shards to probe at query time (recorded in manifest) |
-| `--ann-family <FAMILY>` | enum | `ivf_flat` | ANN candidate-search algorithm to use within each shard: `ivf_flat` (exact brute-force, all metrics) or `hnsw` (HNSW graph-based, all metrics). The chosen family is recorded in `manifest.algorithm.algorithm` and used automatically at query and eval time. |
+| `--ann-family <FAMILY>` | enum | `ivf_flat` | Candidate-search backend recorded in `manifest.algorithm.algorithm`: `ivf_flat` (exact brute-force, all metrics), `hnsw` (HNSW-labelled exact-search baseline, all metrics), or `diskann` (strided-probe experiment, Euclidean only). |
+| `--parallel` | flag | `false` | Enable local parallel build. Distributes shard construction across `--num-workers` Rayon threads using the distributed worker pipeline (plan → execute → merge) entirely in-process. It produces equivalent shard artifacts to a sequential build with the same arguments, although build metadata such as timestamps and duration can differ. |
+| `--num-workers <N>` | usize | Rayon thread count | Number of parallel workers when `--parallel` is set. Values larger than `--num-shards` are clamped to the number of non-empty shards. Must be greater than 0 when provided, and requires `--parallel`. |
 
 ### Validation
 
 - `--num-shards` must be greater than 0.
 - `--kmeans-sample-size`, when provided, must be greater than 0 and is capped to the dataset size before sampling.
+- `--num-workers`, when provided, must be greater than 0 and requires `--parallel`.
 - The stored dataset must contain vectors whose dimensions match the dataset metadata written during `ingest`; index building fails if any record is inconsistent.
+
+### Parallel build
+
+The `--parallel` flag exposes a local parallel build path that runs the same
+three-phase distributed workflow used by `build-index-worker` entirely
+in-process:
+
+1. **Plan** – trains the IVF coarse quantizer and partitions shards across
+   `--num-workers` workers.
+2. **Execute** – all workers run concurrently in a Rayon thread pool; each
+   builds its assigned shards and writes shard artifacts to storage.
+3. **Merge** – the worker outputs are collected and assembled into the final
+   `manifest.json`.
+
+Use `--parallel` when the dataset is large enough that distributing shard
+writes across CPU cores meaningfully reduces wall-clock build time, without
+needing the multi-process coordination of the `build-index-worker` workflow.
+Omit `--parallel` (the default) to use the simpler single-pass
+`IndexBuilder` path.
 
 ### Output
 
@@ -170,10 +192,14 @@ Writes to `<storage>/indexes/<index-version>/`:
 |------|-------------|
 | `manifest.json` | Full manifest JSON (see [Data Formats](data-formats.md)) |
 | `shards/shard-NNNN.sidx` | Binary shard index file for each non-empty shard |
+| `coarse_quantizer.cq` | Trained IVF coarse-quantizer artifact |
+| `worker_plan.json` | Worker shard assignment plan (parallel build only) |
+| `workers/NNNN/output.json` | Per-worker intermediate output metadata (parallel build only) |
 
-### Example
+### Examples
 
 ```bash
+# Sequential build (default)
 shardlake build-index \
   --dataset-version ds-v1 \
   --index-version idx-v1 \
@@ -183,16 +209,35 @@ shardlake build-index \
   --kmeans-sample-size 50000 \
   --metric cosine \
   --nprobe 3
-```
 
-To build an HNSW-labelled index:
+# Parallel build using all available CPU cores
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1 \
+  --num-shards 8 \
+  --parallel
 
-```bash
+# Parallel build with an explicit worker count
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --index-version idx-v1 \
+  --num-shards 16 \
+  --parallel \
+  --num-workers 4
+
+# HNSW-labelled build
 shardlake build-index \
   --dataset-version ds-v1 \
   --metric cosine \
   --num-shards 8 \
   --ann-family hnsw
+
+# DiskANN experiment build
+shardlake build-index \
+  --dataset-version ds-v1 \
+  --metric euclidean \
+  --num-shards 8 \
+  --ann-family diskann
 ```
 
 ---

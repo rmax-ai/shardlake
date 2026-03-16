@@ -78,6 +78,13 @@ pub enum AnnFamily {
     IvfPq,
     /// Hierarchical Navigable Small World graph-based ANN index.
     Hnsw,
+    /// Experimental ANN backend loosely inspired by DiskANN.
+    ///
+    /// Uses a bounded strided probe over each shard's flat vector list rather
+    /// than a navigable graph search. Supports Euclidean distance only. The
+    /// beam width acts as a probe budget that trades query latency against
+    /// recall quality.
+    DiskAnn,
 }
 
 impl AnnFamily {
@@ -87,6 +94,7 @@ impl AnnFamily {
             Self::IvfFlat => "ivf_flat",
             Self::IvfPq => "ivf_pq",
             Self::Hnsw => "hnsw",
+            Self::DiskAnn => "diskann",
         }
     }
 }
@@ -111,8 +119,9 @@ impl std::str::FromStr for AnnFamily {
             "ivf_flat" => Ok(Self::IvfFlat),
             "ivf_pq" => Ok(Self::IvfPq),
             "hnsw" => Ok(Self::Hnsw),
+            "diskann" => Ok(Self::DiskAnn),
             other => Err(crate::error::CoreError::Other(format!(
-                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, hnsw"
+                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq, diskann"
             ))),
         }
     }
@@ -126,6 +135,43 @@ pub enum DistanceMetric {
     Cosine,
     Euclidean,
     InnerProduct,
+}
+
+/// Query retrieval mode.
+///
+/// Controls which search backend(s) are engaged for a query:
+///
+/// - **`Vector`** (default) – approximate nearest-neighbour search against the
+///   IVF vector index.  Requires a query `vector`.
+/// - **`Lexical`** – BM25 full-text search against the lexical index.  Requires
+///   `query_text`.  The vector field is ignored.  The index must have been built
+///   with a lexical artifact.
+/// - **`Hybrid`** – runs both vector and lexical search, then blends the scores
+///   using [`shardlake_index::ranking::rank_hybrid`].  Requires both `vector`
+///   and `query_text`.
+///
+/// Invalid or unsupported modes are rejected at the query surface (HTTP handler
+/// or CLI) before any search work is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMode {
+    /// Vector-only approximate nearest-neighbour search (default).
+    #[default]
+    Vector,
+    /// Lexical-only BM25 full-text search.
+    Lexical,
+    /// Hybrid: blend vector-distance and BM25 scores.
+    Hybrid,
+}
+
+impl std::fmt::Display for QueryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryMode::Vector => write!(f, "vector"),
+            QueryMode::Lexical => write!(f, "lexical"),
+            QueryMode::Hybrid => write!(f, "hybrid"),
+        }
+    }
 }
 
 impl std::fmt::Display for DistanceMetric {

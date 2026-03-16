@@ -1,13 +1,23 @@
 //! `shardlake build-index` – build shard-based index from ingested dataset.
+//!
+//! When `--parallel` is supplied the command drives a local parallel build:
+//! it calls [`plan_workers`] to partition shards across `--num-workers`
+//! workers, executes every worker concurrently in a Rayon thread pool, then
+//! assembles the final manifest with [`merge_worker_outputs`].  This
+//! distributes the CPU-bound shard-write work across cores without the
+//! multi-process coordination overhead of the `build-index-worker` workflow.
 
 use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
+use rayon::prelude::*;
 use tracing::info;
 
 use shardlake_core::{
@@ -16,8 +26,11 @@ use shardlake_core::{
         AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorRecord,
     },
 };
-use shardlake_index::{BuildParams, IndexBuilder};
-use shardlake_manifest::{DatasetManifest, ManifestError};
+use shardlake_index::{
+    merge_worker_outputs, plan_workers, BuildParams, IndexBuilder, MergeParams, WorkerBuilder,
+    WorkerOutput, WorkerPlanParams,
+};
+use shardlake_manifest::{DatasetManifest, Manifest, ManifestError};
 use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
 
 #[derive(Parser, Debug)]
@@ -59,14 +72,39 @@ pub struct BuildIndexArgs {
     /// ANN algorithm family to use for candidate search within each shard.
     ///
     /// `ivf_flat` (default): exact brute-force distance scoring, all metrics.
-    /// `hnsw`: HNSW graph-based candidate search, all metrics.
+    /// `hnsw`: HNSW-labelled candidate search with persisted HNSW params, all metrics.
+    /// `diskann`: strided-probe experiment, Euclidean metric only.
     #[arg(long, default_value = "ivf_flat")]
     pub ann_family: AnnFamily,
+    /// Enable local parallel build.
+    ///
+    /// When set, the build is driven through the distributed worker pipeline
+    /// (plan → parallel execute → merge) entirely in-process, distributing
+    /// shard construction across `--num-workers` Rayon threads. It produces
+    /// equivalent shard artifacts to a sequential `build-index` run with the
+    /// same arguments, although build metadata like timestamps and duration can
+    /// differ.
+    ///
+    /// Omit this flag (default) to use the classic single-threaded
+    /// [`IndexBuilder`] path.
+    #[arg(long, default_value_t = false)]
+    pub parallel: bool,
+    /// Number of parallel workers used when `--parallel` is set.
+    ///
+    /// Defaults to the number of logical CPUs available to Rayon.  Values
+    /// larger than `--num-shards` are silently clamped to the actual number of
+    /// non-empty shards.  Must be greater than 0 when specified.
+    #[arg(long)]
+    pub num_workers: Option<usize>,
 }
 
 pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
     validate_num_shards(args.num_shards)?;
     validate_kmeans_sample_size(args.kmeans_sample_size)?;
+    if let Some(nw) = args.num_workers {
+        anyhow::ensure!(nw > 0, "--num-workers must be greater than 0");
+        anyhow::ensure!(args.parallel, "--num-workers requires --parallel");
+    }
 
     let store = LocalObjectStore::new(&storage)?;
     let dataset_ver = DatasetVersion(args.dataset_version.clone());
@@ -120,20 +158,37 @@ pub async fn run(storage: PathBuf, args: BuildIndexArgs) -> Result<()> {
 
     info!(records = records.len(), dims, "Loaded vectors");
 
-    let builder = IndexBuilder::new(&store, &config);
-    let manifest = builder.build(BuildParams {
-        records,
-        dataset_version: dataset_ver,
-        embedding_version: embedding_ver,
-        index_version: index_ver,
-        metric: args.metric,
-        dims,
-        vectors_key,
-        metadata_key,
-        pq_params: None,
-        ann_family: Some(args.ann_family),
-        hnsw_config: None,
-    })?;
+    let manifest = if args.parallel {
+        run_parallel_build(
+            &store,
+            &config,
+            records,
+            dataset_ver,
+            embedding_ver,
+            index_ver,
+            args.metric,
+            dims,
+            vectors_key,
+            metadata_key,
+            args.num_workers,
+            args.ann_family,
+        )?
+    } else {
+        let builder = IndexBuilder::new(&store, &config);
+        builder.build(BuildParams {
+            records,
+            dataset_version: dataset_ver,
+            embedding_version: embedding_ver,
+            index_version: index_ver,
+            metric: args.metric,
+            dims,
+            vectors_key,
+            metadata_key,
+            pq_params: None,
+            ann_family: Some(args.ann_family),
+            hnsw_config: None,
+        })?
+    };
 
     println!(
         "Index built → index_version={} ({} shards, {} vectors)",
@@ -155,6 +210,119 @@ fn validate_kmeans_sample_size(kmeans_sample_size: Option<u32>) -> Result<()> {
         "--kmeans-sample-size must be greater than 0"
     );
     Ok(())
+}
+
+/// Drive a local parallel build using the distributed worker pipeline.
+///
+/// This is equivalent to running `build-index-worker --mode plan`, then
+/// running every worker concurrently in a Rayon thread pool, then merging the
+/// outputs – all within the current process.
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_build(
+    store: &LocalObjectStore,
+    config: &SystemConfig,
+    records: Vec<VectorRecord>,
+    dataset_ver: DatasetVersion,
+    embedding_ver: EmbeddingVersion,
+    index_ver: IndexVersion,
+    metric: DistanceMetric,
+    dims: usize,
+    vectors_key: String,
+    metadata_key: String,
+    num_workers: Option<usize>,
+    ann_family: AnnFamily,
+) -> Result<Manifest> {
+    let effective_workers = num_workers.unwrap_or_else(rayon::current_num_threads);
+    anyhow::ensure!(
+        effective_workers > 0,
+        "--num-workers must be greater than 0"
+    );
+    let start = Instant::now();
+
+    info!(
+        effective_workers,
+        "Parallel build: planning shard assignments"
+    );
+
+    let plan = plan_workers(
+        store,
+        config,
+        &records,
+        WorkerPlanParams {
+            index_version: index_ver.clone(),
+            dataset_version: dataset_ver,
+            embedding_version: embedding_ver,
+            metric,
+            dims,
+            vectors_key,
+            metadata_key,
+            num_workers: effective_workers,
+            ann_family: Some(ann_family),
+            hnsw_config: None,
+        },
+    )?;
+
+    let plan_key = shardlake_storage::paths::worker_plan_key(&index_ver.0);
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    store.put(&plan_key, plan_bytes)?;
+    info!(key = %plan_key, "Parallel build: worker plan written");
+
+    info!(
+        workers = plan.num_workers,
+        shards = plan.shard_centroids.len(),
+        "Parallel build: executing {} worker(s) concurrently",
+        plan.num_workers,
+    );
+
+    // Wrap records in an Arc so each Rayon task can borrow them cheaply.
+    // The store reference is shared directly; LocalObjectStore is Send + Sync.
+    let records_arc = Arc::new(records);
+
+    // Execute all workers in parallel using Rayon.  Each worker is
+    // independent: it builds its assigned shards and writes shard artifacts
+    // to storage.  Results are collected in worker-ID order.
+    let outputs: Vec<WorkerOutput> = (0..plan.num_workers)
+        .into_par_iter()
+        .map(|worker_id| {
+            let assignment = plan.assignment(worker_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "internal error: worker_id {} is out of range for plan with {} workers",
+                    worker_id,
+                    plan.num_workers,
+                )
+            })?;
+            let builder = WorkerBuilder::new(store);
+            builder
+                .execute(&plan, assignment, &records_arc)
+                .map_err(|e| anyhow::anyhow!("worker {} failed: {}", worker_id, e))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let elapsed = start.elapsed().as_secs_f64();
+
+    info!(
+        elapsed_secs = elapsed,
+        workers = plan.num_workers,
+        "Parallel build: merging worker outputs"
+    );
+
+    let manifest = merge_worker_outputs(
+        &plan,
+        outputs,
+        MergeParams {
+            alias: "latest".to_owned(),
+            built_at: Utc::now(),
+            builder_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_duration_secs: elapsed,
+        },
+    )?;
+
+    // Persist the final manifest.
+    manifest
+        .save(store)
+        .map_err(|e| anyhow::anyhow!("failed to save manifest: {e}"))?;
+
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -197,6 +365,8 @@ mod tests {
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
                 ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: None,
             },
         )
         .await
@@ -223,6 +393,8 @@ mod tests {
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: Some(0),
                 ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: None,
             },
         )
         .await
@@ -231,6 +403,34 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--kmeans-sample-size must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_num_workers_without_parallel_before_loading_dataset() {
+        let tmp = tempdir().unwrap();
+        let err = run(
+            tmp.path().to_path_buf(),
+            BuildIndexArgs {
+                dataset_version: "missing-dataset".into(),
+                embedding_version: None,
+                index_version: None,
+                metric: DistanceMetric::Cosine,
+                num_shards: 1,
+                kmeans_iters: 20,
+                nprobe: 2,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: Some(1),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--num-workers requires --parallel"));
     }
 
     #[tokio::test]
@@ -281,6 +481,8 @@ mod tests {
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
                 ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: None,
             },
         )
         .await
@@ -315,6 +517,8 @@ mod tests {
                 kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
                 kmeans_sample_size: None,
                 ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: None,
             },
         )
         .await
@@ -324,5 +528,141 @@ mod tests {
             .to_string()
             .contains("Dataset ds-test not found; run `shardlake ingest` first"));
         assert!(err.to_string().contains("parse error"));
+    }
+
+    /// Helper that writes a minimal dataset to `store` and returns the storage
+    /// path so tests can pass it to [`run`].
+    fn write_minimal_dataset(store: &LocalObjectStore, dataset_version: &str, dims: usize) {
+        use shardlake_core::types::{DatasetVersion, EmbeddingVersion};
+
+        let dv = DatasetVersion(dataset_version.into());
+        let ev = EmbeddingVersion("emb-par".into());
+
+        let vectors_key = paths::dataset_vectors_key(dataset_version);
+        let metadata_key = paths::dataset_metadata_key(dataset_version);
+
+        // Write four vectors in two clear clusters so K-means always produces
+        // two non-empty shards regardless of the random seed.
+        let mut lines = String::new();
+        for id in 1u64..=4 {
+            let data: Vec<f32> = if id <= 2 {
+                vec![1.0_f32; dims]
+            } else {
+                vec![-1.0_f32; dims]
+            };
+            let rec = serde_json::json!({ "id": id, "data": data, "metadata": null });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        store.put(&vectors_key, lines.into_bytes()).unwrap();
+        store.put(&metadata_key, b"{}".to_vec()).unwrap();
+
+        DatasetManifest {
+            manifest_version: DATASET_MANIFEST_VERSION,
+            dataset_version: dv,
+            embedding_version: ev,
+            dims: dims as u32,
+            vector_count: 4,
+            vectors_key,
+            metadata_key,
+            ingest_metadata: None,
+        }
+        .save(store)
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_build_produces_valid_manifest() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+        write_minimal_dataset(&store, "ds-par", 4);
+
+        run(
+            storage.clone(),
+            BuildIndexArgs {
+                dataset_version: "ds-par".into(),
+                embedding_version: None,
+                index_version: Some("idx-par".into()),
+                metric: DistanceMetric::Euclidean,
+                num_shards: 2,
+                kmeans_iters: 2,
+                nprobe: 1,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
+                parallel: true,
+                num_workers: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest = Manifest::load(&store, &IndexVersion("idx-par".into())).unwrap();
+        let plan_bytes = store
+            .get(&paths::worker_plan_key("idx-par"))
+            .expect("parallel build should persist worker plan");
+        let plan: shardlake_index::WorkerPlan = serde_json::from_slice(&plan_bytes).unwrap();
+
+        assert_eq!(manifest.total_vector_count, 4);
+        assert!(!manifest.shards.is_empty());
+        assert_eq!(plan.index_version.0, "idx-par");
+        assert_eq!(plan.num_workers, 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_build_with_single_worker_matches_sequential() {
+        let tmp = tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let store = LocalObjectStore::new(&storage).unwrap();
+        write_minimal_dataset(&store, "ds-cmp", 4);
+
+        // Sequential build.
+        run(
+            storage.clone(),
+            BuildIndexArgs {
+                dataset_version: "ds-cmp".into(),
+                embedding_version: None,
+                index_version: Some("idx-seq".into()),
+                metric: DistanceMetric::Euclidean,
+                num_shards: 2,
+                kmeans_iters: 2,
+                nprobe: 1,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
+                parallel: false,
+                num_workers: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Parallel build with one worker.
+        run(
+            storage.clone(),
+            BuildIndexArgs {
+                dataset_version: "ds-cmp".into(),
+                embedding_version: None,
+                index_version: Some("idx-par1".into()),
+                metric: DistanceMetric::Euclidean,
+                num_shards: 2,
+                kmeans_iters: 2,
+                nprobe: 1,
+                kmeans_seed: shardlake_core::config::DEFAULT_KMEANS_SEED,
+                kmeans_sample_size: None,
+                ann_family: AnnFamily::IvfFlat,
+                parallel: true,
+                num_workers: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        let seq = Manifest::load(&store, &IndexVersion("idx-seq".into())).unwrap();
+        let par = Manifest::load(&store, &IndexVersion("idx-par1".into())).unwrap();
+
+        assert_eq!(seq.total_vector_count, par.total_vector_count);
+        assert_eq!(seq.shards.len(), par.shards.len());
     }
 }

@@ -55,10 +55,11 @@ pub struct BuildParams {
     /// ANN algorithm family to use for candidate search within each shard.
     ///
     /// When `None` (or `Some(AnnFamily::IvfFlat)`), the builder emits
-    /// `algorithm: "ivf-flat"` in the manifest.  When `Some(AnnFamily::IvfPq)`,
-    /// PQ-encoded candidate search is selected (requires `pq_params` or
-    /// `SystemConfig::pq_enabled`).  When `Some(AnnFamily::Hnsw)`, the builder
-    /// records `algorithm: "hnsw"` in the manifest with the HNSW graph
+    /// `algorithm: "ivf-flat"` in the manifest. When
+    /// `Some(AnnFamily::DiskAnn)`, the builder records `algorithm: "diskann"`
+    /// after validating that the selected distance metric is compatible with
+    /// the DiskANN experiment backend. When `Some(AnnFamily::Hnsw)`, the
+    /// builder records `algorithm: "hnsw"` in the manifest with the HNSW graph
     /// parameters so that `IndexSearcher` selects `HnswPlugin` at query time.
     ///
     /// Defaults to `None` (IVF-flat behaviour).
@@ -348,21 +349,26 @@ impl<'a> IndexBuilder<'a> {
             algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
         }
 
-        // Select the algorithm name and record HNSW-specific params when requested.
-        let is_hnsw = matches!(ann_family, Some(AnnFamily::Hnsw));
-        let algo_name = if is_hnsw { "hnsw" } else { "ivf-flat" };
-        if is_hnsw {
-            let hnsw = hnsw_config.unwrap_or_default();
-            // Validate the HNSW config directly before writing it into the manifest.
-            hnsw.validate()
-                .map_err(|e| IndexError::Other(e.to_string()))?;
-            algo_params.insert("hnsw_m".into(), serde_json::json!(hnsw.m));
-            algo_params.insert(
-                "hnsw_ef_construction".into(),
-                serde_json::json!(hnsw.ef_construction),
-            );
-            algo_params.insert("hnsw_ef_search".into(), serde_json::json!(hnsw.ef_search));
-        }
+        // Select the algorithm name and record backend-specific params when requested.
+        let algo_name = match ann_family {
+            Some(AnnFamily::Hnsw) => {
+                let hnsw = hnsw_config.unwrap_or_default();
+                hnsw.validate()
+                    .map_err(|e| IndexError::Other(e.to_string()))?;
+                algo_params.insert("hnsw_m".into(), serde_json::json!(hnsw.m));
+                algo_params.insert(
+                    "hnsw_ef_construction".into(),
+                    serde_json::json!(hnsw.ef_construction),
+                );
+                algo_params.insert("hnsw_ef_search".into(), serde_json::json!(hnsw.ef_search));
+                "hnsw"
+            }
+            Some(AnnFamily::DiskAnn) => {
+                AnnRegistry::get_flat(AnnFamily::DiskAnn.as_str())?.validate(dims, metric)?;
+                "diskann"
+            }
+            _ => "ivf-flat",
+        };
 
         let compression = if let Some(ref cb) = codebook {
             let cb_key = shardlake_storage::paths::index_pq_codebook_key(&index_version.0);

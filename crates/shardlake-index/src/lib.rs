@@ -31,7 +31,10 @@ pub use pipeline::{
     MergeStage, MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline,
     QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
-pub use plugin::{AnnPlugin, AnnRegistry, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin};
+pub use plugin::{
+    AnnPlugin, AnnRegistry, DiskAnnCandidateStage, DiskAnnPlugin, HnswConfig, HnswPlugin,
+    IvfFlatPlugin, IvfPqPlugin, DISKANN_DEFAULT_BEAM_WIDTH,
+};
 pub use pq::{PqCodebook, PqParams};
 pub use query_plan::QueryPlan;
 pub use ranking::{rank_hybrid, HybridRankingPolicy};

@@ -22,7 +22,10 @@ use crate::{
     exact::{distance, merge_top_k},
     kmeans::top_n_centroids,
     metrics::CacheMetrics,
-    plugin::{AnnPlugin, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin},
+    plugin::{
+        AnnPlugin, DiskAnnPlugin, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin,
+        DISKANN_DEFAULT_BEAM_WIDTH,
+    },
     pq::PqCodebook,
     query_plan::QueryPlan,
     shard::{PqShard, ShardIndex},
@@ -74,8 +77,9 @@ struct RouteResult {
 /// Plugin selection priority:
 /// 1. `"hnsw"` algorithm → [`HnswPlugin`] with parameters extracted from
 ///    `manifest.algorithm.params`.
-/// 2. PQ compression enabled (any algorithm name) → [`IvfPqPlugin`].
-/// 3. Anything else → [`IvfFlatPlugin`].
+/// 2. `"diskann"` algorithm → [`DiskAnnPlugin`] with the default beam width.
+/// 3. PQ compression enabled (any algorithm name) → [`IvfPqPlugin`].
+/// 4. Anything else → [`IvfFlatPlugin`].
 ///
 /// `load_codebook` is a closure that loads the PQ codebook artifact; it is
 /// only called when PQ is selected.
@@ -109,6 +113,9 @@ where
             ef_construction,
             ef_search,
         })));
+    }
+    if manifest.algorithm.algorithm == "diskann" {
+        return Ok(Box::new(DiskAnnPlugin::new(DISKANN_DEFAULT_BEAM_WIDTH)));
     }
     if pq_enabled {
         return Ok(Box::new(IvfPqPlugin::new(load_codebook()?)));

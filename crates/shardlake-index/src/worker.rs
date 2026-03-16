@@ -38,7 +38,8 @@ use tracing::{info, warn};
 use shardlake_core::{
     config::SystemConfig,
     types::{
-        DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
+        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
+        VectorRecord,
     },
 };
 use shardlake_manifest::{
@@ -47,7 +48,7 @@ use shardlake_manifest::{
 };
 use shardlake_storage::ObjectStore;
 
-use crate::{ivf::IvfQuantizer, shard::ShardIndex, IndexError, Result};
+use crate::{ivf::IvfQuantizer, plugin::HnswConfig, shard::ShardIndex, IndexError, Result};
 
 // ─── Plan types ─────────────────────────────────────────────────────────────
 
@@ -72,6 +73,10 @@ pub struct WorkerPlanParams {
     /// Clamped to the number of non-empty shards when it exceeds that value,
     /// so callers may safely pass values larger than the actual shard count.
     pub num_workers: usize,
+    /// ANN algorithm family to record in the merged manifest.
+    pub ann_family: Option<AnnFamily>,
+    /// Optional HNSW parameters to persist when `ann_family` is HNSW.
+    pub hnsw_config: Option<HnswConfig>,
 }
 
 /// The portion of work assigned to one build worker.
@@ -133,6 +138,12 @@ pub struct WorkerPlan {
     pub nprobe_default: u32,
     /// Storage key of the trained IVF coarse-quantizer artifact.
     pub coarse_quantizer_key: String,
+    /// ANN algorithm family to record in the merged manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ann_family: Option<AnnFamily>,
+    /// Optional HNSW parameters to persist when `ann_family` is HNSW.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hnsw_config: Option<HnswConfig>,
     /// All non-empty shard centroids, one per shard, in `ShardId` order.
     ///
     /// Inline in the plan so workers can reconstruct the [`IvfQuantizer`] for
@@ -388,6 +399,23 @@ pub fn merge_worker_outputs(
         algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
     }
 
+    let algorithm_name = match plan.ann_family {
+        Some(AnnFamily::Hnsw) => "hnsw",
+        Some(AnnFamily::DiskAnn) => "diskann",
+        _ => "ivf-flat",
+    };
+    if matches!(plan.ann_family, Some(AnnFamily::Hnsw)) {
+        let hnsw = plan.hnsw_config.clone().unwrap_or_default();
+        hnsw.validate()
+            .map_err(|e| IndexError::Other(e.to_string()))?;
+        algo_params.insert("hnsw_m".into(), serde_json::json!(hnsw.m));
+        algo_params.insert(
+            "hnsw_ef_construction".into(),
+            serde_json::json!(hnsw.ef_construction),
+        );
+        algo_params.insert("hnsw_ef_search".into(), serde_json::json!(hnsw.ef_search));
+    }
+
     let manifest = Manifest {
         manifest_version: 4,
         dataset_version: plan.dataset_version.clone(),
@@ -408,7 +436,7 @@ pub fn merge_worker_outputs(
             build_duration_secs: params.build_duration_secs,
         },
         algorithm: AlgorithmMetadata {
-            algorithm: "ivf-flat".into(),
+            algorithm: algorithm_name.into(),
             variant: None,
             params: algo_params,
         },
@@ -602,6 +630,8 @@ pub fn plan_workers(
         kmeans_sample_size: effective_sample_size,
         nprobe_default: config.nprobe,
         coarse_quantizer_key: cq_key,
+        ann_family: params.ann_family,
+        hnsw_config: params.hnsw_config,
         shard_centroids,
         assignments,
     })
@@ -919,6 +949,8 @@ mod tests {
             vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-worker-test"),
             metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-worker-test"),
             num_workers: 2,
+            ann_family: None,
+            hnsw_config: None,
         }
     }
 

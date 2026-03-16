@@ -158,6 +158,7 @@ framework.
 | `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
 | `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
 | `Hnsw` | `"hnsw"` | Hierarchical Navigable Small World graph-based ANN index. Supports all distance metrics. |
+| `DiskAnn` | `"diskann"` | Experimental strided-probe backend loosely inspired by DiskANN. Euclidean metric only. See [DiskANN experiment](#diskann-experiment) below. |
 
 Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
 `CoreError::Other` with the list of valid choices.
@@ -200,6 +201,7 @@ let pipeline = QueryPipeline::builder(store, manifest)
 | `IvfFlatPlugin` | `"ivf_flat"` | No extra data needed; constructed directly. |
 | `IvfPqPlugin::new(codebook)` | `"ivf_pq"` | Requires a pre-trained `PqCodebook` loaded from storage. |
 | `HnswPlugin::default()` | `"hnsw"` | No extra data needed; optionally customise via `HnswPlugin::new(HnswConfig { m, ef_construction, ef_search })`. |
+| `DiskAnnPlugin::new(beam_width)` | `"diskann"` | Experiment; constructed directly with a beam width. |
 
 ### `HnswConfig`
 
@@ -261,18 +263,19 @@ for name in AnnRegistry::families() { println!("{name}"); }
 // Check if a name is known.
 assert!(AnnRegistry::exists("ivf_flat"));
 assert!(AnnRegistry::exists("hnsw"));
+assert!(AnnRegistry::exists("diskann"));
 
 // Get a plugin directly (no runtime artifact needed).
 let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
 let hnsw_plugin = AnnRegistry::get_flat("hnsw").unwrap();
+let diskann_plugin = AnnRegistry::get_flat("diskann").unwrap();
 ```
 
-`AnnRegistry::get_flat` returns a ready-to-use plugin for `"ivf_flat"` and
-`"hnsw"`.  For `"ivf_pq"`, it returns a helpful error message explaining that
-the codebook must be supplied, which guides callers to construct
-`IvfPqPlugin::new(codebook)` directly.
+`AnnRegistry::get_flat` returns a ready-to-use plugin for `"ivf_flat"`,
+`"hnsw"`, and `"diskann"`. For `"ivf_pq"`, it returns a helpful error
+message explaining that the codebook must be supplied, which guides callers to
+construct `IvfPqPlugin::new(codebook)` directly.
 
-### Extending with a new backend
 
 1. Implement `AnnPlugin` for a new struct.
 2. Call `plugin.validate()` and `plugin.candidate_stage()` from your build or
