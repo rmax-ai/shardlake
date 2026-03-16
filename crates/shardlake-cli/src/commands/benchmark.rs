@@ -1,4 +1,4 @@
-//! `shardlake benchmark` – recall@k and latency report.
+//! `shardlake benchmark` – recall@k, throughput, and latency report.
 
 use std::{
     io::{BufRead, BufReader},
@@ -7,13 +7,22 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::info;
 
 use shardlake_core::{config::FanOutPolicy, types::VectorRecord};
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
+
+/// Output format for the benchmark report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable text table (default).
+    Text,
+    /// Machine-readable JSON object, suitable for regression tracking.
+    Json,
+}
 
 #[derive(Parser, Debug)]
 pub struct BenchmarkArgs {
@@ -37,6 +46,9 @@ pub struct BenchmarkArgs {
     /// Maximum number of query vectors to use (0 = up to 100).
     #[arg(long, default_value_t = 0)]
     pub max_queries: usize,
+    /// Output format: `text` (default) or `json`.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub output: OutputFormat,
 }
 
 pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
@@ -87,18 +99,26 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
         &searcher, &store_arc, &queries, &corpus, args.k, &policy, metric,
     );
 
-    println!("=== Benchmark Report ===");
-    println!("  Queries:           {}", report.num_queries);
-    println!("  k:                 {}", report.k);
-    println!("  nprobe:            {}", report.nprobe);
-    println!(
-        "  Recall@{k}:         {:.4}",
-        report.recall_at_k,
-        k = report.k
-    );
-    println!("  Mean latency:      {:.1} µs", report.mean_latency_us);
-    println!("  P99  latency:      {:.1} µs", report.p99_latency_us);
-    println!("  Artifact size:     {} bytes", report.artifact_size_bytes);
+    match args.output {
+        OutputFormat::Text => {
+            println!("=== Benchmark Report ===");
+            println!("  Queries:           {}", report.num_queries);
+            println!("  k:                 {}", report.k);
+            println!("  nprobe:            {}", report.nprobe);
+            println!(
+                "  Recall@{k}:         {:.4}",
+                report.recall_at_k,
+                k = report.k
+            );
+            println!("  Mean latency:      {:.1} µs", report.mean_latency_us);
+            println!("  P99  latency:      {:.1} µs", report.p99_latency_us);
+            println!("  Throughput:        {:.1} qps", report.throughput_qps);
+            println!("  Artifact size:     {} bytes", report.artifact_size_bytes);
+        }
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+    }
 
     Ok(())
 }
