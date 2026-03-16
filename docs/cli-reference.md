@@ -277,10 +277,12 @@ Writes to `<storage>/indexes/<index-version>/`:
 | File | Description |
 |------|-------------|
 | `shards/shard-NNNN.sidx` | Binary shard file for each shard assigned to this worker |
-| `workers/<worker-id>/output.json` | Intermediate output metadata (shard IDs, artifact keys, vector counts, fingerprints, centroids) |
+| `workers/NNNN/output.json` | Intermediate output metadata (shard IDs, artifact keys, vector counts, fingerprints, centroids) |
 
 The `output.json` file is consumed by the future merge step to assemble the
 final `manifest.json` without re-reading shard artifact bytes.
+Worker IDs are zero-padded to four digits in this path (for example, worker `0`
+writes `workers/0000/output.json`).
 
 #### Reproducibility
 

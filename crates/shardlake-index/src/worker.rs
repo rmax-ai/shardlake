@@ -396,6 +396,10 @@ impl<'a> WorkerBuilder<'a> {
         assignment: &WorkerAssignment,
         records: &[VectorRecord],
     ) -> Result<WorkerOutput> {
+        Self::validate_plan(plan)?;
+        Self::validate_assignment(plan, assignment)?;
+        Self::validate_records(plan, records)?;
+
         // Rebuild the quantizer from the plan's inline centroids so the
         // worker can assign vectors to shards without loading the .cq file.
         let quantizer = IvfQuantizer::from_centroids(plan.shard_centroids.clone());
@@ -493,6 +497,115 @@ impl<'a> WorkerBuilder<'a> {
         );
 
         Ok(worker_output)
+    }
+
+    fn validate_plan(plan: &WorkerPlan) -> Result<()> {
+        if plan.dims == 0 {
+            return Err(IndexError::Other("plan dims must be greater than 0".into()));
+        }
+        if plan.num_workers == 0 {
+            return Err(IndexError::Other(
+                "plan num_workers must be greater than 0".into(),
+            ));
+        }
+        if plan.assignments.len() != plan.num_workers {
+            return Err(IndexError::Other(format!(
+                "plan assignments length mismatch: expected {}, got {}",
+                plan.num_workers,
+                plan.assignments.len()
+            )));
+        }
+        if plan.shard_centroids.is_empty() {
+            return Err(IndexError::Other(
+                "plan must contain at least one shard centroid".into(),
+            ));
+        }
+        for (idx, centroid) in plan.shard_centroids.iter().enumerate() {
+            if centroid.len() != plan.dims {
+                return Err(IndexError::Other(format!(
+                    "shard centroid {} has dimension mismatch: expected {}, got {}",
+                    idx,
+                    plan.dims,
+                    centroid.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_assignment(plan: &WorkerPlan, assignment: &WorkerAssignment) -> Result<()> {
+        if assignment.num_workers != plan.num_workers {
+            return Err(IndexError::Other(format!(
+                "worker assignment num_workers mismatch: expected {}, got {}",
+                plan.num_workers, assignment.num_workers
+            )));
+        }
+        if assignment.worker_id >= plan.num_workers {
+            return Err(IndexError::Other(format!(
+                "worker assignment {} is out of range for plan with {} workers",
+                assignment.worker_id, plan.num_workers
+            )));
+        }
+        let mut seen_shards = std::collections::HashSet::new();
+        let mut previous = None;
+        for shard_id in &assignment.shard_ids {
+            let shard_idx = shard_id.0 as usize;
+            if shard_idx >= plan.shard_centroids.len() {
+                return Err(IndexError::Other(format!(
+                    "worker assignment {} references invalid shard id {} (plan has {} shard centroids)",
+                    assignment.worker_id,
+                    shard_id.0,
+                    plan.shard_centroids.len()
+                )));
+            }
+            if !seen_shards.insert(shard_id.0) {
+                return Err(IndexError::Other(format!(
+                    "worker assignment {} contains duplicate shard id {}",
+                    assignment.worker_id, shard_id.0
+                )));
+            }
+            if let Some(previous_shard_id) = previous {
+                if shard_id.0 <= previous_shard_id {
+                    return Err(IndexError::Other(format!(
+                        "worker assignment {} shard ids must be strictly ascending",
+                        assignment.worker_id
+                    )));
+                }
+            }
+            previous = Some(shard_id.0);
+        }
+
+        match plan.assignments.get(assignment.worker_id) {
+            Some(expected) if expected == assignment => {}
+            Some(_) => {
+                return Err(IndexError::Other(format!(
+                    "worker assignment {} does not match plan entry",
+                    assignment.worker_id
+                )));
+            }
+            None => {
+                return Err(IndexError::Other(format!(
+                    "worker assignment {} missing from plan",
+                    assignment.worker_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_records(plan: &WorkerPlan, records: &[VectorRecord]) -> Result<()> {
+        for record in records {
+            if record.data.len() != plan.dims {
+                return Err(IndexError::Other(format!(
+                    "record {} has dimension mismatch: expected {}, got {}",
+                    record.id,
+                    plan.dims,
+                    record.data.len()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -793,6 +906,62 @@ mod tests {
                 "worker {w} must produce one output per assigned shard"
             );
         }
+    }
+
+    #[test]
+    fn worker_execute_rejects_malformed_plan_inputs() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = default_config(tmp.path(), 2);
+        let records = two_cluster_records();
+
+        let mut plan =
+            plan_workers(&store, &config, &records, plan_params("idx-bad-plan")).unwrap();
+        let assignment = plan.assignment(0).unwrap().clone();
+
+        plan.dims = 0;
+        let err = WorkerBuilder::new(&store)
+            .execute(&plan, &assignment, &records)
+            .unwrap_err();
+        assert!(err.to_string().contains("plan dims must be greater than 0"));
+
+        let mut plan =
+            plan_workers(&store, &config, &records, plan_params("idx-bad-centroid")).unwrap();
+        let assignment = plan.assignment(0).unwrap().clone();
+        plan.shard_centroids[0].pop();
+        let err = WorkerBuilder::new(&store)
+            .execute(&plan, &assignment, &records)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("shard centroid 0 has dimension mismatch"));
+    }
+
+    #[test]
+    fn worker_execute_rejects_invalid_assignment_and_record_dims() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = default_config(tmp.path(), 2);
+        let records = two_cluster_records();
+
+        let plan =
+            plan_workers(&store, &config, &records, plan_params("idx-bad-assignment")).unwrap();
+        let builder = WorkerBuilder::new(&store);
+
+        let mut bad_assignment = plan.assignment(0).unwrap().clone();
+        bad_assignment
+            .shard_ids
+            .push(ShardId(plan.shard_centroids.len() as u32));
+        let err = builder
+            .execute(&plan, &bad_assignment, &records)
+            .unwrap_err();
+        assert!(err.to_string().contains("references invalid shard id"));
+
+        let bad_records = vec![record(0, vec![1.0f32]), record(1, vec![2.0f32, 3.0])];
+        let err = builder
+            .execute(&plan, plan.assignment(0).unwrap(), &bad_records)
+            .unwrap_err();
+        assert!(err.to_string().contains("dimension mismatch"));
     }
 
     #[test]

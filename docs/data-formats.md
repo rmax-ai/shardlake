@@ -55,7 +55,7 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 │       │   ├── shard-0001.sidx        ← index_shard_key(…, 1)
 │       │   └── ...
 │       └── workers/                   ← distributed builds only
-│           └── <worker-id>/
+│           └── 0000/
 │               └── output.json        ← worker_output_key(…, worker_id)
 └── aliases/
     └── <alias-name>.json              ← alias_key
@@ -337,7 +337,7 @@ dataset vectors without reloading the coarse-quantizer artifact.
 | `index_version` | Index version being built. |
 | `dataset_version` | Source dataset version. |
 | `embedding_version` | Embedding version to record in the manifest. |
-| `metric` | Distance metric used for training. |
+| `metric` | Distance metric recorded for the eventual manifest and query-time search. |
 | `dims` | Vector dimensionality. |
 | `vectors_key` | Storage key of the dataset vectors JSONL file. |
 | `metadata_key` | Storage key of the dataset metadata JSON file. |
@@ -351,11 +351,14 @@ dataset vectors without reloading the coarse-quantizer artifact.
 
 ---
 
-## Worker output (`indexes/<version>/workers/<id>/output.json`)
+## Worker output (`indexes/<version>/workers/<worker-id>/output.json`)
 
 Written by `shardlake build-index-worker --mode execute` for each worker.
 Contains the intermediate shard metadata needed by the merge step to assemble
 the final `manifest.json` without re-reading shard artifact bytes.
+
+Worker IDs are zero-padded to four digits in the storage path, so worker `0`
+writes `indexes/<version>/workers/0000/output.json`.
 
 ```json
 {
