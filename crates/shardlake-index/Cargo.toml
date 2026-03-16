@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

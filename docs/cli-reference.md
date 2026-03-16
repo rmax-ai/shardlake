@@ -237,13 +237,26 @@ shardlake [--storage <PATH>] serve [OPTIONS]
 |------|------|---------|-------------|
 | `--alias <STRING>` | string | `latest` | Alias name to resolve at startup |
 | `--bind <ADDR:PORT>` | string | `0.0.0.0:8080` | TCP address to listen on |
-| `--nprobe <N>` | usize | `2` | Default shard probe count for queries that omit `nprobe` |
+| `--nprobe <N>` | u32 | `2` | Default shard probe count for queries that omit `nprobe` |
+| `--candidate-shards <N>` | u32 | `0` | Cap the number of distinct shards probed after centroid-to-shard deduplication; `0` means no cap |
+| `--max-vectors-per-shard <N>` | u32 | `0` | Limit how many vectors are scored inside each probed shard; `0` means score the full shard |
+| `--shard-cache-capacity <N>` | usize | `128` | Maximum number of loaded shard indexes retained in the in-memory LRU cache |
+
+### Validation
+
+- `--nprobe` must be greater than or equal to 1.
+- `--candidate-shards` and `--max-vectors-per-shard` may be `0` to disable their respective caps.
+- `--shard-cache-capacity` must be greater than or equal to 1.
 
 ### Example
 
 ```bash
 # Serve the "stable" alias on a non-default port
-shardlake serve --alias stable --bind 127.0.0.1:9090 --nprobe 4
+shardlake serve \
+  --alias stable \
+  --bind 127.0.0.1:9090 \
+  --nprobe 4 \
+  --shard-cache-capacity 256
 ```
 
 See [API Reference](api-reference.md) for the HTTP endpoints.
@@ -252,7 +265,7 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k) and latency by comparing the index output
+Measures approximate-search quality (Recall@k), throughput, and latency by comparing the index output
 against an exact brute-force baseline over a sample of the corpus.
 
 ### Usage
@@ -267,12 +280,25 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 |------|------|---------|-------------|
 | `--alias <STRING>` | string | `latest` | Alias to benchmark |
 | `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve |
-| `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
+| `--nprobe <N>` | u32 | `2` | Number of nearest centroids to select per query (`candidate_centroids`) |
+| `--candidate-shards <N>` | u32 | `0` | Maximum number of shards to probe after centroid-to-shard deduplication (`0` = no cap) |
+| `--max-vectors-per-shard <N>` | u32 | `0` | Maximum number of vectors to score inside each probed shard (`0` = no limit) |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
+| `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Mean latency | Average per-query ANN search time in microseconds |
+| P99 latency | 99th-percentile per-query ANN search time in microseconds |
+| Throughput | Wall-clock query throughput in queries per second (qps) |
+| Artifact size | Total size of all index artifact files in bytes |
 
 ### Output
 
-Printed to stdout:
+**Text (default):**
 
 ```
 === Benchmark Report ===
@@ -282,7 +308,23 @@ Printed to stdout:
   Recall@10:         0.9400
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
+  Throughput:        23800.0 qps
   Artifact size:     184320 bytes
+```
+
+**JSON (`--output json`):**
+
+```json
+{
+  "num_queries": 100,
+  "k": 10,
+  "nprobe": 2,
+  "recall_at_k": 0.94,
+  "mean_latency_us": 42.3,
+  "p99_latency_us": 210.0,
+  "throughput_qps": 23800.0,
+  "artifact_size_bytes": 184320
+}
 ```
 
 ### Example
@@ -290,6 +332,9 @@ Printed to stdout:
 ```bash
 # Full precision benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Machine-readable JSON for CI regression tracking
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --output json
 ```
 
 ---
