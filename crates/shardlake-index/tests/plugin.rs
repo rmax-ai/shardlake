@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use shardlake_core::{
-    config::SystemConfig,
+    config::{FanOutPolicy, QueryConfig, SystemConfig},
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, VectorId, VectorRecord,
     },
@@ -146,7 +146,19 @@ fn ivf_flat_plugin_candidate_stage_searches_shard() {
         .build();
 
     let query = records[0].data.clone();
-    let results = pipeline.search(&query, 3, 2).unwrap();
+    let results = pipeline
+        .search(
+            &query,
+            &QueryConfig {
+                top_k: 3,
+                fan_out: FanOutPolicy {
+                    candidate_centroids: 2,
+                    ..FanOutPolicy::default()
+                },
+                ..QueryConfig::default()
+            },
+        )
+        .unwrap();
     assert!(!results.is_empty());
     assert!(results.len() <= 3);
 }
@@ -280,7 +292,19 @@ fn both_backends_wire_into_pipeline_via_plugin_interface() {
             .candidate_stage(stage)
             .build();
 
-        let results = pipeline.search(&query, 3, 2).unwrap();
+        let results = pipeline
+            .search(
+                &query,
+                &QueryConfig {
+                    top_k: 3,
+                    fan_out: FanOutPolicy {
+                        candidate_centroids: 2,
+                        ..FanOutPolicy::default()
+                    },
+                    ..QueryConfig::default()
+                },
+            )
+            .unwrap();
         assert!(
             !results.is_empty(),
             "plugin {} should find results",
