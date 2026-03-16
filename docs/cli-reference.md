@@ -674,8 +674,13 @@ Evaluates hybrid retrieval quality by running three retrieval modes — **vector
 **BM25-only**, and **hybrid** — on the same query set and comparing their recall@k and
 precision@k against an exact brute-force ground truth.
 
-This command requires the index to include a lexical (BM25) artifact.  Build with
-`--build-bm25` to produce an index that supports hybrid evaluation.
+This command requires the resolved index manifest to include a lexical (BM25)
+artifact in `manifest.lexical`.
+
+The current CLI does **not** yet expose a `build-index` flag that produces that
+artifact automatically, so `eval-hybrid` is currently only usable with indexes
+prepared by a workflow that has already written `indexes/<index-version>/lexical.bm25`
+and the corresponding `manifest.lexical` entry.
 
 ### Usage
 
@@ -770,7 +775,7 @@ same extraction logic used at index build time:
 ### Example
 
 ```bash
-# Default text output (equal weights)
+# Default text output (0.7 / 0.3 default weights)
 shardlake eval-hybrid --k 10 --nprobe 4 --max-queries 500
 
 # Favour vector signal (70/30 split)

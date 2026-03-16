@@ -97,8 +97,9 @@ pub async fn run(storage: PathBuf, args: EvalHybridArgs) -> Result<()> {
     let lexical_cfg = match &manifest.lexical {
         Some(cfg) => cfg.clone(),
         None => bail!(
-            "index '{}' does not have a lexical (BM25) index. \
-             Rebuild with `--build-bm25` to enable hybrid evaluation.",
+            "alias '{}' resolves to an index manifest without a lexical (BM25) artifact. \
+             `eval-hybrid` requires `manifest.lexical` to be populated, and the current \
+             `build-index` CLI does not create that artifact yet.",
             args.alias
         ),
     };
