@@ -211,16 +211,16 @@ pub const MMAP_MIN_SIZE_BYTES: u64 = 1024 * 1024;
 
 /// Shard loader that uses memory-mapped I/O for large local shard files.
 ///
-/// For shard artifacts stored on the local filesystem and whose on-disk size
-/// exceeds [`MMAP_MIN_SIZE_BYTES`], the file is memory-mapped before being
+/// For shard artifacts stored on the local filesystem and whose on-disk size is
+/// at least [`MMAP_MIN_SIZE_BYTES`], the file is memory-mapped before being
 /// parsed; the mapped region is released as soon as deserialization finishes.
 /// For small files, non-local stores, or any environment where memory mapping
 /// is not available, the loader transparently falls back to reading the file
 /// with the regular [`ObjectStore::get`] path.
 ///
-/// Loaded shards are cached in an in-memory map, so each shard body is
-/// fetched (and memory-mapped) at most once regardless of how many queries
-/// probe it.
+/// Loaded shards are cached in an in-memory map so repeated loads can reuse the
+/// deserialized shard instead of fetching it again after the first successful
+/// load.
 ///
 /// # Example
 ///
@@ -278,7 +278,7 @@ impl MmapShardLoader {
         // Attempt memory-mapped I/O first.
         let path = self.store.path_for(artifact_key)?;
         if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() >= self.mmap_threshold {
+            if meta.len() > 0 && meta.len() >= self.mmap_threshold {
                 match self.try_load_mmap(&path) {
                     Ok(idx) => return Ok(idx),
                     Err(e) => {
@@ -302,12 +302,8 @@ impl MmapShardLoader {
     /// duration of deserialization only.  The map is dropped before this
     /// function returns, so no reference to the mapped region escapes.
     ///
-    /// Empty shard files are rejected by `ShardIndex::from_bytes` before
-    /// the unsafe mmap region is accessed; `memmap2::Mmap::map` requires a
-    /// non-empty file, and an empty file would have been rejected earlier by
-    /// the `meta.len() >= self.mmap_threshold` size check (threshold ≥ 0
-    /// means a file of size 0 never reaches this path when threshold > 0,
-    /// and when threshold == 0 the magic-byte check in `from_bytes` fails).
+    /// Callers only reach this path for non-empty files; zero-length artifacts
+    /// fall back to the regular read path before any mmap attempt.
     fn try_load_mmap(&self, path: &std::path::Path) -> Result<ShardIndex> {
         let file = std::fs::File::open(path).map_err(IndexError::Io)?;
         // SAFETY: The mapped region is released before this function returns

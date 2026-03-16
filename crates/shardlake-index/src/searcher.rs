@@ -457,7 +457,7 @@ impl IndexSearcher {
     fn load_raw_shard_uncached(&self, artifact_key: &str) -> Result<ShardIndex> {
         if let Some(path) = self.store.local_path_for(artifact_key)? {
             if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() >= self.mmap_threshold {
+                if meta.len() > 0 && meta.len() >= self.mmap_threshold {
                     match self.try_load_raw_shard_mmap(&path) {
                         Ok(idx) => return Ok(idx),
                         Err(error) => {

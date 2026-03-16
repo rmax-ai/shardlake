@@ -199,12 +199,12 @@ memory.
 `MmapShardLoader::with_threshold` to override this.
 
 **Fallback.** If memory mapping fails for any reason (e.g. the OS returns an
-error, the platform does not support anonymous mmaps), the loader retries the
+error, file-backed memory mapping is unavailable), the loader retries the
 load via `ObjectStore::get` automatically and logs a DEBUG message.
 
 **Caching.** Like `CachedShardLoader`, loaded shards are cached in an
-in-memory map keyed by shard ID.  Each unique shard is fetched (and
-memory-mapped) at most once per loader instance.
+in-memory map keyed by shard ID. Repeated loads can reuse the cached shard
+after the first successful fetch.
 
 **Usage.**  Inject the loader via `QueryPipelineBuilder::with_loader`:
 

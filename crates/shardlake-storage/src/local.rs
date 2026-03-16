@@ -33,7 +33,7 @@ impl LocalObjectStore {
         Ok(self.root.join(sanitise_key(key, false)?))
     }
 
-    /// Return the absolute filesystem path for `key`.
+    /// Return the validated filesystem path for `key` under this store's root.
     ///
     /// This is the only method that exposes the underlying storage path; use
     /// it when a caller needs direct file access (e.g. for memory-mapped I/O).
