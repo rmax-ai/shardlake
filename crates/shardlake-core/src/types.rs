@@ -121,6 +121,43 @@ pub enum DistanceMetric {
     InnerProduct,
 }
 
+/// Query retrieval mode.
+///
+/// Controls which search backend(s) are engaged for a query:
+///
+/// - **`Vector`** (default) – approximate nearest-neighbour search against the
+///   IVF vector index.  Requires a query `vector`.
+/// - **`Lexical`** – BM25 full-text search against the lexical index.  Requires
+///   `query_text`.  The vector field is ignored.  The index must have been built
+///   with a lexical artifact.
+/// - **`Hybrid`** – runs both vector and lexical search, then blends the scores
+///   using [`shardlake_index::ranking::rank_hybrid`].  Requires both `vector`
+///   and `query_text`.
+///
+/// Invalid or unsupported modes are rejected at the query surface (HTTP handler
+/// or CLI) before any search work is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMode {
+    /// Vector-only approximate nearest-neighbour search (default).
+    #[default]
+    Vector,
+    /// Lexical-only BM25 full-text search.
+    Lexical,
+    /// Hybrid: blend vector-distance and BM25 scores.
+    Hybrid,
+}
+
+impl std::fmt::Display for QueryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryMode::Vector => write!(f, "vector"),
+            QueryMode::Lexical => write!(f, "lexical"),
+            QueryMode::Hybrid => write!(f, "hybrid"),
+        }
+    }
+}
+
 impl std::fmt::Display for DistanceMetric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

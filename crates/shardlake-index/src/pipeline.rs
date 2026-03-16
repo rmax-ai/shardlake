@@ -891,7 +891,7 @@ impl QueryPipelineBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use tempfile::tempdir;
     use tracing::subscriber;
@@ -1147,6 +1147,11 @@ mod tests {
     }
 
     fn collect_spans<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        static TRACE_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = TRACE_CAPTURE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
         let collector = SpanCollector::default();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::filter::LevelFilter::TRACE)

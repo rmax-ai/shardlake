@@ -1,6 +1,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{error::CoreError, types::DistanceMetric};
+use crate::{
+    error::CoreError,
+    types::{DistanceMetric, QueryMode},
+};
 
 /// Default K-means RNG seed used for reproducible shard partitioning.
 ///
@@ -122,13 +125,15 @@ impl Default for PrefetchPolicy {
 
 /// Per-query execution configuration.
 ///
-/// Bundles all the knobs that tune a single ANN query: how many results to
-/// return, how wide to fan out across shards, an optional cap on the number of
-/// rerank candidates, and an optional per-query distance metric override.
+/// Bundles all the knobs that tune a single query: retrieval mode, how many
+/// results to return, how wide to fan out across shards, an optional cap on
+/// the number of rerank candidates, and an optional per-query distance metric
+/// override.
 ///
 /// # Defaults
 ///
 /// Use [`QueryConfig::default`] to get a sensible starting point:
+/// - `query_mode = QueryMode::Vector`
 /// - `top_k = 10`
 /// - `fan_out = FanOutPolicy::default()` (2 centroids, no caps)
 /// - `rerank_limit = None` (no limit; use the pipeline's `rerank_oversample`)
@@ -141,6 +146,14 @@ impl Default for PrefetchPolicy {
 /// [`CoreError::InvalidQueryConfig`] when any invariant is violated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryConfig {
+    /// Retrieval mode for this query.
+    ///
+    /// Controls which search backend(s) are engaged:
+    /// - [`QueryMode::Vector`] (default) – ANN vector search only.
+    /// - [`QueryMode::Lexical`] – BM25 full-text search only.
+    /// - [`QueryMode::Hybrid`] – blend of vector and lexical scores.
+    #[serde(default)]
+    pub query_mode: QueryMode,
     /// Number of results to return.  Must be ≥ 1.
     pub top_k: usize,
     /// Fan-out policy controlling centroid and shard selection.
@@ -187,6 +200,7 @@ impl QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
+            query_mode: QueryMode::Vector,
             top_k: 10,
             fan_out: FanOutPolicy::default(),
             rerank_limit: None,
@@ -442,8 +456,9 @@ mod tests {
 
     #[test]
     fn query_config_valid_with_all_fields() {
-        use crate::types::DistanceMetric;
+        use crate::types::{DistanceMetric, QueryMode};
         let config = QueryConfig {
+            query_mode: QueryMode::Vector,
             top_k: 5,
             fan_out: FanOutPolicy {
                 candidate_centroids: 3,
