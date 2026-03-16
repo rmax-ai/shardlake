@@ -45,15 +45,18 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 │       └── info.json                  ← dataset_info_key
 ├── indexes/
 │   └── <index-version>/
-│       ├── manifest.json      ← index_manifest_key
-│       ├── pq_codebook.bin    ← index_pq_codebook_key (PQ builds only)
 │       ├── manifest.json              ← index_manifest_key
+│       ├── pq_codebook.bin            ← index_pq_codebook_key (PQ builds only)
 │       ├── coarse_quantizer.cq        ← index_coarse_quantizer_key
 │       ├── lexical.bm25               ← index_lexical_key (lexical index builds only)
-│       └── shards/
-│           ├── shard-0000.sidx        ← index_shard_key(…, 0)
-│           ├── shard-0001.sidx        ← index_shard_key(…, 1)
-│           └── ...
+│       ├── worker_plan.json           ← worker_plan_key (distributed builds only)
+│       ├── shards/
+│       │   ├── shard-0000.sidx        ← index_shard_key(…, 0)
+│       │   ├── shard-0001.sidx        ← index_shard_key(…, 1)
+│       │   └── ...
+│       └── workers/                   ← distributed builds only
+│           └── <worker-id>/
+│               └── output.json        ← worker_output_key(…, worker_id)
 └── aliases/
     └── <alias-name>.json              ← alias_key
 ```
@@ -300,6 +303,87 @@ The default `kmeans_seed` (`3735928559` / `0xdeadbeef`) is applied automatically
 `shardlake build-index` when `--kmeans-seed` is not specified.  Supply an explicit
 `--kmeans-seed` value to override it and have it documented directly in the CLI
 invocation.
+
+---
+
+## Worker plan (`indexes/<version>/worker_plan.json`)
+
+Written by `shardlake build-index-worker --mode plan`.  Describes how a
+distributed build is partitioned across workers.  Workers load this file to
+find their shard assignments and the inline shard centroids needed to filter
+dataset vectors without reloading the coarse-quantizer artifact.
+
+```json
+{
+  "index_version": "idx-v1",
+  "dataset_version": "ds-v1",
+  "embedding_version": "emb-v1",
+  "metric": "cosine",
+  "dims": 128,
+  "vectors_key": "datasets/ds-v1/vectors.jsonl",
+  "metadata_key": "datasets/ds-v1/metadata.json",
+  "num_workers": 2,
+  "coarse_quantizer_key": "indexes/idx-v1/coarse_quantizer.cq",
+  "shard_centroids": [[0.1, 0.2, ...], [0.9, 0.8, ...]],
+  "assignments": [
+    { "worker_id": 0, "num_workers": 2, "shard_ids": [0, 2] },
+    { "worker_id": 1, "num_workers": 2, "shard_ids": [1, 3] }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `index_version` | Index version being built. |
+| `dataset_version` | Source dataset version. |
+| `embedding_version` | Embedding version to record in the manifest. |
+| `metric` | Distance metric used for training. |
+| `dims` | Vector dimensionality. |
+| `vectors_key` | Storage key of the dataset vectors JSONL file. |
+| `metadata_key` | Storage key of the dataset metadata JSON file. |
+| `num_workers` | Actual number of workers (may be less than requested when fewer shards exist). |
+| `coarse_quantizer_key` | Storage key of the trained IVF coarse-quantizer artifact. |
+| `shard_centroids` | All non-empty shard centroids, one per shard, in `shard_id` order. Inline so workers do not need to load the `.cq` file. |
+| `assignments` | Per-worker shard assignments. |
+| `assignments[i].worker_id` | Zero-based worker index. |
+| `assignments[i].num_workers` | Total number of workers in this plan. |
+| `assignments[i].shard_ids` | Shard IDs this worker must build (ascending order). |
+
+---
+
+## Worker output (`indexes/<version>/workers/<id>/output.json`)
+
+Written by `shardlake build-index-worker --mode execute` for each worker.
+Contains the intermediate shard metadata needed by the merge step to assemble
+the final `manifest.json` without re-reading shard artifact bytes.
+
+```json
+{
+  "worker_id": 0,
+  "index_version": "idx-v1",
+  "shards": [
+    {
+      "shard_id": 0,
+      "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+      "vector_count": 2543,
+      "fingerprint": "a3f1b2c4d5e6f7a8",
+      "centroid": [0.1, 0.2, ...],
+      "worker_id": 0
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `worker_id` | Worker that produced this output. |
+| `index_version` | Index version these outputs belong to. |
+| `shards[i].shard_id` | Shard identifier. |
+| `shards[i].artifact_key` | Storage key of the shard artifact. |
+| `shards[i].vector_count` | Number of vectors in this shard. |
+| `shards[i].fingerprint` | FNV-1a fingerprint hex string (16 digits). Used by the merge step for integrity checks. |
+| `shards[i].centroid` | Centroid of this shard's Voronoi cell. |
+| `shards[i].worker_id` | Worker that built this shard (matches the outer `worker_id`). |
 
 ---
 
