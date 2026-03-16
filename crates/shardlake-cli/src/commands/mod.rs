@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod build_index;
 pub mod build_index_worker;
 pub mod eval_ann;
+pub mod eval_hybrid;
 pub mod evaluate_partitioning;
 pub mod generate;
 pub mod ingest;
