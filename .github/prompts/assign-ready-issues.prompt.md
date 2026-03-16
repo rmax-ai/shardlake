@@ -26,6 +26,8 @@ Requirements:
    - it still has no open blockers
 3. Ensure the label `implementation-in-progress` exists.
 4. Assign only verified ready issues that are not already assigned to `copilot-swe-agent`.
+  - Treat an issue as blocked only when dependency data contains at least one blocker whose `state` is not `closed`.
+  - Closed blockers are resolved dependencies and must not block assignment.
 5. Prefer `gh issue edit <issue-number> --add-assignee "@copilot"`.
 6. If that fails because the CLI or token cannot resolve `@copilot`, fall back to the REST API agent-assignment payload.
 7. After each successful assignment, remove `ready-to-implement` and add `implementation-in-progress`.
@@ -41,7 +43,7 @@ Execution guidance:
   1. Run `gh issue list --state open --label ready-to-implement --limit 200 --json number,title,assignees,labels,author` once to collect candidate issues.
   2. Run one fixed `gh api graphql` query over the repository's open epic issues to collect each epic's `subIssues` and each child issue's `number`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
   3. Derive whether each candidate still has a parent epic from that GraphQL sub-issue snapshot instead of from `gh issue view` JSON fields.
-  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints.
+  4. Retrieve dependency state for each candidate with the GitHub issue dependencies REST endpoints and treat only blockers with `state != "closed"` as open blockers.
 - Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
 
 ```bash
@@ -56,6 +58,7 @@ gh api graphql -f query="$QUERY" -F owner=<owner> -F repo=<repo>
 - Use `gh issue edit <issue-number> --remove-label ready-to-implement --add-label implementation-in-progress` only after the issue is verified to be assigned to `copilot-swe-agent`.
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, skip the issue and report that it was policy-blocked.
+- Do not treat closed blockers returned by the dependencies endpoint as blocking.
 - If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 REST fallback payload:

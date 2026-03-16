@@ -38,6 +38,8 @@ Requirements:
    - the `gh api graphql` command must bind repository identity through GraphQL variables, for example `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`
    - do not use `gh api graphql --repo ...` or `gh api --repo ...`; `gh api` in this environment does not support that flag
 4. Retrieve dependency state only for candidate child issues using the GitHub issue dependencies REST endpoints.
+   - Treat an issue as blocked only when the dependency response contains at least one blocker whose `state` is not `closed`.
+   - Closed blockers must be treated as resolved and must not disqualify a candidate child issue.
 5. Build the desired ready queue deterministically:
    - walk epics in ascending issue-number order
    - within each epic, walk child issues in ascending issue-number order
@@ -61,7 +63,7 @@ Execution guidance:
 - Use this fixed collection pipeline:
    1. Run `gh issue list --state open --limit 200 --json number,title,labels,assignees,author` once and derive the open `ready-to-implement` set, the open `implementation-in-progress` set, the open `epic` set, open issues without a parent epic, issues already assigned to `copilot-swe-agent`, and issues whose author login is outside the allowed set from that snapshot.
    2. For the open epic set, call `gh api graphql` with a fixed query that requests each epic's `subIssues` and each child issue's `number`, `title`, `state`, and `author { login }`. Pass repository identity as GraphQL variables with the supported form `gh api graphql -f query='query($owner:String!,$repo:String!){ repository(owner:$owner,name:$repo){ ... } }' -F owner=<owner> -F repo=<repo>`.
-   3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocking` to determine whether open blockers exist.
+   3. For the candidate child issues encountered while building the queue, call `gh api /repos/OWNER/REPO/issues/ISSUE_NUMBER/dependencies/blocking` and treat only blockers with `state != "closed"` as open blockers.
 - Use the following exact query transport shape for the epic-child snapshot to avoid shell-quoting and JSON-escaping errors:
 
 ```bash
@@ -79,6 +81,7 @@ gh api graphql -f query="$QUERY" -F owner=<owner> -F repo=<repo>
 - Normalize GitHub App identities before applying the actor guard rail. Treat `app/copilot-swe-agent` as equivalent to `copilot-swe-agent`.
 - If author identity is missing or ambiguous, treat the issue as not ready for this iteration.
 - If blocker state is ambiguous, treat the issue as not ready for this iteration.
+- Do not treat closed blockers returned by the dependencies endpoint as blocking.
 - If automation is blocked on a needed human decision, ensure the `needs-human` label exists, add it to the issue, and leave a concise evidence-based issue comment describing the decision needed, why the prompt could not proceed safely, and the minimum next action.
 
 Output format:
