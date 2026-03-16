@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use rayon::prelude::*;
 use tracing::{debug, info};
 
 use shardlake_core::{
@@ -160,18 +161,24 @@ impl IndexSearcher {
                 policy.max_vectors_per_shard,
             )
         } else {
-            let mut all_results = Vec::new();
-            for shard_id in probe_shards {
-                let shard = self.load_shard(shard_id)?;
-                let records = if policy.max_vectors_per_shard > 0 {
-                    let limit = (policy.max_vectors_per_shard as usize).min(shard.records.len());
-                    &shard.records[..limit]
-                } else {
-                    &shard.records
-                };
-                let results = exact_search(query, records, metric, k);
-                all_results.extend(results);
-            }
+            // Stages: Load shard + exact search run concurrently across probed shards.
+            // Each task loads one shard and scores its records; results are merged below.
+            // Any shard-load error short-circuits the fan-out.
+            let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+                .par_iter()
+                .map(|&shard_id| {
+                    let shard = self.load_shard(shard_id)?;
+                    let records = if policy.max_vectors_per_shard > 0 {
+                        let limit =
+                            (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                        &shard.records[..limit]
+                    } else {
+                        &shard.records
+                    };
+                    Ok(exact_search(query, records, metric, k))
+                })
+                .collect();
+            let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
             Ok(merge_top_k(all_results, k))
         }
     }
@@ -197,34 +204,37 @@ impl IndexSearcher {
         let table = codebook.compute_distance_table(query)?;
         let metadata_map = self.load_metadata_map()?;
 
-        let mut all_results: Vec<SearchResult> = Vec::new();
-
-        for &shard_id in probe_shards {
-            let shard = self.load_pq_shard(shard_id)?;
-            let max_entries = if max_vectors_per_shard > 0 {
-                (max_vectors_per_shard as usize).min(shard.entries.len())
-            } else {
-                shard.entries.len()
-            };
-            let mut scored: Vec<SearchResult> = shard
-                .entries
-                .iter()
-                .take(max_entries)
-                .map(|(id, codes)| SearchResult {
-                    id: *id,
-                    score: codebook.adc_distance(codes, &table),
-                    metadata: metadata_map.get(&id.to_string()).cloned(),
-                })
-                .collect();
-            scored.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            scored.truncate(k);
-            all_results.extend(scored);
-        }
-
+        // Load and score PQ-encoded shards concurrently.  The codebook distance
+        // table and metadata map are computed once and shared across tasks.
+        let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.load_pq_shard(shard_id)?;
+                let max_entries = if max_vectors_per_shard > 0 {
+                    (max_vectors_per_shard as usize).min(shard.entries.len())
+                } else {
+                    shard.entries.len()
+                };
+                let mut scored: Vec<SearchResult> = shard
+                    .entries
+                    .iter()
+                    .take(max_entries)
+                    .map(|(id, codes)| SearchResult {
+                        id: *id,
+                        score: codebook.adc_distance(codes, &table),
+                        metadata: metadata_map.get(&id.to_string()).cloned(),
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored.truncate(k);
+                Ok(scored)
+            })
+            .collect();
+        let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
         Ok(merge_top_k(all_results, k))
     }
 
