@@ -212,13 +212,13 @@ pub fn rank_hybrid(
     }
 
     // Compute hybrid scores.
+    // Use `remove` on `vector_map` to take ownership of each entry's metadata
+    // rather than cloning it out of a shared reference.
+    let mut vector_map = vector_map;
     let mut candidates: Vec<SearchResult> = all_ids
         .into_iter()
         .map(|id| {
-            let (v_norm, metadata) = vector_map
-                .get(&id)
-                .map(|(n, m)| (*n, m.clone()))
-                .unwrap_or((1.0_f32, None));
+            let (v_norm, metadata) = vector_map.remove(&id).unwrap_or((1.0_f32, None));
             let b_norm = bm25_map.get(&id).copied().unwrap_or(1.0_f32);
 
             // If both weights are concentrated on one signal, only that

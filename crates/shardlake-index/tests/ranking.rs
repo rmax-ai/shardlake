@@ -70,7 +70,7 @@ fn pure_bm25_ranking_empty_vector_list() {
     let bm25_results = vec![sr(1, -2.0), sr(2, -1.0)];
     let ranked = rank_hybrid(vec![], bm25_results, &policy, 5);
     assert_eq!(ranked.len(), 2);
-    assert_eq!(ranked[0].id, VectorId(1)); // -2.0 < -1.0 → doc 1 is better
+    assert_eq!(ranked[0].id, VectorId(1)); // -2.0 < -1.0 → ID 1 is the better match
 }
 
 // ── Blended ranking ───────────────────────────────────────────────────────────
