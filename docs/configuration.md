@@ -199,6 +199,71 @@ not yet a user-facing flag or config setting to select a different backend.
 - Server-side encryption (SSE)
 - Object versioning
 - Retry / back-off logic
+
+## Shard loading
+
+Query-time raw shard loading supports both the default `IndexSearcher` path
+and the composable `QueryPipeline` `LoadShardStage` abstraction.
+
+### Default behavior
+
+For any backend that does not expose a validated local filesystem path, raw
+shards are fetched through `ObjectStore::get`, deserialized, and cached in
+memory. This remains the universal fallback for remote stores and unsupported
+environments.
+
+`QueryPipeline` uses `CachedShardLoader` by default, and `IndexSearcher`
+automatically follows the same fallback path whenever mmap is unavailable.
+
+### `CachedShardLoader`
+
+`CachedShardLoader` is the explicit query-pipeline implementation of the
+default behavior above: it fetches the entire shard file into a `Vec<u8>` via
+`ObjectStore::get`, deserializes it, and caches the result in a
+`Mutex<HashMap>`. Compatible with every `ObjectStore` backend.
+
+### `MmapShardLoader` (memory-mapped, local only)
+
+`MmapShardLoader` uses `memmap2` to memory-map large shard files directly
+from the local filesystem, avoiding an extra heap allocation for the raw
+bytes. `IndexSearcher` uses the same mmap fast path automatically when its
+store exposes a validated local path. The mapped region is released as soon as
+deserialization finishes, so only the deserialized `ShardIndex` is retained in
+memory.
+
+**Threshold.** Files whose on-disk size is strictly less than
+`MMAP_MIN_SIZE_BYTES` (1 MiB by default) are loaded via the regular
+`ObjectStore::get` fallback path instead.  Pass a custom threshold to
+`MmapShardLoader::with_threshold` to override this.
+
+**Fallback.** If memory mapping fails for any reason (e.g. the OS returns an
+error, file-backed memory mapping is unavailable), the loader retries the
+load via `ObjectStore::get` automatically and logs a DEBUG message.
+
+**Caching.** Like `CachedShardLoader`, loaded shards are cached in an
+in-memory map keyed by shard ID. Repeated loads can reuse the cached shard
+after the first successful fetch.
+
+**Usage.**  Inject the loader via `QueryPipelineBuilder::with_loader`:
+
+```rust,no_run
+use std::sync::Arc;
+use shardlake_index::pipeline::{MmapShardLoader, QueryPipeline};
+use shardlake_manifest::Manifest;
+use shardlake_storage::LocalObjectStore;
+
+fn run(store: Arc<LocalObjectStore>, manifest: Manifest) {
+    let pipeline = QueryPipeline::builder(Arc::clone(&store) as Arc<_>, manifest.clone())
+        .with_loader(Box::new(MmapShardLoader::new(store, manifest)))
+        .build();
+    let results = pipeline.run(&[1.0, 0.0], 10, 2).unwrap();
+    println!("{} results", results.len());
+}
+```
+
+`MmapShardLoader` is only useful with `LocalObjectStore`.  For any other
+backend, use `CachedShardLoader` (the default).
+
 ## Query-time centroid shard routing
 
 `IndexSearcher` implements centroid-based routing rather than a naive fan-out to every

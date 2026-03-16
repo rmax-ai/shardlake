@@ -33,6 +33,27 @@ impl LocalObjectStore {
         Ok(self.root.join(sanitise_key(key, false)?))
     }
 
+    /// Return the validated filesystem path for `key` under this store's root.
+    ///
+    /// This is the only method that exposes the underlying storage path; use
+    /// it when a caller needs direct file access (e.g. for memory-mapped I/O).
+    /// All the usual key-validation rules apply: the key must not be empty,
+    /// contain backslashes, use `.` or `..` path segments, or be absolute.
+    /// These checks prevent path-traversal attacks; callers must not construct
+    /// keys from untrusted input without applying their own validation first.
+    ///
+    /// The returned path should only be used for **read-only** access.
+    /// Writes through the returned path bypass the `ObjectStore` abstraction
+    /// and may corrupt stored artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidKey`] for keys that fail validation (see
+    /// [`ObjectStore::get`]).
+    pub fn path_for(&self, key: &str) -> Result<PathBuf> {
+        self.full_path(key)
+    }
+
     fn full_prefix_path(&self, prefix: &str) -> Result<PathBuf> {
         Ok(self.root.join(sanitise_key(prefix, true)?))
     }
@@ -107,6 +128,10 @@ impl ObjectStore for LocalObjectStore {
             path: path.display().to_string(),
             source: e,
         })
+    }
+
+    fn local_path_for(&self, key: &str) -> Result<Option<PathBuf>> {
+        Ok(Some(self.path_for(key)?))
     }
 }
 

@@ -24,8 +24,8 @@ pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
     ExactCandidateStage, ExactRerankStage, IdentityEmbedder, LoadShardStage, MergeStage,
-    NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder, RerankStage, RouteStage,
-    TopKMerge,
+    MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder,
+    RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
