@@ -145,10 +145,20 @@ async fn query_handler(
     let rerank = req.rerank.unwrap_or(false);
     let policy = query_config.fan_out.clone();
     let k = query_config.top_k;
+    let metric = query_config
+        .distance_metric
+        .unwrap_or(searcher.manifest().distance_metric);
+    let candidate_k = if rerank {
+        query_config.rerank_limit.unwrap_or(k).max(k)
+    } else {
+        k
+    };
     match tokio::task::spawn_blocking(move || {
-        let ann_results = searcher.search(&vector, k, &policy)?;
+        let ann_results = searcher.search_with_metric(&vector, candidate_k, &policy, metric)?;
         if rerank {
-            searcher.rerank(&vector, ann_results)
+            let mut reranked = searcher.rerank_with_metric(&vector, ann_results, metric)?;
+            reranked.truncate(k);
+            Ok(reranked)
         } else {
             Ok(ann_results)
         }
@@ -248,6 +258,57 @@ mod tests {
             searcher,
             fan_out: FanOutPolicy {
                 candidate_centroids: 2,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
+        };
+        (build_router(state), tmp)
+    }
+
+    fn make_distance_metric_router() -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 4,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![100.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![9.0, 1.0],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-metric".into()),
+                embedding_version: EmbeddingVersion("emb-metric".into()),
+                index_version: IndexVersion("idx-metric".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 2,
+                vectors_key: "datasets/ds-metric/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-metric/metadata.json".into(),
+                pq_params: None,
+            })
+            .expect("build index");
+        let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let state = AppState {
+            searcher,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 1,
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
@@ -497,5 +558,49 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_applies_distance_metric_override() {
+        let (app, _tmp) = make_distance_metric_router();
+
+        let default_response = app
+            .clone()
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[10.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(default_response.status(), StatusCode::OK);
+        let default_body = to_bytes(default_response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let default_payload: QueryResponse =
+            serde_json::from_slice(&default_body).expect("query response json");
+        assert_eq!(default_payload.results[0].id, VectorId(2));
+
+        let cosine_response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[10.0,0.0],"k":1,"distance_metric":"cosine"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(cosine_response.status(), StatusCode::OK);
+        let cosine_body = to_bytes(cosine_response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let cosine_payload: QueryResponse =
+            serde_json::from_slice(&cosine_body).expect("query response json");
+        assert_eq!(cosine_payload.results[0].id, VectorId(1));
     }
 }
