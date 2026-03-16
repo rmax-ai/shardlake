@@ -1,5 +1,6 @@
 //! Index building and approximate nearest-neighbour search.
 
+pub mod bm25;
 pub mod builder;
 pub mod exact;
 pub mod ivf;
@@ -11,6 +12,7 @@ pub mod searcher;
 pub mod shard;
 pub mod validator;
 
+pub use bm25::{tokenize, BM25Params, Bm25Index, BM25_MAGIC};
 pub use builder::{BuildParams, IndexBuilder};
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;

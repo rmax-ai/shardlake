@@ -193,6 +193,30 @@ pub struct RecallEstimate {
     pub sample_size: u64,
 }
 
+/// Configuration for the optional BM25 lexical index artifact (manifest v4+).
+///
+/// When present in a [`Manifest`], a BM25 inverted-index artifact has been
+/// built alongside the vector shards and can be used for text-only or hybrid
+/// retrieval.  `None` means no lexical index was built.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexicalIndexConfig {
+    /// Storage key of the serialised [`Bm25Index`] artifact (`.bm25` file).
+    ///
+    /// [`Bm25Index`]: shardlake_index::bm25::Bm25Index
+    pub artifact_key: String,
+    /// BM25 term-frequency saturation parameter (k1) used at build time.
+    ///
+    /// Typical range: 1.2–2.0.  Stored here so that callers can verify that
+    /// a loaded index matches the expected configuration.
+    pub k1: f32,
+    /// BM25 document-length normalisation parameter (b) used at build time.
+    ///
+    /// Range: 0.0–1.0.
+    pub b: f32,
+    /// Number of documents (vectors) indexed by this lexical index.
+    pub doc_count: u64,
+}
+
 /// Build-time metadata recorded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -257,6 +281,13 @@ pub struct Manifest {
     /// persistence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_quantizer_key: Option<String>,
+    /// Configuration for the optional BM25 lexical index (manifest v4+).
+    ///
+    /// `Some` when a BM25 inverted-index artifact was built alongside the
+    /// vector shards for this index version.  `None` when no lexical index
+    /// was built (the default for pure vector-only indexes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<LexicalIndexConfig>,
 }
 
 impl Manifest {
@@ -468,6 +499,24 @@ impl Manifest {
                         shard.shard_id
                     )));
                 }
+            }
+        }
+
+        if let Some(lexical) = &self.lexical {
+            if lexical.artifact_key.trim().is_empty() {
+                return Err(ManifestError::Validation(
+                    "lexical.artifact_key must not be empty when present".into(),
+                ));
+            }
+            if !lexical.k1.is_finite() || lexical.k1 <= 0.0 {
+                return Err(ManifestError::Validation(
+                    "lexical.k1 must be finite and > 0".into(),
+                ));
+            }
+            if !lexical.b.is_finite() || !(0.0..=1.0).contains(&lexical.b) {
+                return Err(ManifestError::Validation(
+                    "lexical.b must be finite and within [0, 1]".into(),
+                ));
             }
         }
 
