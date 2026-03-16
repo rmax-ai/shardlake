@@ -72,6 +72,54 @@ impl Default for FanOutPolicy {
     }
 }
 
+/// Policy controlling optional shard prefetch warming based on query frequency.
+///
+/// When enabled, shards that have been probed at least `min_query_count` times
+/// are considered "hot" and may be loaded into the shard cache proactively on
+/// a later cache miss.
+///
+/// # Validation
+///
+/// Call [`PrefetchPolicy::validate`] before using a policy obtained from
+/// untrusted input. The method returns
+/// [`CoreError::InvalidPrefetchPolicy`] when `min_query_count` is `0` while
+/// `enabled` is `true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrefetchPolicy {
+    /// Whether shard prefetch warming is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum number of probe events required before a shard becomes eligible
+    /// for prefetch warming.
+    #[serde(default = "PrefetchPolicy::default_min_query_count")]
+    pub min_query_count: u32,
+}
+
+impl PrefetchPolicy {
+    /// Validate the policy.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.enabled && self.min_query_count == 0 {
+            return Err(CoreError::InvalidPrefetchPolicy(
+                "min_query_count must be ≥ 1 when prefetch is enabled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_min_query_count() -> u32 {
+        3
+    }
+}
+
+impl Default for PrefetchPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_query_count: Self::default_min_query_count(),
+        }
+    }
+}
+
 /// Top-level system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
@@ -152,6 +200,12 @@ pub struct SystemConfig {
         deserialize_with = "deserialize_nonzero_shard_cache_capacity"
     )]
     pub shard_cache_capacity: usize,
+    /// Prefetch policy for warming frequently probed shards into the cache.
+    ///
+    /// Disabled by default so the historical lazy-load behaviour is preserved
+    /// unless callers explicitly opt in.
+    #[serde(default)]
+    pub prefetch: PrefetchPolicy,
 }
 
 impl SystemConfig {
@@ -206,6 +260,7 @@ impl Default for SystemConfig {
             pq_num_subspaces: Self::default_pq_num_subspaces(),
             pq_codebook_size: Self::default_pq_codebook_size(),
             shard_cache_capacity: Self::default_shard_cache_capacity(),
+            prefetch: PrefetchPolicy::default(),
         }
     }
 }
@@ -229,7 +284,7 @@ where
 mod tests {
     use serde_json::json;
 
-    use super::SystemConfig;
+    use super::{PrefetchPolicy, SystemConfig};
 
     #[test]
     fn system_config_rejects_zero_shard_cache_capacity() {
@@ -245,5 +300,20 @@ mod tests {
         assert!(err
             .to_string()
             .contains("shard_cache_capacity must be >= 1"));
+    }
+
+    #[test]
+    fn prefetch_policy_rejects_zero_threshold_when_enabled() {
+        let err = PrefetchPolicy {
+            enabled: true,
+            min_query_count: 0,
+        }
+        .validate()
+        .expect_err("enabled prefetch policy must reject a zero threshold");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid prefetch policy: min_query_count must be ≥ 1 when prefetch is enabled"
+        );
     }
 }
