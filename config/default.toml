@@ -13,3 +13,10 @@ shard_cache_capacity = 128
 # used for centroid training.  Set to a positive integer to train centroids
 # from a random sample of that many vectors instead (e.g. 50000).
 # kmeans_sample_size = 50000
+
+# prefetch: optional shard warming based on query frequency.
+# When enabled, shards probed at least min_query_count times are warmed into
+# the cache proactively on the next cache-miss load event.
+[prefetch]
+enabled = false
+min_query_count = 3

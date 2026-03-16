@@ -16,7 +16,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use tracing::debug;
 
 use shardlake_core::{
+    config::PrefetchPolicy,
     error::CoreError,
     types::{DistanceMetric, SearchResult, ShardId, VectorRecord},
 };
@@ -134,6 +135,10 @@ impl RouteStage for CentroidRouter {
 /// to resolve the artifact key for each shard ID before fetching bytes from
 /// the store.  Evicts the least-recently-used shard when the cache is full.
 ///
+/// Optional shard warming can be enabled via [`CachedShardLoader::with_prefetch`].
+/// When active, shards whose probe count reaches the configured threshold are
+/// loaded proactively on the next cache-miss event.
+///
 /// Cache observability is available via [`CachedShardLoader::metrics`]: a
 /// shared [`CacheMetrics`] instance that tracks hits, misses, load latency,
 /// and retained bytes for every shard loaded through this loader.
@@ -142,6 +147,8 @@ pub struct CachedShardLoader {
     manifest: Manifest,
     metrics: Arc<CacheMetrics>,
     cache: ShardCache<ShardIndex>,
+    access_counts: Mutex<HashMap<ShardId, u64>>,
+    policy: Option<PrefetchPolicy>,
 }
 
 impl CachedShardLoader {
@@ -173,7 +180,16 @@ impl CachedShardLoader {
             manifest,
             metrics: Arc::new(CacheMetrics::new()),
             cache: ShardCache::new(capacity),
+            access_counts: Mutex::new(HashMap::new()),
+            policy: None,
         }
+    }
+
+    /// Enable best-effort warming of hot shards after cache misses.
+    #[must_use]
+    pub fn with_prefetch(mut self, policy: PrefetchPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// Return a shared reference to the cache metrics for this loader.
@@ -183,10 +199,72 @@ impl CachedShardLoader {
     pub fn metrics(&self) -> Arc<CacheMetrics> {
         Arc::clone(&self.metrics)
     }
+
+    fn record_access(&self, shard_id: ShardId) -> Result<()> {
+        let mut counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("shard loader access-count lock poisoned".into()))?;
+        *counts.entry(shard_id).or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn prefetch_candidates(&self) -> Result<Vec<(ShardId, String)>> {
+        let Some(policy) = self.policy.as_ref().filter(|policy| policy.enabled) else {
+            return Ok(Vec::new());
+        };
+
+        let threshold = u64::from(policy.min_query_count);
+        let counts = self
+            .access_counts
+            .lock()
+            .map_err(|_| IndexError::Other("shard loader access-count lock poisoned".into()))?;
+
+        self.manifest
+            .shards
+            .iter()
+            .filter(|shard| counts.get(&shard.shard_id).copied().unwrap_or(0) >= threshold)
+            .filter_map(|shard| match self.cache.contains(shard.shard_id) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok((shard.shard_id, shard.artifact_key.clone()))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    fn warm_hot_shards(&self) -> Result<()> {
+        for (shard_id, artifact_key) in self.prefetch_candidates()? {
+            let mut retained_bytes = None;
+            match self.cache.get_or_load_with_status(shard_id, || {
+                let started = Instant::now();
+                let bytes = self.store.get(&artifact_key);
+                self.metrics
+                    .record_load_attempt(started.elapsed().as_nanos() as u64);
+                let bytes = bytes?;
+                retained_bytes = Some(bytes.len() as u64);
+                Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+            }) {
+                Ok((_, CacheAccess::Miss)) => {
+                    if let Some(bytes) = retained_bytes {
+                        self.metrics.record_retained_bytes(bytes);
+                    }
+                    debug!(?shard_id, "prefetch: warmed hot shard");
+                }
+                Ok((_, CacheAccess::Hit | CacheAccess::Raced)) => {}
+                Err(error) => {
+                    debug!(?shard_id, %error, "prefetch: failed to warm shard");
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        self.record_access(shard_id)?;
+
         let mut retained_bytes = None;
         let (shard, access) = self.cache.get_or_load_with_status(shard_id, || {
             let shard_def = self
@@ -211,6 +289,7 @@ impl LoadShardStage for CachedShardLoader {
                 if let Some(bytes) = retained_bytes {
                     self.metrics.record_retained_bytes(bytes);
                 }
+                self.warm_hot_shards()?;
             }
             CacheAccess::Raced => {}
         }

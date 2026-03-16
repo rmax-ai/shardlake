@@ -245,6 +245,15 @@ impl<V: Send + 'static> ShardCache<V> {
         Ok(self.lock()?.map.values().cloned().collect())
     }
 
+    /// Return whether `shard_id` is currently resident in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn contains(&self, shard_id: ShardId) -> Result<bool> {
+        Ok(self.lock()?.map.contains_key(&shard_id))
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, LruCache<ShardId, Arc<V>>>> {
         self.inner
             .lock()
