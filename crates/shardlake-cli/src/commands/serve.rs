@@ -9,7 +9,7 @@ use tracing::info;
 use shardlake_core::config::FanOutPolicy;
 use shardlake_index::{IndexSearcher, DEFAULT_SHARD_CACHE_CAPACITY};
 use shardlake_manifest::Manifest;
-use shardlake_serve::{build_router, AppState};
+use shardlake_serve::{build_router, AppState, PrometheusMetrics};
 use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 #[derive(Parser, Debug)]
@@ -67,7 +67,12 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
         manifest,
         args.shard_cache_capacity,
     ));
-    let state = AppState { searcher, fan_out };
+    let metrics = std::sync::Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
+    let state = AppState {
+        searcher,
+        fan_out,
+        metrics,
+    };
     let router = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

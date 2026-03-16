@@ -1,11 +1,12 @@
 use axum::{
     extract::{Json, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::error;
 
 use shardlake_core::{
@@ -72,6 +73,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/query", post(query_handler))
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -81,6 +83,27 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         status: "ok",
         index_version: version,
     })
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.searcher.cached_shard_bytes() {
+        Ok(retained_bytes) => {
+            let body = state.metrics.gather(retained_bytes);
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to gather metrics: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn query_handler(
@@ -141,8 +164,10 @@ async fn query_handler(
 
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
+    let metrics = Arc::clone(&state.metrics);
     let vector = req.vector;
     let rerank = req.rerank.unwrap_or(false);
+    let timer = metrics.query_duration_seconds.start_timer();
     let manifest = searcher.manifest();
     let pq_metric_override_rejected = manifest.compression.enabled
         && manifest.compression.codec == PQ8_CODEC
@@ -181,24 +206,36 @@ async fn query_handler(
     })
     .await
     {
-        Ok(Ok(results)) => Json(QueryResponse {
-            results,
-            index_version: version,
-        })
-        .into_response(),
-        Ok(Err(IndexError::Core(CoreError::DimensionMismatch { .. }))) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "query vector dimensions do not match the index"
-            })),
-        )
-            .into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(Ok(results)) => {
+            timer.observe_duration();
+            metrics.queries_total.inc();
+            metrics.query_results_total.inc_by(results.len() as u64);
+            Json(QueryResponse {
+                results,
+                index_version: version,
+            })
+            .into_response()
+        }
+        Ok(Err(IndexError::Core(CoreError::DimensionMismatch { .. }))) => {
+            timer.stop_and_discard();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "query vector dimensions do not match the index"
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            timer.stop_and_discard();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
         Err(e) => {
+            timer.stop_and_discard();
             error!(error = %e, "search task failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -228,7 +265,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::*;
-    use crate::AppState;
+    use crate::{AppState, PrometheusMetrics};
 
     fn make_test_router() -> (Router, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -270,6 +307,7 @@ mod tests {
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
         let state = AppState {
             searcher,
             fan_out: FanOutPolicy {
@@ -277,6 +315,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            metrics,
         };
         (build_router(state), tmp)
     }
@@ -321,6 +360,7 @@ mod tests {
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
         let state = AppState {
             searcher,
             fan_out: FanOutPolicy {
@@ -328,6 +368,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            metrics,
         };
         (build_router(state), tmp)
     }
@@ -388,6 +429,7 @@ mod tests {
             })
             .expect("build index");
         let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
         let state = AppState {
             searcher,
             fan_out: FanOutPolicy {
@@ -395,6 +437,7 @@ mod tests {
                 candidate_shards: 0,
                 max_vectors_per_shard: 0,
             },
+            metrics,
         };
         (build_router(state), tmp)
     }
@@ -577,6 +620,116 @@ mod tests {
         assert_eq!(payload.index_version, "idx-test");
         assert_eq!(payload.results.len(), 1);
         assert_eq!(payload.results[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
+    async fn metrics_route_returns_200_with_prometheus_content_type() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/plain"),
+            "expected text/plain content-type, got: {content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_route_contains_expected_metric_families() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_str = std::str::from_utf8(&body).expect("utf-8 metrics body");
+
+        for metric in &[
+            "shardlake_query_duration_seconds",
+            "shardlake_queries_total",
+            "shardlake_query_results_total",
+            "shardlake_shard_cache_hits_total",
+            "shardlake_shard_cache_misses_total",
+            "shardlake_shard_load_count_total",
+            "shardlake_shard_load_latency_ns_total",
+            "shardlake_shard_cache_retained_bytes",
+        ] {
+            assert!(
+                body_str.contains(metric),
+                "missing metric {metric} in:\n{body_str}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_route_increments_after_query() {
+        let (app, _tmp) = make_test_router();
+
+        // Issue a query first, then check the metrics endpoint.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_str = std::str::from_utf8(&body).expect("utf-8 metrics body");
+        assert!(
+            body_str.contains("shardlake_queries_total 1"),
+            "expected queries_total=1 after one query, got:\n{body_str}"
+        );
+        assert!(
+            body_str.contains("shardlake_query_results_total 1"),
+            "expected query_results_total=1 after one result, got:\n{body_str}"
+        );
+        assert!(
+            body_str
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("shardlake_shard_cache_retained_bytes ")
+                        .map(str::trim)
+                })
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0),
+            "expected shardlake_shard_cache_retained_bytes > 0 after one query, got:\n{body_str}"
+        );
     }
 
     #[tokio::test]

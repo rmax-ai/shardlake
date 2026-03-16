@@ -1,7 +1,9 @@
 //! HTTP serving layer built on axum.
 
+pub mod prom;
 pub mod routes;
 
+pub use prom::PrometheusMetrics;
 pub use routes::build_router;
 
 use std::sync::Arc;
@@ -16,4 +18,6 @@ pub struct AppState {
     /// Default fan-out policy used when the query request does not supply
     /// per-request overrides.
     pub fan_out: FanOutPolicy,
+    /// Prometheus metrics registry updated by request handlers.
+    pub metrics: Arc<PrometheusMetrics>,
 }

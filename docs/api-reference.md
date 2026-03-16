@@ -201,3 +201,63 @@ distance scoring. Requests that override `distance_metric` to `"cosine"` or
 - **Inner product**: `score = -dot(a, b)`. Negated so that lower is always better; the most similar vector has the most negative raw dot product but the smallest (most negative → closest to zero) reported score.
 
 In all cases, results are sorted ascending by score (best match first).
+
+---
+
+## `GET /metrics`
+
+Returns a Prometheus text-format metrics payload (version 0.0.4) suitable for
+scraping by a Prometheus server or any compatible metrics collector.
+
+### Response
+
+The response body is plain text following the
+[Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format).
+
+**Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
+
+### Exposed metric families
+
+| Metric name | Type | Description |
+|-------------|------|-------------|
+| `shardlake_query_duration_seconds` | histogram | End-to-end query duration in seconds, bucketed at 1 ms–10 s. |
+| `shardlake_queries_total` | counter | Total number of successfully completed queries. |
+| `shardlake_query_results_total` | counter | Total number of result vectors returned across all queries (recall-oriented signal). |
+| `shardlake_shard_cache_hits_total` | gauge | Cumulative raw-shard cache hit count since server start. |
+| `shardlake_shard_cache_misses_total` | gauge | Cumulative raw-shard cache miss count since server start. |
+| `shardlake_shard_load_count_total` | gauge | Cumulative shard load attempt count since server start. |
+| `shardlake_shard_load_latency_ns_total` | gauge | Cumulative shard-load wall-clock time in nanoseconds since server start. |
+| `shardlake_shard_cache_retained_bytes` | gauge | Total raw bytes currently retained in the in-process shard cache. |
+
+> **Note:** Cache hit/miss/load metrics (`shardlake_shard_cache_hits_total`,
+> `shardlake_shard_cache_misses_total`, and `shardlake_shard_load_*`) are
+> exposed as gauges because they are read from monotonically increasing atomic
+> counters inside the searcher at scrape time. By contrast,
+> `shardlake_shard_cache_retained_bytes` is recomputed from the live shard
+> caches on each scrape and reflects the bytes currently resident in-process.
+
+### Example
+
+```bash
+curl -s http://localhost:8080/metrics
+```
+
+Example output (truncated):
+
+```
+# HELP shardlake_query_duration_seconds End-to-end query duration in seconds.
+# TYPE shardlake_query_duration_seconds histogram
+shardlake_query_duration_seconds_bucket{le="0.001"} 3
+shardlake_query_duration_seconds_bucket{le="0.005"} 5
+...
+shardlake_query_duration_seconds_count 5
+shardlake_query_duration_seconds_sum 0.012
+
+# HELP shardlake_queries_total Total completed query count.
+# TYPE shardlake_queries_total counter
+shardlake_queries_total 5
+
+# HELP shardlake_shard_cache_hits_total Cumulative raw-shard cache hit count since server start.
+# TYPE shardlake_shard_cache_hits_total gauge
+shardlake_shard_cache_hits_total 8
+```
