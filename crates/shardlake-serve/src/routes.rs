@@ -8,7 +8,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use shardlake_core::{config::FanOutPolicy, error::CoreError, types::SearchResult};
+use shardlake_core::{
+    config::{FanOutPolicy, QueryConfig},
+    error::CoreError,
+    types::{DistanceMetric, SearchResult},
+};
 use shardlake_index::IndexError;
 
 use crate::AppState;
@@ -33,6 +37,20 @@ pub struct QueryRequest {
     /// Maximum number of vectors to evaluate per probed shard.
     /// `0` means no limit.  Overrides the server default when present.
     pub max_vectors_per_shard: Option<u32>,
+    /// Maximum number of merged candidates passed to the reranker.
+    ///
+    /// When absent, the server falls back to the pipeline's
+    /// `rerank_oversample` factor.  When set, caps the candidate pool
+    /// handed to the reranker at this value.  Must be ≥ 1 when provided.
+    /// Only meaningful when `rerank` is `true`.
+    pub rerank_limit: Option<usize>,
+    /// Distance metric override for this query.
+    ///
+    /// When absent (default), the metric stored in the index manifest is
+    /// used.  When provided, overrides the manifest metric for this query
+    /// only.  Must be one of `"cosine"`, `"euclidean"`, or
+    /// `"inner_product"`.
+    pub distance_metric: Option<DistanceMetric>,
 }
 
 /// Query response envelope.
@@ -102,13 +120,18 @@ async fn query_handler(
         .max_vectors_per_shard
         .unwrap_or(state.fan_out.max_vectors_per_shard);
 
-    let policy = FanOutPolicy {
-        candidate_centroids,
-        candidate_shards,
-        max_vectors_per_shard,
+    let query_config = QueryConfig {
+        top_k: req.k,
+        fan_out: FanOutPolicy {
+            candidate_centroids,
+            candidate_shards,
+            max_vectors_per_shard,
+        },
+        rerank_limit: req.rerank_limit,
+        distance_metric: req.distance_metric,
     };
 
-    if let Err(e) = policy.validate() {
+    if let Err(e) = query_config.validate() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -119,8 +142,9 @@ async fn query_handler(
     let version = state.searcher.manifest().index_version.0.clone();
     let searcher = state.searcher.clone();
     let vector = req.vector;
-    let k = req.k;
     let rerank = req.rerank.unwrap_or(false);
+    let policy = query_config.fan_out.clone();
+    let k = query_config.top_k;
     match tokio::task::spawn_blocking(move || {
         let ann_results = searcher.search(&vector, k, &policy)?;
         if rerank {
@@ -409,5 +433,69 @@ mod tests {
         assert_eq!(payload.index_version, "idx-test");
         assert_eq!(payload.results.len(), 1);
         assert_eq!(payload.results[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
+    async fn query_route_accepts_rerank_limit() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"candidate_centroids":1,"rerank":true,"rerank_limit":5}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_route_rejects_zero_rerank_limit() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"vector":[1.0,0.0],"k":1,"rerank_limit":0}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rerank_limit"),
+            "expected error mentioning rerank_limit, got: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_route_accepts_distance_metric_override() {
+        let (app, _tmp) = make_test_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"distance_metric":"euclidean"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

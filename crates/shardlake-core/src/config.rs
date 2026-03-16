@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::error::CoreError;
+use crate::{error::CoreError, types::DistanceMetric};
 
 /// Default K-means RNG seed used for reproducible shard partitioning.
 ///
@@ -116,6 +116,81 @@ impl Default for PrefetchPolicy {
         Self {
             enabled: false,
             min_query_count: Self::default_min_query_count(),
+        }
+    }
+}
+
+/// Per-query execution configuration.
+///
+/// Bundles all the knobs that tune a single ANN query: how many results to
+/// return, how wide to fan out across shards, an optional cap on the number of
+/// rerank candidates, and an optional per-query distance metric override.
+///
+/// # Defaults
+///
+/// Use [`QueryConfig::default`] to get a sensible starting point:
+/// - `top_k = 10`
+/// - `fan_out = FanOutPolicy::default()` (2 centroids, no caps)
+/// - `rerank_limit = None` (no limit; use the pipeline's `rerank_oversample`)
+/// - `distance_metric = None` (use the metric stored in the manifest)
+///
+/// # Validation
+///
+/// Call [`QueryConfig::validate`] before using a config obtained from
+/// untrusted input (e.g. an HTTP request body).  Returns
+/// [`CoreError::InvalidQueryConfig`] when any invariant is violated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    /// Number of results to return.  Must be ≥ 1.
+    pub top_k: usize,
+    /// Fan-out policy controlling centroid and shard selection.
+    pub fan_out: FanOutPolicy,
+    /// Maximum number of merged candidates passed to the reranker.
+    ///
+    /// When `None` (default) the pipeline falls back to multiplying `top_k`
+    /// by its configured `rerank_oversample` factor.  When `Some(n)`, exactly
+    /// `n` merged candidates are handed to the reranker before it returns the
+    /// final top-`top_k` results.  Must be ≥ 1 when set.
+    #[serde(default)]
+    pub rerank_limit: Option<usize>,
+    /// Distance metric for this query.
+    ///
+    /// When `None` (default), the metric recorded in the index manifest is
+    /// used.  When `Some(metric)`, the specified metric overrides the manifest
+    /// value for this query only.
+    #[serde(default)]
+    pub distance_metric: Option<DistanceMetric>,
+}
+
+impl QueryConfig {
+    /// Validate the configuration.
+    ///
+    /// Returns [`CoreError::InvalidQueryConfig`] when:
+    /// - `top_k` is `0`,
+    /// - the embedded [`FanOutPolicy`] is invalid (delegates to
+    ///   [`FanOutPolicy::validate`]), or
+    /// - `rerank_limit` is `Some(0)`.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.top_k == 0 {
+            return Err(CoreError::InvalidQueryConfig("top_k must be ≥ 1".into()));
+        }
+        self.fan_out.validate()?;
+        if self.rerank_limit == Some(0) {
+            return Err(CoreError::InvalidQueryConfig(
+                "rerank_limit must be ≥ 1 when set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            top_k: 10,
+            fan_out: FanOutPolicy::default(),
+            rerank_limit: None,
+            distance_metric: None,
         }
     }
 }
@@ -284,7 +359,7 @@ where
 mod tests {
     use serde_json::json;
 
-    use super::{PrefetchPolicy, SystemConfig};
+    use super::{FanOutPolicy, PrefetchPolicy, QueryConfig, SystemConfig};
 
     #[test]
     fn system_config_rejects_zero_shard_cache_capacity() {
@@ -315,5 +390,71 @@ mod tests {
             err.to_string(),
             "invalid prefetch policy: min_query_count must be ≥ 1 when prefetch is enabled"
         );
+    }
+
+    #[test]
+    fn query_config_rejects_zero_top_k() {
+        let err = QueryConfig {
+            top_k: 0,
+            ..QueryConfig::default()
+        }
+        .validate()
+        .expect_err("top_k = 0 must be rejected");
+
+        assert!(
+            err.to_string().contains("top_k must be ≥ 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn query_config_rejects_zero_rerank_limit() {
+        let err = QueryConfig {
+            rerank_limit: Some(0),
+            ..QueryConfig::default()
+        }
+        .validate()
+        .expect_err("rerank_limit = 0 must be rejected");
+
+        assert!(
+            err.to_string().contains("rerank_limit must be ≥ 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn query_config_rejects_invalid_fan_out() {
+        let err = QueryConfig {
+            fan_out: FanOutPolicy {
+                candidate_centroids: 0,
+                ..Default::default()
+            },
+            ..QueryConfig::default()
+        }
+        .validate()
+        .expect_err("candidate_centroids = 0 must be rejected");
+
+        assert!(
+            err.to_string().contains("candidate_centroids"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn query_config_valid_with_all_fields() {
+        use crate::types::DistanceMetric;
+        let config = QueryConfig {
+            top_k: 5,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 3,
+                candidate_shards: 2,
+                max_vectors_per_shard: 100,
+            },
+            rerank_limit: Some(20),
+            distance_metric: Some(DistanceMetric::Cosine),
+        };
+        config
+            .validate()
+            .expect("fully specified config must be valid");
     }
 }
