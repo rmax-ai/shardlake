@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use rayon::prelude::*;
@@ -20,6 +21,7 @@ use crate::{
     cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    metrics::CacheMetrics,
     pq::PqCodebook,
     shard::{PqShard, ShardIndex},
     IndexError, Result, MMAP_MIN_SIZE_BYTES, PQ8_CODEC,
@@ -44,6 +46,8 @@ pub struct IndexSearcher {
     mmap_threshold: u64,
     access_counts: Mutex<HashMap<ShardId, u64>>,
     prefetch: Option<PrefetchPolicy>,
+    /// Cache observability counters shared with external monitoring.
+    cache_metrics: Arc<CacheMetrics>,
 }
 
 impl IndexSearcher {
@@ -124,6 +128,7 @@ impl IndexSearcher {
             mmap_threshold,
             access_counts: Mutex::new(HashMap::new()),
             prefetch: None,
+            cache_metrics: Arc::new(CacheMetrics::new()),
         }
     }
 
@@ -152,6 +157,14 @@ impl IndexSearcher {
     /// Return the underlying manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Return a shared reference to the cache observability counters.
+    ///
+    /// The returned [`Arc`] points to the same instance used internally, so
+    /// callers observe live counter updates without extra synchronisation cost.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.cache_metrics)
     }
 
     /// Perform approximate top-k search using the provided [`FanOutPolicy`].
@@ -488,7 +501,7 @@ impl IndexSearcher {
 
     /// Load a PQ-encoded shard from cache or store.
     fn load_pq_shard(&self, shard_id: ShardId) -> Result<Arc<PqShard>> {
-        self.pq_shard_cache.get_or_load(shard_id, || {
+        let (shard, access) = self.pq_shard_cache.get_or_load_with_status(shard_id, || {
             let shard_def = self
                 .manifest
                 .shards
@@ -496,7 +509,11 @@ impl IndexSearcher {
                 .find(|s| s.shard_id == shard_id)
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
+            self.cache_metrics.record_miss();
+            let started = Instant::now();
             let bytes = self.store.get(&shard_def.artifact_key)?;
+            self.cache_metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
             let shard = Arc::new(PqShard::from_bytes(&bytes)?);
             if shard.dims != self.manifest.dims as usize {
                 return Err(IndexError::Other(format!(
@@ -517,7 +534,13 @@ impl IndexSearcher {
                 )));
             }
             Ok(shard)
-        })
+        })?;
+
+        if matches!(access, crate::cache::CacheAccess::Hit) {
+            self.cache_metrics.record_hit();
+        }
+
+        Ok(shard)
     }
 
     // ── Raw shard path ────────────────────────────────────────────────────────
@@ -616,13 +639,26 @@ impl IndexSearcher {
                 .iter()
                 .find(|s| s.shard_id == shard_id)
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-            Ok(Arc::new(
-                self.load_raw_shard_uncached(&shard_def.artifact_key)?,
-            ))
+            self.cache_metrics.record_miss();
+            let started = Instant::now();
+            let result = self.load_raw_shard_uncached(&shard_def.artifact_key)?;
+            self.cache_metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
+            Ok(Arc::new(result))
         })?;
 
-        if matches!(access, crate::cache::CacheAccess::Miss) {
-            self.warm_hot_shards()?;
+        match access {
+            crate::cache::CacheAccess::Hit => {
+                self.cache_metrics.record_hit();
+            }
+            crate::cache::CacheAccess::Miss => {
+                self.warm_hot_shards()?;
+            }
+            // Raced: another thread inserted this shard between the miss
+            // detection and our load completing.  The load was counted in the
+            // closure above (record_miss + record_load_attempt), so no
+            // additional metric update is needed here.
+            crate::cache::CacheAccess::Raced => {}
         }
 
         Ok(shard)
