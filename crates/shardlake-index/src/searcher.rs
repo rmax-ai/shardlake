@@ -24,6 +24,7 @@ use crate::{
     metrics::CacheMetrics,
     plugin::{AnnPlugin, IvfFlatPlugin, IvfPqPlugin},
     pq::PqCodebook,
+    query_plan::QueryPlan,
     shard::{PqShard, ShardIndex},
     IndexError, Result, MMAP_MIN_SIZE_BYTES, PQ8_CODEC,
 };
@@ -49,6 +50,22 @@ pub struct IndexSearcher {
     prefetch: Option<PrefetchPolicy>,
     /// Cache observability counters shared with external monitoring.
     cache_metrics: Arc<CacheMetrics>,
+}
+
+/// Intermediate result of the IVF routing step, shared by [`IndexSearcher::search`]
+/// and [`IndexSearcher::search_with_plan`].
+struct RouteResult {
+    /// Shard IDs to probe after centroid selection and deduplication.
+    probe_shards: Vec<ShardId>,
+    /// Centroid vectors that were selected (one per probe index, in selection
+    /// order). Populated only when the caller explicitly asks to capture them.
+    selected_centroids: Vec<Vec<f32>>,
+    /// Distance metric derived from the manifest.
+    metric: DistanceMetric,
+    /// Whether PQ-encoded shards should be searched.
+    pq_enabled: bool,
+    /// Per-shard vector cap carried from the fan-out policy.
+    max_vectors_per_shard: u32,
 }
 
 impl IndexSearcher {
@@ -231,6 +248,74 @@ impl IndexSearcher {
         policy: &FanOutPolicy,
         metric: DistanceMetric,
     ) -> Result<Vec<SearchResult>> {
+        let routed = self.route_query(query, policy, false, metric)?;
+        if routed.probe_shards.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fan_out_search(query, k, &routed)
+    }
+
+    /// Perform approximate top-k search and capture a [`QueryPlan`] with the
+    /// routing decisions made during the execution.
+    ///
+    /// The returned [`QueryPlan`] records:
+    /// - the centroid vectors that were selected during IVF routing
+    ///   (`selected_centroids`),
+    /// - the shard IDs probed after centroid-to-shard mapping and deduplication
+    ///   (`searched_shards`), and
+    /// - the candidate vectors returned by the fan-out search, before any
+    ///   reranking (`candidate_vectors`).
+    ///
+    /// The search semantics are identical to [`IndexSearcher::search`].
+    pub fn search_with_plan(
+        &self,
+        query: &[f32],
+        k: usize,
+        policy: &FanOutPolicy,
+    ) -> Result<QueryPlan> {
+        self.search_with_plan_with_metric(query, k, policy, self.manifest.distance_metric)
+    }
+
+    /// Perform approximate top-k search with an explicit scoring metric and
+    /// capture the resulting [`QueryPlan`].
+    ///
+    /// The routing centroids are still selected using the index's routing
+    /// configuration; `metric` affects only candidate scoring and plan output.
+    pub fn search_with_plan_with_metric(
+        &self,
+        query: &[f32],
+        k: usize,
+        policy: &FanOutPolicy,
+        metric: DistanceMetric,
+    ) -> Result<QueryPlan> {
+        let routed = self.route_query(query, policy, true, metric)?;
+        if routed.probe_shards.is_empty() {
+            return Ok(QueryPlan {
+                selected_centroids: Vec::new(),
+                searched_shards: Vec::new(),
+                candidate_vectors: Vec::new(),
+            });
+        }
+        let candidate_vectors = self.fan_out_search(query, k, &routed)?;
+        Ok(QueryPlan {
+            selected_centroids: routed.selected_centroids,
+            searched_shards: routed.probe_shards,
+            candidate_vectors,
+        })
+    }
+
+    /// Resolve the IVF routing step: collect centroids, select the top-n
+    /// candidates, and map them to deduplicated shard IDs.
+    ///
+    /// Returns an empty `probe_shards` when no centroids are present (empty
+    /// index), which callers must check before invoking [`Self::fan_out_search`].
+    fn route_query(
+        &self,
+        query: &[f32],
+        policy: &FanOutPolicy,
+        capture_selected_centroids: bool,
+        metric: DistanceMetric,
+    ) -> Result<RouteResult> {
         let expected_dims = self.manifest.dims as usize;
         if query.len() != expected_dims {
             return Err(IndexError::Core(CoreError::DimensionMismatch {
@@ -242,17 +327,14 @@ impl IndexSearcher {
         let pq_enabled =
             self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
-        // ===== SELECT BACKEND via ANN plugin =====
-        // Construct the plugin from manifest state and validate it once before
-        // the shard fan-out.  This replaces algorithm-specific branching at the
-        // integration edge with a single shared interface.
+        // Validate the selected ANN backend once at the routing edge so
+        // unsupported metric/backend combinations fail before any shard work.
         let plugin: Box<dyn AnnPlugin> = if pq_enabled {
             Box::new(IvfPqPlugin::new(self.load_codebook()?))
         } else {
             Box::new(IvfFlatPlugin)
         };
         plugin.validate(expected_dims, metric)?;
-        let stage = plugin.candidate_stage();
 
         // Collect centroids for routing from the manifest when available (manifest v2+).
         // Shards built with an older builder (manifest v1) have an empty centroid vec; for
@@ -285,13 +367,28 @@ impl IndexSearcher {
         }
 
         if all_centroids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RouteResult {
+                probe_shards: Vec::new(),
+                selected_centroids: Vec::new(),
+                metric,
+                pq_enabled,
+                max_vectors_per_shard: policy.max_vectors_per_shard,
+            });
         }
 
         // ===== ROUTING STEP =====
         // Select the top `candidate_centroids` nearest IVF centroids.
         let n_centroids = (policy.candidate_centroids as usize).min(all_centroids.len());
         let probe_indices = top_n_centroids(query, &all_centroids, n_centroids);
+
+        let selected_centroids = if capture_selected_centroids {
+            probe_indices
+                .iter()
+                .filter_map(|&i| all_centroids.get(i).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Map centroid indices to shard ids and deduplicate.
         let mut probe_shards: Vec<ShardId> = probe_indices
@@ -314,16 +411,39 @@ impl IndexSearcher {
             "Probing shards"
         );
 
-        // ===== SHARD FAN-OUT (unified — no algorithm-specific branching) =====
-        // Both IVF-flat and IVF-PQ go through the same call site.  The stage
-        // obtained from the plugin determines the actual distance computation.
-        let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
+        Ok(RouteResult {
+            probe_shards,
+            selected_centroids,
+            metric,
+            pq_enabled,
+            max_vectors_per_shard: policy.max_vectors_per_shard,
+        })
+    }
+
+    /// Execute the fan-out search across the probed shards described in
+    /// `routed`. Callers must ensure `routed.probe_shards` is non-empty.
+    fn fan_out_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        routed: &RouteResult,
+    ) -> Result<Vec<SearchResult>> {
+        let plugin: Box<dyn AnnPlugin> = if routed.pq_enabled {
+            Box::new(IvfPqPlugin::new(self.load_codebook()?))
+        } else {
+            Box::new(IvfFlatPlugin)
+        };
+        plugin.validate(self.manifest.dims as usize, routed.metric)?;
+        let stage = plugin.candidate_stage();
+
+        let shard_results: Result<Vec<Vec<SearchResult>>> = routed
+            .probe_shards
             .par_iter()
             .map(|&shard_id| {
                 let shard = self.load_shard_for_stage(shard_id)?;
                 // Apply max_vectors_per_shard limit when requested.
-                let limited: Arc<ShardIndex> = if policy.max_vectors_per_shard > 0 {
-                    let limit = (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                let limited: Arc<ShardIndex> = if routed.max_vectors_per_shard > 0 {
+                    let limit = (routed.max_vectors_per_shard as usize).min(shard.records.len());
                     Arc::new(ShardIndex {
                         shard_id: shard.shard_id,
                         dims: shard.dims,
@@ -333,7 +453,7 @@ impl IndexSearcher {
                 } else {
                     Arc::clone(&shard)
                 };
-                stage.search(query, &limited, metric, k)
+                stage.search(query, &limited, routed.metric, k)
             })
             .collect();
 
@@ -342,7 +462,7 @@ impl IndexSearcher {
         // Enrich results with metadata from the metadata artifact when it exists.
         // For PQ-compressed indexes this replicates the per-result metadata that
         // was previously attached in the now-removed dedicated PQ search path.
-        if pq_enabled {
+        if routed.pq_enabled {
             if let Some(metadata_map) = self.try_load_metadata_map()? {
                 for result in &mut all_results {
                     if result.metadata.is_none() {
@@ -1298,6 +1418,84 @@ mod tests {
             shard_loads.load(Ordering::SeqCst),
             before,
             "hot shard should be cache-resident after warming"
+        );
+    }
+
+    #[test]
+    fn search_with_plan_captures_routing_details() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let plan = searcher
+            .search_with_plan(&[1.0, 0.0], 1, &policy)
+            .expect("search_with_plan");
+
+        assert!(
+            !plan.selected_centroids.is_empty(),
+            "expected at least one selected centroid"
+        );
+        for centroid in &plan.selected_centroids {
+            assert_eq!(centroid.len(), 2, "centroid must have index dimensionality");
+        }
+        assert!(
+            !plan.searched_shards.is_empty(),
+            "expected at least one searched shard"
+        );
+        assert!(
+            !plan.candidate_vectors.is_empty(),
+            "expected at least one candidate vector"
+        );
+    }
+
+    #[test]
+    fn search_with_plan_matches_search_results() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let query = &[1.0_f32, 0.0];
+        let k = 2;
+
+        let results = searcher.search(query, k, &policy).expect("search");
+        let plan = searcher
+            .search_with_plan(query, k, &policy)
+            .expect("search_with_plan");
+
+        assert_eq!(
+            results.len(),
+            plan.candidate_vectors.len(),
+            "candidate_vectors must match search results"
+        );
+        for (result, candidate) in results.iter().zip(plan.candidate_vectors.iter()) {
+            assert_eq!(result.id, candidate.id);
+        }
+    }
+
+    #[test]
+    fn search_with_plan_rejects_dimension_mismatch() {
+        let tmp = tempdir().unwrap();
+        let searcher = build_test_searcher(&tmp);
+
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let err = searcher
+            .search_with_plan(&[1.0, 2.0, 3.0], 1, &policy)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "core error: dimension mismatch: expected 2, got 3"
         );
     }
 

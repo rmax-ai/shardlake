@@ -151,8 +151,16 @@ pub async fn run(storage: PathBuf, args: BenchmarkArgs) -> Result<()> {
                 report.benchmark.throughput_qps
             );
             println!(
-                "  Artifact size:     {} bytes",
-                report.benchmark.artifact_size_bytes
+                "  Disk footprint:    {} bytes",
+                report.benchmark.cost_metrics.disk_footprint_bytes
+            );
+            println!(
+                "  Memory usage:      {} bytes",
+                report.benchmark.cost_metrics.memory_usage_bytes
+            );
+            println!(
+                "  Compression ratio: {:.2}x",
+                report.benchmark.cost_metrics.compression_ratio
             );
         }
         OutputFormat::Json => {

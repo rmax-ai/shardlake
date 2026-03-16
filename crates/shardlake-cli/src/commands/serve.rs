@@ -43,6 +43,12 @@ pub struct ServeArgs {
         value_parser = parse_positive_shard_cache_capacity
     )]
     pub shard_cache_capacity: usize,
+    /// Expose diagnostic routes such as `POST /debug/query-plan`.
+    ///
+    /// Disabled by default because these endpoints reveal internal routing
+    /// details intended for local debugging rather than public production use.
+    #[arg(long, default_value_t = false)]
+    pub enable_debug_routes: bool,
 }
 
 pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
@@ -71,6 +77,7 @@ pub async fn run(storage: PathBuf, args: ServeArgs) -> Result<()> {
     let state = AppState {
         searcher,
         fan_out,
+        debug_routes_enabled: args.enable_debug_routes,
         metrics,
     };
     let router = build_router(state);
@@ -106,5 +113,18 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("--shard-cache-capacity"));
         assert!(message.contains("value must be greater than 0"));
+    }
+
+    #[test]
+    fn serve_args_debug_routes_disabled_by_default() {
+        let args = ServeArgs::try_parse_from(["shardlake"]).expect("default args parse");
+        assert!(!args.enable_debug_routes);
+    }
+
+    #[test]
+    fn serve_args_accept_enable_debug_routes_flag() {
+        let args = ServeArgs::try_parse_from(["shardlake", "--enable-debug-routes"])
+            .expect("flag args parse");
+        assert!(args.enable_debug_routes);
     }
 }

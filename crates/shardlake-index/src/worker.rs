@@ -19,8 +19,9 @@
 //!    built shard.  A [`WorkerOutput`] containing all shard descriptors is also
 //!    written to storage.
 //!
-//! 3. **Merge** (future) – A coordinator collects all [`WorkerOutput`]
-//!    descriptors and assembles the final [`shardlake_manifest::Manifest`].
+//! 3. **Merge** – A coordinator collects all [`WorkerOutput`]
+//!    descriptors and assembles the final [`shardlake_manifest::Manifest`]
+//!    by calling [`merge_worker_outputs`].
 //!
 //! # Reproducibility
 //!
@@ -29,6 +30,7 @@
 //! assignments and centroid layout.  Workers therefore always produce identical
 //! artifact bytes and fingerprints for the same inputs.
 
+use chrono::{DateTime, Utc};
 use rand::{seq::SliceRandom, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -38,6 +40,10 @@ use shardlake_core::{
     types::{
         DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId, VectorRecord,
     },
+};
+use shardlake_manifest::{
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, RoutingMetadata, ShardDef,
+    ShardSummary,
 };
 use shardlake_storage::ObjectStore;
 
@@ -112,6 +118,19 @@ pub struct WorkerPlan {
     /// Number of workers actually used (may be less than requested when there
     /// are fewer non-empty shards than requested workers).
     pub num_workers: usize,
+    /// Number of K-means iterations used during planning.
+    #[serde(default = "default_kmeans_iters")]
+    pub kmeans_iters: u32,
+    /// RNG seed used for K-means centroid initialisation.
+    #[serde(default = "default_kmeans_seed")]
+    pub kmeans_seed: u64,
+    /// Effective bounded sample size used during centroid training, when
+    /// sampling actually occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kmeans_sample_size: Option<u32>,
+    /// Default `nprobe` value to record in the final manifest.
+    #[serde(default = "default_nprobe")]
+    pub nprobe_default: u32,
     /// Storage key of the trained IVF coarse-quantizer artifact.
     pub coarse_quantizer_key: String,
     /// All non-empty shard centroids, one per shard, in `ShardId` order.
@@ -129,6 +148,18 @@ impl WorkerPlan {
     pub fn assignment(&self, worker_id: usize) -> Option<&WorkerAssignment> {
         self.assignments.get(worker_id)
     }
+}
+
+fn default_kmeans_iters() -> u32 {
+    20
+}
+
+fn default_kmeans_seed() -> u64 {
+    shardlake_core::config::DEFAULT_KMEANS_SEED
+}
+
+fn default_nprobe() -> u32 {
+    SystemConfig::default().nprobe
 }
 
 // ─── Output types ────────────────────────────────────────────────────────────
@@ -167,6 +198,228 @@ pub struct WorkerOutput {
     pub index_version: IndexVersion,
     /// One entry per shard built by this worker.
     pub shards: Vec<WorkerShardOutput>,
+}
+
+// ─── Merge ───────────────────────────────────────────────────────────────────
+
+/// Parameters required to finalise a distributed build via
+/// [`merge_worker_outputs`].
+pub struct MergeParams {
+    /// Alias name to record in the manifest (e.g. `"latest"`).
+    pub alias: String,
+    /// Timestamp to record as the build time in the manifest.
+    pub built_at: DateTime<Utc>,
+    /// Crate version string recorded in [`BuildMetadata::builder_version`].
+    pub builder_version: String,
+    /// Wall-clock duration of the full distributed build in seconds.
+    pub build_duration_secs: f64,
+}
+
+/// Assemble the final [`Manifest`] from all worker outputs produced by a
+/// distributed build.
+///
+/// The merge step is the third and final phase of a distributed build:
+///
+/// 1. **Plan** – [`plan_workers`] trains the IVF quantizer and partitions shard
+///    assignments.
+/// 2. **Execute** – Each worker calls [`WorkerBuilder::execute`] and writes
+///    shard artifacts and an `output.json` descriptor.
+/// 3. **Merge** – This function collects all [`WorkerOutput`] descriptors and
+///    assembles the final [`Manifest`], which can then be saved to storage.
+///
+/// # Determinism
+///
+/// Shards are sorted by [`ShardId`] ascending before being written into the
+/// manifest, so equivalent sets of worker outputs always produce an identical
+/// manifest regardless of the order in which `outputs` are supplied.
+///
+/// # Errors
+///
+/// Returns [`IndexError::Other`] when any of the following validation checks
+/// fail:
+///
+/// - `outputs` is empty.
+/// - A [`WorkerOutput`] has a [`WorkerOutput::index_version`] that does not
+///   match the plan's index version.
+/// - Two outputs share the same `worker_id` (duplicate worker).
+/// - A worker output's `worker_id` is out of range for the plan.
+/// - A [`WorkerShardOutput`] names a different `worker_id` than its parent
+///   [`WorkerOutput`].
+/// - The set of shard IDs across all outputs does not exactly match the set
+///   of shard IDs in the plan (missing or unexpected shard).
+/// - A shard ID appears more than once across all outputs (duplicate shard).
+pub fn merge_worker_outputs(
+    plan: &WorkerPlan,
+    outputs: Vec<WorkerOutput>,
+    params: MergeParams,
+) -> Result<Manifest> {
+    if outputs.is_empty() {
+        return Err(IndexError::Other(
+            "merge requires at least one worker output".into(),
+        ));
+    }
+
+    // ── Validate index version consistency ──────────────────────────────────
+    for output in &outputs {
+        if output.index_version != plan.index_version {
+            return Err(IndexError::Other(format!(
+                "worker {} output index_version '{}' does not match plan index_version '{}'",
+                output.worker_id, output.index_version, plan.index_version
+            )));
+        }
+    }
+
+    // ── Check for duplicate worker IDs ──────────────────────────────────────
+    let mut seen_workers: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(outputs.len());
+    for output in &outputs {
+        if !seen_workers.insert(output.worker_id) {
+            return Err(IndexError::Other(format!(
+                "duplicate worker output for worker_id {}",
+                output.worker_id
+            )));
+        }
+    }
+
+    // ── Check worker IDs are within range ───────────────────────────────────
+    for output in &outputs {
+        if output.worker_id >= plan.num_workers {
+            return Err(IndexError::Other(format!(
+                "worker output worker_id {} is out of range for plan with {} workers",
+                output.worker_id, plan.num_workers
+            )));
+        }
+    }
+
+    // ── Check for missing workers ────────────────────────────────────────────
+    for expected_id in 0..plan.num_workers {
+        if !seen_workers.contains(&expected_id) {
+            return Err(IndexError::Other(format!(
+                "missing output for worker_id {expected_id}"
+            )));
+        }
+    }
+
+    // ── Collect and validate all shard outputs ───────────────────────────────
+    let total_shards: usize = plan.shard_centroids.len();
+
+    // Flatten all shard outputs and check for duplicates.
+    let mut all_shards: Vec<WorkerShardOutput> = Vec::with_capacity(total_shards);
+    let mut seen_shard_ids: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(total_shards);
+
+    for output in outputs {
+        for shard_out in output.shards {
+            if shard_out.worker_id != output.worker_id {
+                return Err(IndexError::Other(format!(
+                    "shard_id {} reports worker_id {} but parent output is worker_id {}",
+                    shard_out.shard_id.0, shard_out.worker_id, output.worker_id
+                )));
+            }
+            if !seen_shard_ids.insert(shard_out.shard_id.0) {
+                return Err(IndexError::Other(format!(
+                    "duplicate shard_id {} in worker outputs",
+                    shard_out.shard_id.0
+                )));
+            }
+            // Validate the shard id is within the range declared by the plan.
+            if shard_out.shard_id.0 as usize >= total_shards {
+                return Err(IndexError::Other(format!(
+                    "shard_id {} is out of range; plan has {} shards",
+                    shard_out.shard_id.0, total_shards
+                )));
+            }
+            all_shards.push(shard_out);
+        }
+    }
+
+    // ── Validate full shard coverage ─────────────────────────────────────────
+    for expected_shard in 0..total_shards as u32 {
+        if !seen_shard_ids.contains(&expected_shard) {
+            return Err(IndexError::Other(format!(
+                "shard_id {expected_shard} is present in the plan but missing from worker outputs"
+            )));
+        }
+    }
+
+    // ── Sort shards deterministically by shard_id ────────────────────────────
+    all_shards.sort_by_key(|s| s.shard_id.0);
+
+    // ── Assemble ShardDefs ────────────────────────────────────────────────────
+    let shard_defs: Vec<ShardDef> = all_shards
+        .iter()
+        .map(|s| {
+            let file_location = s.artifact_key.clone();
+            ShardDef {
+                shard_id: s.shard_id,
+                artifact_key: s.artifact_key.clone(),
+                vector_count: s.vector_count,
+                fingerprint: s.fingerprint.clone(),
+                centroid: s.centroid.clone(),
+                routing: Some(RoutingMetadata {
+                    centroid_id: format!("shard-{:04}", s.shard_id.0),
+                    index_type: "flat".into(),
+                    file_location,
+                }),
+            }
+        })
+        .collect();
+
+    let total_vector_count: u64 = shard_defs.iter().map(|s| s.vector_count).sum();
+
+    let shard_summary = if shard_defs.is_empty() {
+        None
+    } else {
+        let min_count = shard_defs.iter().map(|s| s.vector_count).min().unwrap_or(0);
+        let max_count = shard_defs.iter().map(|s| s.vector_count).max().unwrap_or(0);
+        Some(ShardSummary {
+            num_shards: shard_defs.len() as u32,
+            min_shard_vector_count: min_count,
+            max_shard_vector_count: max_count,
+        })
+    };
+
+    let mut algo_params = std::collections::BTreeMap::new();
+    algo_params.insert("num_clusters".into(), serde_json::json!(total_shards));
+    algo_params.insert("num_shards".into(), serde_json::json!(total_shards));
+    algo_params.insert("kmeans_iters".into(), serde_json::json!(plan.kmeans_iters));
+    algo_params.insert("kmeans_seed".into(), serde_json::json!(plan.kmeans_seed));
+    if let Some(sample_size) = plan.kmeans_sample_size {
+        algo_params.insert("kmeans_sample_size".into(), serde_json::json!(sample_size));
+    }
+
+    let manifest = Manifest {
+        manifest_version: 4,
+        dataset_version: plan.dataset_version.clone(),
+        embedding_version: plan.embedding_version.clone(),
+        index_version: plan.index_version.clone(),
+        alias: params.alias,
+        dims: plan.dims as u32,
+        distance_metric: plan.metric,
+        vectors_key: plan.vectors_key.clone(),
+        metadata_key: plan.metadata_key.clone(),
+        total_vector_count,
+        shards: shard_defs,
+        build_metadata: BuildMetadata {
+            built_at: params.built_at,
+            builder_version: params.builder_version,
+            num_kmeans_iters: plan.kmeans_iters,
+            nprobe_default: plan.nprobe_default,
+            build_duration_secs: params.build_duration_secs,
+        },
+        algorithm: AlgorithmMetadata {
+            algorithm: "ivf-flat".into(),
+            variant: None,
+            params: algo_params,
+        },
+        shard_summary,
+        compression: CompressionConfig::default(),
+        recall_estimate: None,
+        coarse_quantizer_key: Some(plan.coarse_quantizer_key.clone()),
+        lexical: None,
+    };
+
+    Ok(manifest)
 }
 
 // ─── Planning ────────────────────────────────────────────────────────────────
@@ -236,24 +489,28 @@ pub fn plan_workers(
     let vecs: Vec<Vec<f32>> = records.iter().map(|r| r.data.clone()).collect();
 
     // Optionally sample a subset for centroid training (same logic as IndexBuilder).
-    let sampled: Option<Vec<Vec<f32>>> = match config.kmeans_sample_size {
-        Some(0) => {
-            return Err(IndexError::Other(
-                "kmeans_sample_size must be greater than 0".into(),
-            ))
-        }
-        Some(max_samples) => {
-            let sample_size = (max_samples as usize).min(vecs.len());
-            if sample_size >= vecs.len() {
-                None
-            } else {
-                let mut indices: Vec<usize> = (0..vecs.len()).collect();
-                let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
-                Some(shuffled.iter().map(|&i| vecs[i].clone()).collect())
+    let (sampled, effective_sample_size): (Option<Vec<Vec<f32>>>, Option<u32>) =
+        match config.kmeans_sample_size {
+            Some(0) => {
+                return Err(IndexError::Other(
+                    "kmeans_sample_size must be greater than 0".into(),
+                ))
             }
-        }
-        None => None,
-    };
+            Some(max_samples) => {
+                let sample_size = (max_samples as usize).min(vecs.len());
+                if sample_size >= vecs.len() {
+                    (None, None)
+                } else {
+                    let mut indices: Vec<usize> = (0..vecs.len()).collect();
+                    let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
+                    (
+                        Some(shuffled.iter().map(|&i| vecs[i].clone()).collect()),
+                        Some(sample_size as u32),
+                    )
+                }
+            }
+            None => (None, None),
+        };
     let training_vecs: &[Vec<f32>] = sampled.as_deref().unwrap_or(&vecs);
 
     info!(
@@ -340,6 +597,10 @@ pub fn plan_workers(
         vectors_key: params.vectors_key,
         metadata_key: params.metadata_key,
         num_workers,
+        kmeans_iters: config.kmeans_iters,
+        kmeans_seed: config.kmeans_seed,
+        kmeans_sample_size: effective_sample_size,
+        nprobe_default: config.nprobe,
         coarse_quantizer_key: cq_key,
         shard_centroids,
         assignments,
@@ -751,6 +1012,34 @@ mod tests {
             all_shard_ids, expected,
             "every shard must be assigned exactly once"
         );
+    }
+
+    #[test]
+    fn plan_workers_records_build_metadata() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 7,
+            nprobe: 5,
+            kmeans_seed: 1234,
+            kmeans_sample_size: Some(10),
+            ..SystemConfig::default()
+        };
+
+        let plan = plan_workers(
+            &store,
+            &config,
+            &two_cluster_records(),
+            plan_params("idx-plan-meta"),
+        )
+        .unwrap();
+
+        assert_eq!(plan.kmeans_iters, 7);
+        assert_eq!(plan.kmeans_seed, 1234);
+        assert_eq!(plan.kmeans_sample_size, Some(10));
+        assert_eq!(plan.nprobe_default, 5);
     }
 
     #[test]

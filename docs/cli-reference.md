@@ -193,7 +193,7 @@ multiple independent workers, each responsible for a subset of shards.  Use
 this instead of `build-index` when the dataset is too large to build on a
 single machine, or when you want to parallelize shard construction.
 
-The workflow has two phases: **`plan`** and **`execute`**.
+The workflow has three phases: **`plan`**, **`execute`**, and **`merge`**.
 
 ### Phase 1 – `plan`
 
@@ -304,6 +304,58 @@ done
 
 ---
 
+### Phase 3 – `merge`
+
+Collects all worker `output.json` descriptors for the given index version,
+validates that every shard in the plan is covered exactly once, and assembles
+the final `manifest.json`.  Run this **once** after all workers have finished
+their `execute` phase.
+
+#### Usage
+
+```
+shardlake [--storage <PATH>] build-index-worker --mode merge \
+  --index-version <STRING> [OPTIONS]
+```
+
+#### Arguments
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--index-version <STRING>` | string | *(required)* | Index version to merge (must match the prior `plan` and `execute` runs) |
+| `--alias <STRING>` | string | `latest` | Alias to record in the generated manifest |
+
+#### Output
+
+Writes to `<storage>/indexes/<index-version>/`:
+
+| File | Description |
+|------|-------------|
+| `manifest.json` | Final index manifest (shard list, vector counts, fingerprints, centroids) |
+
+#### Validation
+
+The merge step rejects inputs that are incomplete, duplicate, or inconsistent:
+
+| Error | Condition |
+|-------|-----------|
+| Missing worker output | A `workers/<id>/output.json` file is absent for any worker ID in `0..num_workers` |
+| Duplicate shard | The same `shard_id` appears in more than one worker's output |
+| Missing shard | A shard in the plan has no corresponding entry in any worker output |
+| Index version mismatch | A worker output's `index_version` differs from the plan |
+| Out-of-range worker ID | A worker output's `worker_id` is ≥ `num_workers` |
+
+#### Example
+
+```bash
+# After all workers have completed the execute phase:
+shardlake build-index-worker --mode merge \
+  --index-version idx-v1 \
+  --alias latest
+```
+
+---
+
 ## `shardlake publish`
 
 Creates or updates an alias pointer that maps a human-readable name (e.g. `latest`) to a
@@ -359,12 +411,14 @@ shardlake [--storage <PATH>] serve [OPTIONS]
 | `--candidate-shards <N>` | u32 | `0` | Cap the number of distinct shards probed after centroid-to-shard deduplication; `0` means no cap |
 | `--max-vectors-per-shard <N>` | u32 | `0` | Limit how many vectors are scored inside each probed shard; `0` means score the full shard |
 | `--shard-cache-capacity <N>` | usize | `128` | Maximum number of loaded shard indexes retained in the in-memory LRU cache |
+| `--enable-debug-routes` | bool flag | `false` | Expose diagnostic HTTP routes such as `POST /debug/query-plan`; disabled by default because they reveal internal routing details |
 
 ### Validation
 
 - `--nprobe` must be greater than or equal to 1.
 - `--candidate-shards` and `--max-vectors-per-shard` may be `0` to disable their respective caps.
 - `--shard-cache-capacity` must be greater than or equal to 1.
+- Diagnostic routes remain unavailable unless `--enable-debug-routes` is set explicitly.
 
 ### Example
 
@@ -375,6 +429,9 @@ shardlake serve \
   --bind 127.0.0.1:9090 \
   --nprobe 4 \
   --shard-cache-capacity 256
+
+# Opt in to local debug-only HTTP routes
+shardlake serve --enable-debug-routes
 ```
 
 See [API Reference](api-reference.md) for the HTTP endpoints.
@@ -383,8 +440,8 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k), throughput, and latency by comparing the index output
-against an exact brute-force baseline over a sample of the corpus.
+Measures approximate-search quality (Recall@k), throughput, latency, and cost-estimation metrics
+by comparing the index output against an exact brute-force baseline over a sample of the corpus.
 
 ### Usage
 
@@ -423,7 +480,9 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | Mean latency | Average per-query ANN search time in microseconds |
 | P99 latency | 99th-percentile per-query ANN search time in microseconds |
 | Throughput | Wall-clock query throughput in queries per second (qps) |
-| Artifact size | Total size of all index artifact files in bytes |
+| Disk footprint | Total size of all index artifact files on disk in bytes |
+| Memory usage | Estimated in-memory footprint of indexed vector data in bytes. For uncompressed indexes: `total_vectors × dims × 4`. For PQ-compressed indexes: `total_vectors × M` (codes) + codebook bytes. |
+| Compression ratio | Ratio of raw vector bytes to PQ-encoded vector bytes: `(dims × 4) / M`. Returns `1.0` for uncompressed indexes. |
 
 ### Output
 
@@ -440,7 +499,9 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
   Throughput:        23800.0 qps
-  Artifact size:     184320 bytes
+  Disk footprint:    184320 bytes
+  Memory usage:      12800000 bytes
+  Compression ratio: 1.00x
 ```
 
 **JSON (`--output json`):**
@@ -456,7 +517,23 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
   "mean_latency_us": 42.3,
   "p99_latency_us": 210.0,
   "throughput_qps": 23800.0,
-  "artifact_size_bytes": 184320
+  "cost_metrics": {
+    "memory_usage_bytes": 12800000,
+    "disk_footprint_bytes": 184320,
+    "compression_ratio": 1.0
+  }
+}
+```
+
+For a PQ-compressed index the `cost_metrics` block reflects the reduced in-memory representation:
+
+```json
+{
+  "cost_metrics": {
+    "memory_usage_bytes": 850000,
+    "disk_footprint_bytes": 184320,
+    "compression_ratio": 16.0
+  }
 }
 ```
 
