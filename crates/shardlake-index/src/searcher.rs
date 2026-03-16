@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use rayon::prelude::*;
@@ -20,6 +21,7 @@ use crate::{
     cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    metrics::CacheMetrics,
     pq::PqCodebook,
     query_plan::QueryPlan,
     shard::{PqShard, ShardIndex},
@@ -45,6 +47,8 @@ pub struct IndexSearcher {
     mmap_threshold: u64,
     access_counts: Mutex<HashMap<ShardId, u64>>,
     prefetch: Option<PrefetchPolicy>,
+    /// Cache observability counters shared with external monitoring.
+    cache_metrics: Arc<CacheMetrics>,
 }
 
 /// Intermediate result of the IVF routing step, shared by [`IndexSearcher::search`]
@@ -141,6 +145,7 @@ impl IndexSearcher {
             mmap_threshold,
             access_counts: Mutex::new(HashMap::new()),
             prefetch: None,
+            cache_metrics: Arc::new(CacheMetrics::new()),
         }
     }
 
@@ -169,6 +174,23 @@ impl IndexSearcher {
     /// Return the underlying manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Return a shared reference to the cache observability counters.
+    ///
+    /// The returned [`Arc`] points to the same instance used internally, so
+    /// callers observe live counter updates without extra synchronisation cost.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.cache_metrics)
+    }
+
+    /// Return the serialized size of all currently cached shard artifacts.
+    ///
+    /// Both raw-vector and PQ shard caches are included so the serving layer can
+    /// expose an accurate scrape-time retained-bytes gauge.
+    pub fn cached_shard_bytes(&self) -> Result<u64> {
+        Ok(self.cache.retained_bytes(ShardIndex::encoded_len)?
+            + self.pq_shard_cache.retained_bytes(PqShard::encoded_len)?)
     }
 
     /// Return the cache hit rate for raw-shard loads since this searcher was created.
@@ -656,7 +678,7 @@ impl IndexSearcher {
 
     /// Load a PQ-encoded shard from cache or store.
     fn load_pq_shard(&self, shard_id: ShardId) -> Result<Arc<PqShard>> {
-        self.pq_shard_cache.get_or_load(shard_id, || {
+        let (shard, access) = self.pq_shard_cache.get_or_load_with_status(shard_id, || {
             let shard_def = self
                 .manifest
                 .shards
@@ -664,28 +686,41 @@ impl IndexSearcher {
                 .find(|s| s.shard_id == shard_id)
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-            let bytes = self.store.get(&shard_def.artifact_key)?;
-            let shard = Arc::new(PqShard::from_bytes(&bytes)?);
-            if shard.dims != self.manifest.dims as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} dims {} do not match manifest dims {}",
-                    shard.dims, self.manifest.dims
-                )));
-            }
-            if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
-                    shard.pq_m, self.manifest.compression.pq_num_subspaces
-                )));
-            }
-            if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
-                return Err(IndexError::Other(format!(
-                    "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
-                    shard.pq_k, self.manifest.compression.pq_codebook_size
-                )));
-            }
-            Ok(shard)
-        })
+            self.cache_metrics.record_miss();
+            let started = Instant::now();
+            let load_result = (|| {
+                let bytes = self.store.get(&shard_def.artifact_key)?;
+                let shard = Arc::new(PqShard::from_bytes(&bytes)?);
+                if shard.dims != self.manifest.dims as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} dims {} do not match manifest dims {}",
+                        shard.dims, self.manifest.dims
+                    )));
+                }
+                if shard.pq_m != self.manifest.compression.pq_num_subspaces as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} subspaces {} do not match manifest pq_num_subspaces {}",
+                        shard.pq_m, self.manifest.compression.pq_num_subspaces
+                    )));
+                }
+                if shard.pq_k != self.manifest.compression.pq_codebook_size as usize {
+                    return Err(IndexError::Other(format!(
+                        "PQ shard {shard_id} codebook size {} do not match manifest pq_codebook_size {}",
+                        shard.pq_k, self.manifest.compression.pq_codebook_size
+                    )));
+                }
+                Ok(shard)
+            })();
+            self.cache_metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
+            load_result
+        })?;
+
+        if matches!(access, crate::cache::CacheAccess::Hit) {
+            self.cache_metrics.record_hit();
+        }
+
+        Ok(shard)
     }
 
     // ── Raw shard path ────────────────────────────────────────────────────────
@@ -784,13 +819,26 @@ impl IndexSearcher {
                 .iter()
                 .find(|s| s.shard_id == shard_id)
                 .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-            Ok(Arc::new(
-                self.load_raw_shard_uncached(&shard_def.artifact_key)?,
-            ))
+            self.cache_metrics.record_miss();
+            let started = Instant::now();
+            let result = self.load_raw_shard_uncached(&shard_def.artifact_key);
+            self.cache_metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
+            result.map(Arc::new)
         })?;
 
-        if matches!(access, crate::cache::CacheAccess::Miss) {
-            self.warm_hot_shards()?;
+        match access {
+            crate::cache::CacheAccess::Hit => {
+                self.cache_metrics.record_hit();
+            }
+            crate::cache::CacheAccess::Miss => {
+                self.warm_hot_shards()?;
+            }
+            // Raced: another thread inserted this shard between the miss
+            // detection and our load completing.  The load was counted in the
+            // closure above (record_miss + record_load_attempt), so no
+            // additional metric update is needed here.
+            crate::cache::CacheAccess::Raced => {}
         }
 
         Ok(shard)
@@ -895,6 +943,40 @@ mod tests {
         }
     }
 
+    struct FailingGetStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl ObjectStore for FailingGetStore {
+        fn put(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), StorageError> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> std::result::Result<Vec<u8>, StorageError> {
+            Err(StorageError::NotFound(key.to_string()))
+        }
+
+        fn exists(&self, key: &str) -> std::result::Result<bool, StorageError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StorageError> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn local_path_for(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<std::path::PathBuf>, StorageError> {
+            let _ = key;
+            Ok(None)
+        }
+    }
+
     fn build_test_searcher(tmp: &tempfile::TempDir) -> IndexSearcher {
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
@@ -944,6 +1026,51 @@ mod tests {
             })
             .unwrap();
         IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest)
+    }
+
+    fn build_metric_test_manifest(
+        tmp: &tempfile::TempDir,
+        index_version: &str,
+        pq_params: Option<crate::pq::PqParams>,
+    ) -> (Arc<LocalObjectStore>, shardlake_manifest::Manifest) {
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 2,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0, 0.5, 0.5],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0, 0.5, 0.5],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion(format!("ds-{index_version}")),
+                embedding_version: EmbeddingVersion(format!("emb-{index_version}")),
+                index_version: IndexVersion(index_version.into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: format!("datasets/ds-{index_version}/vectors.jsonl"),
+                metadata_key: format!("datasets/ds-{index_version}/metadata.json"),
+                pq_params,
+            })
+            .unwrap();
+        (store, manifest)
     }
 
     #[test]
@@ -1358,5 +1485,50 @@ mod tests {
             err.to_string(),
             "core error: dimension mismatch: expected 2, got 3"
         );
+    }
+
+    #[test]
+    fn load_shard_records_load_attempt_on_storage_error() {
+        let tmp = tempdir().unwrap();
+        let (store, manifest) = build_metric_test_manifest(&tmp, "idx-load-error-raw", None);
+        let failing_store = Arc::new(FailingGetStore {
+            inner: store as Arc<dyn ObjectStore>,
+        });
+        let searcher = IndexSearcher::new(failing_store as Arc<dyn ObjectStore>, manifest.clone());
+
+        let err = searcher
+            .load_shard(manifest.shards[0].shard_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("key not found"));
+
+        let snapshot = searcher.cache_metrics().snapshot();
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.total_load_count, 1);
+    }
+
+    #[test]
+    fn load_pq_shard_records_load_attempt_on_storage_error() {
+        let tmp = tempdir().unwrap();
+        let (store, manifest) = build_metric_test_manifest(
+            &tmp,
+            "idx-load-error-pq",
+            Some(crate::pq::PqParams {
+                num_subspaces: 2,
+                codebook_size: 4,
+            }),
+        );
+        let failing_store = Arc::new(FailingGetStore {
+            inner: store as Arc<dyn ObjectStore>,
+        });
+        let searcher = IndexSearcher::new(failing_store as Arc<dyn ObjectStore>, manifest.clone());
+
+        let err = searcher
+            .load_pq_shard(manifest.shards[0].shard_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("key not found"));
+
+        let snapshot = searcher.cache_metrics().snapshot();
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.total_load_count, 1);
     }
 }

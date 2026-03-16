@@ -152,6 +152,79 @@ when the ANN stage is only an approximate first pass.
 candidates from the in-memory shard cache, so the extra cost is proportional to
 the number of candidates reranked and their dimensionality.
 
+## Weighted hybrid ranking
+
+The `shardlake_index::ranking` module provides `rank_hybrid` and
+`HybridRankingPolicy` for blending vector-distance and BM25 lexical scores
+into a single deterministically-ordered result list.  The function is
+reusable from any query or search path and is independent of transport layers.
+
+### How it works
+
+1. **Normalize** — each candidate list (vector and BM25) is independently
+   min–max normalized to the \[0, 1\] range so that scores are on a common
+   scale before combining.  Because both score types follow the
+   **lower-is-better** convention (vector distances and negated BM25 scores),
+   a normalized value of `0.0` means the best candidate in that list and
+   `1.0` means the worst.
+
+2. **Combine** — the hybrid score for each candidate is:
+
+    ```
+    hybrid_score =
+      (vector_weight × vector_norm + bm25_weight × bm25_norm)
+      / (vector_weight + bm25_weight)
+    ```
+
+    This keeps the final score in the `[0, 1]` range even when the weights do
+    not sum to `1.0`. A lower `hybrid_score` remains the best result.
+
+3. **Missing-signal handling** — a candidate that appears in only one list
+   receives a normalized score of `1.0` (worst) for the missing signal.
+   Its final rank depends on both the weight given to the missing signal and
+   its actual score on the available signal.
+
+4. **Tie-breaking** — when two candidates produce an identical `hybrid_score`
+   the one with the lower `VectorId` wins, giving a fully deterministic order
+   that is stable across runs.
+
+### `HybridRankingPolicy`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vector_weight` | `f32` | Weight applied to the normalized vector-distance score. Must be ≥ 0. |
+| `bm25_weight` | `f32` | Weight applied to the normalized BM25 lexical score. Must be ≥ 0. |
+
+At least one weight must be positive.  Weights do not need to sum to 1.
+
+### Examples
+
+**Equal blend (default policy)**
+
+```rust
+use shardlake_index::ranking::{HybridRankingPolicy, rank_hybrid};
+
+let policy = HybridRankingPolicy::default(); // vector_weight: 0.5, bm25_weight: 0.5
+```
+
+**Pure vector (ignore BM25)**
+
+```rust
+let policy = HybridRankingPolicy { vector_weight: 1.0, bm25_weight: 0.0 };
+```
+
+**Pure lexical (ignore vector)**
+
+```rust
+let policy = HybridRankingPolicy { vector_weight: 0.0, bm25_weight: 1.0 };
+```
+
+**Emphasise lexical signal**
+
+```rust
+let policy = HybridRankingPolicy { vector_weight: 0.3, bm25_weight: 0.7 };
+```
+
 ## Rerank candidate limit
 
 By default, when `rerank` is `true`, the server reranks the top `k` ANN
@@ -199,6 +272,7 @@ distance scoring. Requests that override `distance_metric` to `"cosine"` or
 - **Cosine** distance: `score = 1 - cosine_similarity`. Range [0, 2]; 0 means identical direction.
 - **Euclidean** distance: `score = sqrt(sum((a_i - b_i)^2))`. Range [0, ∞).
 - **Inner product**: `score = -dot(a, b)`. Negated so that lower is always better; the most similar vector has the most negative raw dot product but the smallest (most negative → closest to zero) reported score.
+- **BM25**: raw BM25 scores are negated before being returned, so lower is still better and the convention is consistent with all other scorers.
 
 In all cases, results are sorted ascending by score (best match first).
 
@@ -266,4 +340,62 @@ curl -s -X POST http://localhost:8080/debug/query-plan \
     "k": 5,
     "candidate_centroids": 3
   }' | python3 -m json.tool
+```
+
+## `GET /metrics`
+
+Returns a Prometheus text-format metrics payload (version 0.0.4) suitable for
+scraping by a Prometheus server or any compatible metrics collector.
+
+### Response
+
+The response body is plain text following the
+[Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format).
+
+**Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
+
+### Exposed metric families
+
+| Metric name | Type | Description |
+|-------------|------|-------------|
+| `shardlake_query_duration_seconds` | histogram | End-to-end query duration in seconds, bucketed at 1 ms–10 s. |
+| `shardlake_queries_total` | counter | Total number of successfully completed queries. |
+| `shardlake_query_results_total` | counter | Total number of result vectors returned across all queries (recall-oriented signal). |
+| `shardlake_shard_cache_hits_total` | gauge | Cumulative raw-shard cache hit count since server start. |
+| `shardlake_shard_cache_misses_total` | gauge | Cumulative raw-shard cache miss count since server start. |
+| `shardlake_shard_load_count_total` | gauge | Cumulative shard load attempt count since server start. |
+| `shardlake_shard_load_latency_ns_total` | gauge | Cumulative shard-load wall-clock time in nanoseconds since server start. |
+| `shardlake_shard_cache_retained_bytes` | gauge | Total raw bytes currently retained in the in-process shard cache. |
+
+> **Note:** Cache hit/miss/load metrics (`shardlake_shard_cache_hits_total`,
+> `shardlake_shard_cache_misses_total`, and `shardlake_shard_load_*`) are
+> exposed as gauges because they are read from monotonically increasing atomic
+> counters inside the searcher at scrape time. By contrast,
+> `shardlake_shard_cache_retained_bytes` is recomputed from the live shard
+> caches on each scrape and reflects the bytes currently resident in-process.
+
+### Example
+
+```bash
+curl -s http://localhost:8080/metrics
+```
+
+Example output (truncated):
+
+```
+# HELP shardlake_query_duration_seconds End-to-end query duration in seconds.
+# TYPE shardlake_query_duration_seconds histogram
+shardlake_query_duration_seconds_bucket{le="0.001"} 3
+shardlake_query_duration_seconds_bucket{le="0.005"} 5
+...
+shardlake_query_duration_seconds_count 5
+shardlake_query_duration_seconds_sum 0.012
+
+# HELP shardlake_queries_total Total completed query count.
+# TYPE shardlake_queries_total counter
+shardlake_queries_total 5
+
+# HELP shardlake_shard_cache_hits_total Cumulative raw-shard cache hit count since server start.
+# TYPE shardlake_shard_cache_hits_total gauge
+shardlake_shard_cache_hits_total 8
 ```

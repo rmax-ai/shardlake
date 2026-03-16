@@ -245,6 +245,26 @@ impl<V: Send + 'static> ShardCache<V> {
         Ok(self.lock()?.map.values().cloned().collect())
     }
 
+    /// Return the total retained size of all cached entries.
+    ///
+    /// The caller supplies `size_of` so each cache user can define "retained
+    /// size" in terms of its on-wire or in-memory representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the internal mutex is poisoned.
+    pub fn retained_bytes<F>(&self, size_of: F) -> Result<u64>
+    where
+        F: Fn(&V) -> u64,
+    {
+        let guard = self.lock()?;
+        Ok(guard
+            .map
+            .values()
+            .map(|value| size_of(value.as_ref()))
+            .sum())
+    }
+
     /// Return whether `shard_id` is currently resident in the cache.
     ///
     /// # Errors

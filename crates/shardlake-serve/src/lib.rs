@@ -1,7 +1,9 @@
 //! HTTP serving layer built on axum.
 
+pub mod prom;
 pub mod routes;
 
+pub use prom::PrometheusMetrics;
 pub use routes::build_router;
 
 use std::sync::Arc;
@@ -18,4 +20,6 @@ pub struct AppState {
     pub fan_out: FanOutPolicy,
     /// Whether diagnostic HTTP routes are exposed.
     pub debug_routes_enabled: bool,
+    /// Prometheus metrics registry updated by request handlers.
+    pub metrics: Arc<PrometheusMetrics>,
 }
