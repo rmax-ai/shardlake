@@ -252,7 +252,7 @@ See [API Reference](api-reference.md) for the HTTP endpoints.
 
 ## `shardlake benchmark`
 
-Measures approximate-search quality (Recall@k) and latency by comparing the index output
+Measures approximate-search quality (Recall@k), throughput, and latency by comparing the index output
 against an exact brute-force baseline over a sample of the corpus.
 
 ### Usage
@@ -269,10 +269,21 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve |
 | `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
+| `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Mean latency | Average per-query ANN search time in microseconds |
+| P99 latency | 99th-percentile per-query ANN search time in microseconds |
+| Throughput | Wall-clock query throughput in queries per second (qps) |
+| Artifact size | Total size of all index artifact files in bytes |
 
 ### Output
 
-Printed to stdout:
+**Text (default):**
 
 ```
 === Benchmark Report ===
@@ -282,7 +293,23 @@ Printed to stdout:
   Recall@10:         0.9400
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
+  Throughput:        23800.0 qps
   Artifact size:     184320 bytes
+```
+
+**JSON (`--output json`):**
+
+```json
+{
+  "num_queries": 100,
+  "k": 10,
+  "nprobe": 2,
+  "recall_at_k": 0.94,
+  "mean_latency_us": 42.3,
+  "p99_latency_us": 210.0,
+  "throughput_qps": 23800.0,
+  "artifact_size_bytes": 184320
+}
 ```
 
 ### Example
@@ -290,6 +317,9 @@ Printed to stdout:
 ```bash
 # Full precision benchmark with a larger query sample
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Machine-readable JSON for CI regression tracking
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --output json
 ```
 
 ---
