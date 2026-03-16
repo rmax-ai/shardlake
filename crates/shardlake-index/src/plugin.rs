@@ -32,11 +32,11 @@
 
 use std::sync::Arc;
 
-use shardlake_core::{AnnFamily, DistanceMetric};
+use shardlake_core::{config::SystemConfig, AnnFamily, DistanceMetric};
 
 use crate::{
     pipeline::{CandidateSearchStage, ExactCandidateSearch, PqCandidateStage},
-    pq::PqCodebook,
+    pq::{PqCodebook, PqParams},
     IndexError, Result,
 };
 
@@ -204,6 +204,24 @@ impl AnnRegistry {
     /// Returns `true` if `family` is a known built-in ANN family name.
     pub fn exists(family: &str) -> bool {
         Self::families().contains(&family)
+    }
+
+    /// Resolve the build-time PQ parameters from an explicit override and the
+    /// system configuration, centralising algorithm selection so callers do not
+    /// need to branch on `pq_enabled` directly.
+    ///
+    /// Returns `explicit` if supplied, otherwise derives [`PqParams`] from the
+    /// config when `config.pq_enabled` is `true`, and `None` otherwise.
+    pub fn resolve_build_params(
+        explicit: Option<PqParams>,
+        config: &SystemConfig,
+    ) -> Option<PqParams> {
+        explicit.or_else(|| {
+            config.pq_enabled.then_some(PqParams {
+                num_subspaces: config.pq_num_subspaces as usize,
+                codebook_size: config.pq_codebook_size as usize,
+            })
+        })
     }
 
     /// Return an [`IvfFlatPlugin`] for `"ivf_flat"`, or an error for any

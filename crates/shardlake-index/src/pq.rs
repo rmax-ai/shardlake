@@ -194,6 +194,39 @@ impl PqCodebook {
         vectors.iter().map(|v| self.encode(v)).collect()
     }
 
+    /// Reconstruct an approximate vector from PQ codes by summing sub-space centroids.
+    ///
+    /// For each sub-space `m`, the `m`-th centroid identified by `codes[m]` is
+    /// copied into the corresponding slice of the output vector.  This is a
+    /// fixed-point: `encode(reconstruct(codes)) == codes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::Other`] when `codes.len() != num_subspaces` or when
+    /// any code value is ≥ `codebook_size`.
+    pub fn reconstruct(&self, codes: &[u8]) -> Result<Vec<f32>> {
+        if codes.len() != self.params.num_subspaces {
+            return Err(IndexError::Other(format!(
+                "PQ reconstruct: expected {} codes, got {}",
+                self.params.num_subspaces,
+                codes.len()
+            )));
+        }
+        let mut result = vec![0.0; self.dims];
+        for (m, &code) in codes.iter().enumerate() {
+            let k = code as usize;
+            if k >= self.params.codebook_size {
+                return Err(IndexError::Other(format!(
+                    "PQ reconstruct: code {k} out of range for codebook_size {}",
+                    self.params.codebook_size
+                )));
+            }
+            let start = m * self.sub_dims;
+            result[start..start + self.sub_dims].copy_from_slice(&self.codebooks[m][k]);
+        }
+        Ok(result)
+    }
+
     // ── Approximate Distance Computation (ADC) ────────────────────────────────
 
     /// Compute a `M × K` ADC distance table for `query`.

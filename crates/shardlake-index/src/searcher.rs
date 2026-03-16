@@ -18,8 +18,9 @@ use shardlake_storage::ObjectStore;
 
 use crate::{
     cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
-    exact::{distance, exact_search, merge_top_k},
+    exact::{distance, merge_top_k},
     kmeans::top_n_centroids,
+    plugin::{AnnPlugin, IvfFlatPlugin, IvfPqPlugin},
     pq::PqCodebook,
     shard::{PqShard, ShardIndex},
     IndexError, Result, MMAP_MIN_SIZE_BYTES, PQ8_CODEC,
@@ -181,6 +182,18 @@ impl IndexSearcher {
         let pq_enabled =
             self.manifest.compression.enabled && self.manifest.compression.codec == PQ8_CODEC;
 
+        // ===== SELECT BACKEND via ANN plugin =====
+        // Construct the plugin from manifest state and validate it once before
+        // the shard fan-out.  This replaces algorithm-specific branching at the
+        // integration edge with a single shared interface.
+        let plugin: Box<dyn AnnPlugin> = if pq_enabled {
+            Box::new(IvfPqPlugin::new(self.load_codebook()?))
+        } else {
+            Box::new(IvfFlatPlugin)
+        };
+        plugin.validate(expected_dims, metric)?;
+        let stage = plugin.candidate_stage();
+
         // Collect centroids for routing from the manifest when available (manifest v2+).
         // Shards built with an older builder (manifest v1) have an empty centroid vec; for
         // those shards we fall back to loading the shard body to extract the centroid.
@@ -202,18 +215,11 @@ impl IndexSearcher {
             } else {
                 // Slow path: legacy manifest without centroid metadata -- load the shard
                 // body to read its centroids (preserves backward compatibility).
-                if pq_enabled {
-                    let shard = self.load_pq_shard(shard_def.shard_id)?;
-                    for c in &shard.centroids {
-                        all_centroids.push(c.clone());
-                        centroid_to_shard.push(shard_def.shard_id);
-                    }
-                } else {
-                    let shard = self.load_shard(shard_def.shard_id)?;
-                    for c in &shard.centroids {
-                        all_centroids.push(c.clone());
-                        centroid_to_shard.push(shard_def.shard_id);
-                    }
+                // Both backends go through the same load path.
+                let shard = self.load_shard_for_stage(shard_def.shard_id)?;
+                for c in &shard.centroids {
+                    all_centroids.push(c.clone());
+                    centroid_to_shard.push(shard_def.shard_id);
                 }
             }
         }
@@ -248,91 +254,89 @@ impl IndexSearcher {
             "Probing shards"
         );
 
-        if pq_enabled {
-            self.search_pq_shards(
-                query,
-                &probe_shards,
-                k,
-                metric,
-                policy.max_vectors_per_shard,
-            )
-        } else {
-            // Stages: Load shard + exact search run concurrently across probed shards.
-            // Each task loads one shard and scores its records; results are merged below.
-            // Any shard-load error short-circuits the fan-out.
-            let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
-                .par_iter()
-                .map(|&shard_id| {
-                    let shard = self.load_shard(shard_id)?;
-                    let records = if policy.max_vectors_per_shard > 0 {
-                        let limit =
-                            (policy.max_vectors_per_shard as usize).min(shard.records.len());
-                        &shard.records[..limit]
-                    } else {
-                        &shard.records
-                    };
-                    Ok(exact_search(query, records, metric, k))
-                })
-                .collect();
-            let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
-            Ok(merge_top_k(all_results, k))
-        }
-    }
-
-    // ── PQ search path ────────────────────────────────────────────────────────
-
-    /// Search probed PQ-encoded shards using Asymmetric Distance Computation.
-    fn search_pq_shards(
-        &self,
-        query: &[f32],
-        probe_shards: &[ShardId],
-        k: usize,
-        metric: DistanceMetric,
-        max_vectors_per_shard: u32,
-    ) -> Result<Vec<SearchResult>> {
-        if metric != DistanceMetric::Euclidean {
-            return Err(IndexError::Other(
-                "PQ search currently supports only euclidean distance".into(),
-            ));
-        }
-
-        let codebook = self.load_codebook()?;
-        let table = codebook.compute_distance_table(query)?;
-        let metadata_map = self.load_metadata_map()?;
-
-        // Load and score PQ-encoded shards concurrently.  The codebook distance
-        // table and metadata map are computed once and shared across tasks.
+        // ===== SHARD FAN-OUT (unified — no algorithm-specific branching) =====
+        // Both IVF-flat and IVF-PQ go through the same call site.  The stage
+        // obtained from the plugin determines the actual distance computation.
         let shard_results: Result<Vec<Vec<SearchResult>>> = probe_shards
             .par_iter()
             .map(|&shard_id| {
-                let shard = self.load_pq_shard(shard_id)?;
-                let max_entries = if max_vectors_per_shard > 0 {
-                    (max_vectors_per_shard as usize).min(shard.entries.len())
-                } else {
-                    shard.entries.len()
-                };
-                let mut scored: Vec<SearchResult> = shard
-                    .entries
-                    .iter()
-                    .take(max_entries)
-                    .map(|(id, codes)| SearchResult {
-                        id: *id,
-                        score: codebook.adc_distance(codes, &table),
-                        metadata: metadata_map.get(&id.to_string()).cloned(),
+                let shard = self.load_shard_for_stage(shard_id)?;
+                // Apply max_vectors_per_shard limit when requested.
+                let limited: Arc<ShardIndex> = if policy.max_vectors_per_shard > 0 {
+                    let limit = (policy.max_vectors_per_shard as usize).min(shard.records.len());
+                    Arc::new(ShardIndex {
+                        shard_id: shard.shard_id,
+                        dims: shard.dims,
+                        centroids: shard.centroids.clone(),
+                        records: shard.records[..limit].to_vec(),
                     })
-                    .collect();
-                scored.sort_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                scored.truncate(k);
-                Ok(scored)
+                } else {
+                    Arc::clone(&shard)
+                };
+                stage.search(query, &limited, metric, k)
             })
             .collect();
-        let all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
+
+        let mut all_results: Vec<SearchResult> = shard_results?.into_iter().flatten().collect();
+
+        // Enrich results with metadata from the metadata artifact when it exists.
+        // For PQ-compressed indexes this replicates the per-result metadata that
+        // was previously attached in the now-removed dedicated PQ search path.
+        if pq_enabled {
+            if let Some(metadata_map) = self.try_load_metadata_map()? {
+                for result in &mut all_results {
+                    if result.metadata.is_none() {
+                        result.metadata = metadata_map.get(&result.id.to_string()).cloned();
+                    }
+                }
+            }
+        }
+
         Ok(merge_top_k(all_results, k))
     }
+
+    // ── Shard loading for plugin-based search ─────────────────────────────────
+
+    /// Load a shard as a raw [`ShardIndex`] regardless of the on-disk format.
+    ///
+    /// For format-v1 shards (flat indexes), this delegates to [`Self::load_shard`].
+    /// For format-v2 shards (PQ-compressed indexes), the [`PqShard`] is loaded via
+    /// the PQ shard cache and its entries are reconstructed to approximate raw
+    /// vectors using [`PqCodebook::reconstruct`].  The reconstruction is a
+    /// fixed-point operation: `encode(reconstruct(codes)) == codes`, so the
+    /// [`PqCandidateStage`](crate::pipeline::PqCandidateStage) produces identical
+    /// results to the former `search_pq_shards` path.
+    fn load_shard_for_stage(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
+        if !self.manifest.compression.enabled || self.manifest.compression.codec != PQ8_CODEC {
+            return self.load_shard(shard_id);
+        }
+
+        // PQ-encoded index (format-v2): reconstruct approximate raw vectors so
+        // both backends share the same CandidateSearchStage call site.
+        self.record_access(shard_id)?;
+        let codebook = self.load_codebook()?;
+        let pq_shard = self.load_pq_shard(shard_id)?;
+        let records = pq_shard
+            .entries
+            .iter()
+            .map(|(id, codes)| {
+                let data = codebook.reconstruct(codes)?;
+                Ok(shardlake_core::types::VectorRecord {
+                    id: *id,
+                    data,
+                    metadata: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(ShardIndex {
+            shard_id: pq_shard.shard_id,
+            dims: pq_shard.dims,
+            centroids: pq_shard.centroids.clone(),
+            records,
+        }))
+    }
+
+    // ── Metadata loading ──────────────────────────────────────────────────────
 
     /// Rerank ANN candidates using exact distance to `query`.
     ///
@@ -462,28 +466,34 @@ impl IndexSearcher {
         Ok(cb)
     }
 
-    fn load_metadata_map(&self) -> Result<Arc<HashMap<String, serde_json::Value>>> {
+    fn try_load_metadata_map(&self) -> Result<Option<Arc<HashMap<String, serde_json::Value>>>> {
         {
             let guard = self
                 .metadata_cache
                 .lock()
                 .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
             if let Some(ref metadata) = *guard {
-                return Ok(Arc::clone(metadata));
+                return Ok(Some(Arc::clone(metadata)));
             }
         }
 
-        let bytes = self.store.get(&self.manifest.metadata_key)?;
-        let metadata: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)
-            .map_err(|err| IndexError::Other(format!("invalid dataset metadata map: {err}")))?;
-        let metadata = Arc::new(metadata);
-
-        let mut guard = self
-            .metadata_cache
-            .lock()
-            .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
-        *guard = Some(Arc::clone(&metadata));
-        Ok(metadata)
+        match self.store.get(&self.manifest.metadata_key) {
+            Ok(bytes) => {
+                let metadata: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)
+                    .map_err(|err| {
+                    IndexError::Other(format!("invalid dataset metadata map: {err}"))
+                })?;
+                let metadata = Arc::new(metadata);
+                let mut guard = self
+                    .metadata_cache
+                    .lock()
+                    .map_err(|_| IndexError::Other("metadata cache lock poisoned".into()))?;
+                *guard = Some(Arc::clone(&metadata));
+                Ok(Some(metadata))
+            }
+            Err(shardlake_storage::StorageError::NotFound(_)) => Ok(None),
+            Err(e) => Err(IndexError::from(e)),
+        }
     }
 
     /// Load a PQ-encoded shard from cache or store.

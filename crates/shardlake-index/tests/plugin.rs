@@ -253,27 +253,27 @@ fn both_backends_wire_into_pipeline_via_plugin_interface() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
     let records = make_records(12, 4);
+    // Use Euclidean so both IvfFlatPlugin and IvfPqPlugin are compatible.
     let manifest = build_test_index(
         store.as_ref(),
         records.clone(),
         4,
         2,
-        DistanceMetric::Cosine,
+        DistanceMetric::Euclidean,
         tmp.path(),
     );
 
-    // Both plugins implement the same trait; call site is identical.
+    // Both plugins implement the same trait; the call site below is identical
+    // for both – no algorithm-specific branching at the wiring edge.
     let plugins: Vec<Box<dyn AnnPlugin>> = vec![
         Box::new(IvfFlatPlugin),
-        // IvfPq requires Euclidean, but we can still wire it via the same interface.
-        // We use IvfFlatPlugin for both to keep the test self-contained.
-        AnnRegistry::get_flat("ivf_flat").unwrap(),
+        Box::new(IvfPqPlugin::new(make_codebook(4, 2))),
     ];
 
     let query = records[0].data.clone();
     for plugin in &plugins {
         // validate first (the integration edge)
-        plugin.validate(4, DistanceMetric::Cosine).unwrap();
+        plugin.validate(4, DistanceMetric::Euclidean).unwrap();
 
         let stage = plugin.candidate_stage();
         let pipeline = QueryPipeline::builder(Arc::clone(&store), manifest.clone())
