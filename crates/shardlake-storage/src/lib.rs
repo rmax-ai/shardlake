@@ -9,6 +9,8 @@
 //!
 //! Additional backends only need to implement [`ObjectStore`].
 
+use std::path::PathBuf;
+
 pub mod local;
 pub mod paths;
 pub mod s3;
@@ -47,4 +49,14 @@ pub trait ObjectStore: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
     /// Delete `key`.
     fn delete(&self, key: &str) -> Result<()>;
+    /// Return a validated local filesystem path for `key` when the backend can
+    /// expose one safely for read-only access.
+    ///
+    /// Backends without direct local-file access should return `Ok(None)`.
+    /// This lets higher layers opt into memory-mapped or other path-based fast
+    /// paths without breaking the object-store abstraction for remote backends.
+    fn local_path_for(&self, key: &str) -> Result<Option<PathBuf>> {
+        let _ = key;
+        Ok(None)
+    }
 }

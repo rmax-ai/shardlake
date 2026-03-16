@@ -20,7 +20,7 @@ use crate::{
     kmeans::top_n_centroids,
     pq::PqCodebook,
     shard::{PqShard, ShardIndex},
-    IndexError, Result, PQ8_CODEC,
+    IndexError, Result, MMAP_MIN_SIZE_BYTES, PQ8_CODEC,
 };
 
 /// Searcher that loads shard indexes lazily from `store`, caching them in RAM.
@@ -32,11 +32,26 @@ pub struct IndexSearcher {
     /// PQ codebook; loaded once on first PQ search, then cached.
     codebook: Mutex<Option<Arc<PqCodebook>>>,
     metadata_cache: Mutex<Option<Arc<HashMap<String, serde_json::Value>>>>,
+    mmap_threshold: u64,
 }
 
 impl IndexSearcher {
     /// Create a new searcher from a loaded manifest.
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self::with_mmap_threshold(store, manifest, MMAP_MIN_SIZE_BYTES)
+    }
+
+    /// Create a new searcher with a custom raw-shard mmap threshold in bytes.
+    ///
+    /// Raw shard artifacts backed by a local [`ObjectStore`] path and whose
+    /// size is at least `mmap_threshold` are memory-mapped for deserialization.
+    /// Remote backends, unsupported environments, and mmap failures continue to
+    /// use the regular `ObjectStore::get` path transparently.
+    pub fn with_mmap_threshold(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        mmap_threshold: u64,
+    ) -> Self {
         info!(
             index_version = %manifest.index_version,
             shards = manifest.shards.len(),
@@ -49,6 +64,7 @@ impl IndexSearcher {
             pq_shard_cache: Mutex::new(HashMap::new()),
             codebook: Mutex::new(None),
             metadata_cache: Mutex::new(None),
+            mmap_threshold,
         }
     }
 
@@ -438,6 +454,38 @@ impl IndexSearcher {
 
     // ── Raw shard path ────────────────────────────────────────────────────────
 
+    fn load_raw_shard_uncached(&self, artifact_key: &str) -> Result<ShardIndex> {
+        if let Some(path) = self.store.local_path_for(artifact_key)? {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() >= self.mmap_threshold {
+                    match self.try_load_raw_shard_mmap(&path) {
+                        Ok(idx) => return Ok(idx),
+                        Err(error) => {
+                            debug!(
+                                key = artifact_key,
+                                %error,
+                                "mmap failed for searcher shard load; falling back to regular read",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let bytes = self.store.get(artifact_key)?;
+        ShardIndex::from_bytes(&bytes)
+    }
+
+    fn try_load_raw_shard_mmap(&self, path: &std::path::Path) -> Result<ShardIndex> {
+        let file = std::fs::File::open(path).map_err(IndexError::Io)?;
+        // SAFETY: The mapped region is used only within this function and is
+        // dropped immediately after deserialization, so no borrowed reference
+        // can outlive the file mapping. Shard artifacts are immutable after
+        // publication, so their length does not change while mapped.
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(IndexError::Io)? };
+        ShardIndex::from_bytes(&mmap)
+    }
+
     /// Load a raw shard from cache or store.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
@@ -457,8 +505,7 @@ impl IndexSearcher {
             .find(|s| s.shard_id == shard_id)
             .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
 
-        let bytes = self.store.get(&shard_def.artifact_key)?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
+        let idx = Arc::new(self.load_raw_shard_uncached(&shard_def.artifact_key)?);
 
         let mut cache = self
             .cache
@@ -471,6 +518,7 @@ impl IndexSearcher {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -481,7 +529,47 @@ mod tests {
         config::{FanOutPolicy, SystemConfig},
         types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId, VectorRecord},
     };
-    use shardlake_storage::LocalObjectStore;
+    use shardlake_storage::{LocalObjectStore, StorageError};
+
+    struct CountingLocalPathStore {
+        inner: Arc<LocalObjectStore>,
+        get_calls: Arc<AtomicUsize>,
+        expose_local_path: bool,
+    }
+
+    impl ObjectStore for CountingLocalPathStore {
+        fn put(&self, key: &str, data: Vec<u8>) -> shardlake_storage::Result<()> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> shardlake_storage::Result<Vec<u8>> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key)
+        }
+
+        fn exists(&self, key: &str) -> shardlake_storage::Result<bool> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> shardlake_storage::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> shardlake_storage::Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn local_path_for(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<std::path::PathBuf>, StorageError> {
+            if self.expose_local_path {
+                Ok(Some(self.inner.path_for(key)?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 
     fn build_test_searcher(tmp: &tempfile::TempDir) -> IndexSearcher {
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
@@ -611,5 +699,143 @@ mod tests {
         let results = searcher.search(&[1.0, 0.0], 4, &policy).unwrap();
         // With 2 shards and 1 vector/shard, we can get at most 2 results.
         assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn searcher_uses_mmap_for_local_shards_when_path_is_available() {
+        let tmp = tempdir().unwrap();
+        let inner = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 2,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![1.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(4),
+                data: vec![0.5, 0.5],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(inner.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-mmap-searcher".into()),
+                embedding_version: EmbeddingVersion("emb-mmap-searcher".into()),
+                index_version: IndexVersion("idx-mmap-searcher".into()),
+                metric: DistanceMetric::Cosine,
+                dims: 2,
+                vectors_key: "datasets/ds-mmap-searcher/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-mmap-searcher/metadata.json".into(),
+                pq_params: None,
+            })
+            .unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingLocalPathStore {
+            inner,
+            get_calls: Arc::clone(&get_calls),
+            expose_local_path: true,
+        });
+        let searcher = IndexSearcher::with_mmap_threshold(store, manifest, 0);
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let results = searcher.search(&[1.0, 0.0], 2, &policy).unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(get_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn searcher_falls_back_to_get_without_local_path() {
+        let tmp = tempdir().unwrap();
+        let inner = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 2,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![1.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(4),
+                data: vec![0.5, 0.5],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(inner.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-get-searcher".into()),
+                embedding_version: EmbeddingVersion("emb-get-searcher".into()),
+                index_version: IndexVersion("idx-get-searcher".into()),
+                metric: DistanceMetric::Cosine,
+                dims: 2,
+                vectors_key: "datasets/ds-get-searcher/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-get-searcher/metadata.json".into(),
+                pq_params: None,
+            })
+            .unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingLocalPathStore {
+            inner,
+            get_calls: Arc::clone(&get_calls),
+            expose_local_path: false,
+        });
+        let searcher = IndexSearcher::with_mmap_threshold(store, manifest, 0);
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let results = searcher.search(&[1.0, 0.0], 2, &policy).unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
     }
 }

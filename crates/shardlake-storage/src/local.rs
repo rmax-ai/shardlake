@@ -129,6 +129,10 @@ impl ObjectStore for LocalObjectStore {
             source: e,
         })
     }
+
+    fn local_path_for(&self, key: &str) -> Result<Option<PathBuf>> {
+        Ok(Some(self.path_for(key)?))
+    }
 }
 
 fn collect_keys(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
