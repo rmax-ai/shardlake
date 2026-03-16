@@ -267,7 +267,9 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 |------|------|---------|-------------|
 | `--alias <STRING>` | string | `latest` | Alias to benchmark |
 | `--k <N>` | usize | `10` | Number of nearest neighbours to retrieve |
-| `--nprobe <N>` | usize | `2` | Number of shards to probe per query |
+| `--nprobe <N>` | u32 | `2` | Number of nearest centroids to select per query (`candidate_centroids`) |
+| `--candidate-shards <N>` | u32 | `0` | Maximum number of shards to probe after centroid-to-shard deduplication (`0` = no cap) |
+| `--max-vectors-per-shard <N>` | u32 | `0` | Maximum number of vectors to score inside each probed shard (`0` = no limit) |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
 | `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
 
