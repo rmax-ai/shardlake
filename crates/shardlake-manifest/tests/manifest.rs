@@ -434,6 +434,225 @@ fn test_v1_manifest_defaults_new_fields() {
     assert!(manifest.shards[0].routing.is_none());
 }
 
+// ── compression config validation ─────────────────────────────────────────────
+
+fn pq8_compression() -> CompressionConfig {
+    CompressionConfig {
+        enabled: true,
+        codec: "pq8".into(),
+        pq_num_subspaces: 8,
+        pq_codebook_size: 256,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    }
+}
+
+#[test]
+fn test_validate_accepts_valid_pq8_compression() {
+    let mut m = sample_manifest();
+    m.compression = pq8_compression();
+    m.validate()
+        .expect("valid pq8 compression must be accepted");
+}
+
+#[test]
+fn test_validate_rejects_unknown_codec() {
+    let mut m = sample_manifest();
+    m.compression.codec = "lz4".into();
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("not a recognised codec"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_enabled_true_with_none_codec() {
+    let mut m = sample_manifest();
+    m.compression.enabled = true;
+    // codec is still "none" (default)
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.enabled is true but codec is \"none\""),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_enabled_false_with_pq8_codec() {
+    let mut m = sample_manifest();
+    // enabled stays false (default), but codec is set to pq8
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "pq8".into(),
+        pq_num_subspaces: 8,
+        pq_codebook_size: 256,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codec is \"pq8\" but enabled is false"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_missing_num_subspaces() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_num_subspaces: 0,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_num_subspaces must be > 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_zero_codebook_size() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_codebook_size: 0,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be in 1..=256"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_codebook_size_exceeds_256() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_codebook_size: 512,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be in 1..=256"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_missing_codebook_key() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        codebook_key: None,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must be present"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_empty_codebook_key() {
+    // spaces-only
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        codebook_key: Some("  ".into()),
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must not be empty"),
+        "unexpected error: {err}"
+    );
+
+    // mixed whitespace (tabs, newlines)
+    let mut m2 = sample_manifest();
+    m2.compression = CompressionConfig {
+        codebook_key: Some("\t\n ".into()),
+        ..pq8_compression()
+    };
+
+    let err2 = m2.validate().unwrap_err();
+    assert!(
+        err2.to_string()
+            .contains("compression.codebook_key must not be empty"),
+        "unexpected error: {err2}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_pq_num_subspaces() {
+    let mut m = sample_manifest();
+    // codec is "none" but pq_num_subspaces is non-zero (stale PQ config)
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 4,
+        pq_codebook_size: 0,
+        codebook_key: None,
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_num_subspaces must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_pq_codebook_size() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 0,
+        pq_codebook_size: 256,
+        codebook_key: None,
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_codebook_key() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 0,
+        pq_codebook_size: 0,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must be absent when codec is \"none\""),
+        "unexpected error: {err}"
+    );
+}
+
 // ── compatibility checks ──────────────────────────────────────────────────────
 
 #[test]
