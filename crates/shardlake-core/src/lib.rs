@@ -5,6 +5,6 @@ pub mod types;
 pub use config::{FanOutPolicy, PrefetchPolicy, SystemConfig};
 pub use error::{CoreError, Result};
 pub use types::{
-    DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult, ShardId,
-    VectorId, VectorRecord,
+    AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult,
+    ShardId, VectorId, VectorRecord,
 };

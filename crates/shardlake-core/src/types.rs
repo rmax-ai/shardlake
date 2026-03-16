@@ -50,6 +50,67 @@ impl std::fmt::Display for IndexVersion {
     }
 }
 
+/// Identifies the ANN algorithm family used to build and query an index.
+///
+/// This type is the key used by [`AnnPlugin`](shardlake_index::plugin::AnnPlugin)
+/// implementations and [`AnnRegistry`](shardlake_index::plugin::AnnRegistry) to
+/// select the right candidate-search backend without hard-coding algorithm checks
+/// at call sites.
+///
+/// # Examples
+///
+/// ```rust
+/// use shardlake_core::AnnFamily;
+///
+/// let family = "ivf_flat".parse::<AnnFamily>().unwrap();
+/// assert_eq!(family.as_str(), "ivf_flat");
+/// assert_eq!(family.to_string(), "ivf_flat");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnFamily {
+    /// IVF with exact (flat) distance scoring within each shard.
+    #[default]
+    IvfFlat,
+    /// IVF with product-quantised distance scoring within each shard.
+    IvfPq,
+}
+
+impl AnnFamily {
+    /// Returns the canonical string identifier for this family.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::IvfFlat => "ivf_flat",
+            Self::IvfPq => "ivf_pq",
+        }
+    }
+}
+
+impl std::fmt::Display for AnnFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AnnFamily {
+    type Err = crate::error::CoreError;
+
+    /// Parse a family name produced by [`AnnFamily::as_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Other`] when `s` does not match any known family.
+    fn from_str(s: &str) -> crate::error::Result<Self> {
+        match s {
+            "ivf_flat" => Ok(Self::IvfFlat),
+            "ivf_pq" => Ok(Self::IvfPq),
+            other => Err(crate::error::CoreError::Other(format!(
+                "unknown ANN family: \"{other}\"; valid values are: ivf_flat, ivf_pq"
+            ))),
+        }
+    }
+}
+
 /// Supported distance metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]

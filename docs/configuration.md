@@ -142,9 +142,91 @@ Controls how many probe events are required before a shard is considered hot.
 | `1` | A shard becomes eligible for warming after its first probe |
 | `3` (default) | A shard becomes eligible after three probes |
 
-## Validation
+## ANN plugin interface
 
-Invalid fan-out settings are rejected at startup (for `serve` and `benchmark`) and at
+Shardlake exposes a shared ANN plugin interface in `shardlake_index::plugin` that lets
+multiple ANN backends be built, queried, and compared through a single extensible
+framework.
+
+### `AnnFamily`
+
+`AnnFamily` is the type-safe identifier for an ANN backend. It lives in
+`shardlake_core` and is serialisable so it can be embedded in manifests and config.
+
+| Variant | String key | Description |
+|---------|-----------|-------------|
+| `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
+| `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
+
+Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
+`CoreError::Other` with the list of valid choices.
+
+### `AnnPlugin` trait
+
+Every ANN backend implements `AnnPlugin`:
+
+```rust
+pub trait AnnPlugin: Send + Sync {
+    /// Human-readable family identifier, e.g. `"ivf_flat"`.
+    fn family(&self) -> &str;
+
+    /// Validate compatibility with a vector dimension and distance metric.
+    fn validate(&self, dims: usize, metric: DistanceMetric) -> Result<()>;
+
+    /// Create a `CandidateSearchStage` for use in the query pipeline.
+    fn candidate_stage(&self) -> Arc<dyn CandidateSearchStage>;
+}
+```
+
+Call `plugin.validate(dims, metric)` before building or querying to surface
+incompatible configurations early—before any pipeline or artifact is
+constructed.  Then call `plugin.candidate_stage()` to wire the backend into a
+`QueryPipeline` without algorithm-specific branching:
+
+```rust
+// No branching—both families use the same interface.
+let plugin: &dyn AnnPlugin = &IvfFlatPlugin;
+plugin.validate(dims, DistanceMetric::Cosine).unwrap();
+let pipeline = QueryPipeline::builder(store, manifest)
+    .candidate_stage(plugin.candidate_stage())
+    .build();
+```
+
+### Built-in plugin structs
+
+| Struct | Family | Notes |
+|--------|--------|-------|
+| `IvfFlatPlugin` | `"ivf_flat"` | No extra data needed; constructed directly. |
+| `IvfPqPlugin::new(codebook)` | `"ivf_pq"` | Requires a pre-trained `PqCodebook` loaded from storage. |
+
+### `AnnRegistry`
+
+`AnnRegistry` is a stateless helper that enumerates built-in families and
+validates family names:
+
+```rust
+// Enumerate all built-in families.
+for name in AnnRegistry::families() { println!("{name}"); }
+
+// Check if a name is known.
+assert!(AnnRegistry::exists("ivf_flat"));
+assert!(!AnnRegistry::exists("hnsw"));
+
+// Get the IvfFlatPlugin directly (no runtime artifact needed).
+let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
+```
+
+For `"ivf_pq"`, `AnnRegistry::get_flat` returns a helpful error message
+explaining that the codebook must be supplied, which guides callers to
+construct `IvfPqPlugin::new(codebook)` directly.
+
+### Extending with a new backend
+
+1. Implement `AnnPlugin` for a new struct.
+2. Call `plugin.validate()` and `plugin.candidate_stage()` from your build or
+   query integration code—no changes to the orchestration layer are needed.
+
+
 request time (for per-request HTTP overrides).  The following invariants are enforced:
 
 - `candidate_centroids` (or `nprobe`) must be ≥ 1. A value of `0` would cause every

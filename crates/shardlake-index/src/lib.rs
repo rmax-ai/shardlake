@@ -9,6 +9,7 @@ pub mod kmeans;
 pub mod merge;
 pub mod metrics;
 pub mod pipeline;
+pub mod plugin;
 pub mod pq;
 pub mod searcher;
 pub mod shard;
@@ -27,6 +28,7 @@ pub use pipeline::{
     MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder,
     RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
+pub use plugin::{AnnPlugin, AnnRegistry, IvfFlatPlugin, IvfPqPlugin};
 pub use pq::{PqCodebook, PqParams};
 pub use searcher::IndexSearcher;
 pub use shard::{PqShard, ShardIndex, SHARD_MAGIC};
