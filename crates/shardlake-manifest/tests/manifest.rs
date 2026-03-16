@@ -522,6 +522,143 @@ fn test_check_algorithm_compat_uses_v1_default() {
     assert!(manifest.check_algorithm_compat("hnsw").is_err());
 }
 
+// ── check_algorithm_full_compat ───────────────────────────────────────────────
+
+/// Algorithm name, no variant, no required params → compatible.
+#[test]
+fn test_full_compat_algorithm_only_ok() {
+    let m = sample_manifest();
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", None, &[])
+        .is_ok());
+}
+
+/// Algorithm name mismatch → Compatibility error.
+#[test]
+fn test_full_compat_algorithm_mismatch() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat("hnsw", None, &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm mismatch"));
+    assert!(err.to_string().contains("manifest has kmeans-flat"));
+    assert!(err.to_string().contains("requested hnsw"));
+}
+
+/// Manifest has a variant and caller requests the same variant → compatible.
+#[test]
+fn test_full_compat_variant_match_ok() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", Some("cosine-normalised"), &[])
+        .is_ok());
+}
+
+/// Manifest has variant A, caller requires variant B → Compatibility error.
+#[test]
+fn test_full_compat_variant_mismatch() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    let err = m
+        .check_algorithm_full_compat("kmeans-flat", Some("dot-normalised"), &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm variant mismatch"));
+    assert!(err.to_string().contains("manifest has"));
+    assert!(err.to_string().contains("cosine-normalised"));
+    assert!(err.to_string().contains("requested"));
+    assert!(err.to_string().contains("dot-normalised"));
+}
+
+/// Manifest has no variant, caller requires a specific variant → Compatibility error.
+#[test]
+fn test_full_compat_variant_manifest_none_requested_some() {
+    let m = sample_manifest(); // variant is None
+    let err = m
+        .check_algorithm_full_compat("kmeans-flat", Some("cosine-normalised"), &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm variant mismatch"));
+}
+
+/// Manifest has a variant, caller passes variant=None → variant is not checked (compatible).
+#[test]
+fn test_full_compat_variant_caller_none_skips_check() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", None, &[])
+        .is_ok());
+}
+
+/// All required_params are present and match → compatible.
+#[test]
+fn test_full_compat_required_params_all_match() {
+    let m = sample_manifest();
+    assert!(m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[
+                ("num_shards", &serde_json::json!(2)),
+                ("kmeans_iters", &serde_json::json!(20)),
+            ]
+        )
+        .is_ok());
+}
+
+/// A required param has a different value in the manifest → Compatibility error.
+#[test]
+fn test_full_compat_required_param_value_mismatch() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_shards", &serde_json::json!(8))],
+        )
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm param"));
+    assert!(err.to_string().contains("num_shards"));
+    assert!(err.to_string().contains("mismatch"));
+}
+
+/// A required param is not present in the manifest at all → Compatibility error.
+#[test]
+fn test_full_compat_required_param_missing_from_manifest() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_clusters", &serde_json::json!(256))],
+        )
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("num_clusters"));
+    assert!(err.to_string().contains("missing from manifest"));
+}
+
+/// Manifest has extra params not listed in required_params → silently accepted (forward-compat).
+#[test]
+fn test_full_compat_extra_manifest_params_ignored() {
+    let mut m = sample_manifest();
+    m.algorithm
+        .params
+        .insert("future_param".into(), serde_json::json!("some_value"));
+    // Caller only requires num_shards; the extra future_param is not checked.
+    assert!(m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_shards", &serde_json::json!(2))]
+        )
+        .is_ok());
+}
+
 // ── routing metadata validation ───────────────────────────────────────────────
 
 /// A v4 manifest with a shard whose `routing.centroid_id` is empty must fail

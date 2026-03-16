@@ -581,6 +581,66 @@ impl Manifest {
         }
         Ok(())
     }
+
+    /// Check that this manifest is compatible with the requested algorithm
+    /// family, variant, and a subset of critical algorithm parameters.
+    ///
+    /// # Compatibility semantics
+    ///
+    /// * **algorithm** — must match [`AlgorithmMetadata::algorithm`] exactly.
+    /// * **variant** — when `Some(v)`, [`AlgorithmMetadata::variant`] must
+    ///   equal `Some(v)` exactly; pass `None` to skip the variant check
+    ///   entirely (any manifest variant, including `None`, is accepted).
+    /// * **required_params** — each `(key, value)` pair must appear in
+    ///   [`AlgorithmMetadata::params`] with an identical value.  Parameters
+    ///   present in the manifest but absent from `required_params` are
+    ///   silently ignored, enabling forward-compatibility when new
+    ///   informational parameters are added in future builder versions.  A
+    ///   parameter listed in `required_params` but absent from the manifest
+    ///   is treated as a mismatch.
+    ///
+    /// Returns [`ManifestError::Compatibility`] on the first mismatch
+    /// encountered.
+    pub fn check_algorithm_full_compat(
+        &self,
+        algorithm: &str,
+        variant: Option<&str>,
+        required_params: &[(&str, &serde_json::Value)],
+    ) -> Result<()> {
+        if self.algorithm.algorithm != algorithm {
+            return Err(ManifestError::Compatibility(format!(
+                "algorithm mismatch: manifest has {}, requested {}",
+                self.algorithm.algorithm, algorithm
+            )));
+        }
+        if let Some(required_variant) = variant {
+            if self.algorithm.variant.as_deref() != Some(required_variant) {
+                return Err(ManifestError::Compatibility(format!(
+                    "algorithm variant mismatch: manifest has {:?}, requested {:?}",
+                    self.algorithm.variant.as_deref(),
+                    required_variant
+                )));
+            }
+        }
+        for (key, expected) in required_params {
+            match self.algorithm.params.get(*key) {
+                None => {
+                    return Err(ManifestError::Compatibility(format!(
+                        "algorithm param {:?} missing from manifest",
+                        key
+                    )));
+                }
+                Some(actual) if actual != *expected => {
+                    return Err(ManifestError::Compatibility(format!(
+                        "algorithm param {:?} mismatch: manifest has {}, requested {}",
+                        key, actual, expected
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Thin alias pointer stored at `aliases/<alias>.json`.
