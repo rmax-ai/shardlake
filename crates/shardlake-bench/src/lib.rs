@@ -3,7 +3,11 @@
 
 pub mod generate;
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::Instant,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -18,7 +22,7 @@ use shardlake_index::{
     IndexSearcher, Result as IndexResult,
 };
 use shardlake_manifest::Manifest;
-use shardlake_storage::{paths, ObjectStore};
+use shardlake_storage::ObjectStore;
 
 /// Errors that can arise while evaluating partition quality.
 #[derive(Debug, thiserror::Error)]
@@ -78,17 +82,20 @@ pub struct CostMetrics {
 /// * `store` – Object store used to list and measure artifact sizes.
 /// * `manifest` – Manifest of the index being measured.
 pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -> CostMetrics {
-    let disk_footprint_bytes: u64 = match store.list(paths::indexes_prefix()) {
-        Ok(keys) => keys
-            .iter()
-            .filter_map(|k| store.get(k).ok())
-            .map(|b| b.len() as u64)
-            .sum(),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to list index artifacts; disk_footprint_bytes will be 0");
-            0
-        }
-    };
+    let disk_footprint_bytes: u64 = index_artifact_keys(manifest)
+        .into_iter()
+        .filter_map(|key| match store.get(&key) {
+            Ok(bytes) => Some(bytes.len() as u64),
+            Err(err) => {
+                tracing::warn!(
+                    artifact_key = %key,
+                    error = %err,
+                    "failed to read index artifact while computing disk footprint"
+                );
+                None
+            }
+        })
+        .sum();
 
     let total_vectors = manifest.total_vector_count;
     let dims = manifest.dims as u64;
@@ -126,6 +133,28 @@ pub fn compute_cost_metrics(store: &Arc<dyn ObjectStore>, manifest: &Manifest) -
         disk_footprint_bytes,
         compression_ratio,
     }
+}
+
+fn index_artifact_keys(manifest: &Manifest) -> BTreeSet<String> {
+    let mut keys = BTreeSet::from([Manifest::storage_key(&manifest.index_version)]);
+    keys.extend(
+        manifest
+            .shards
+            .iter()
+            .map(|shard| shard.artifact_key.clone()),
+    );
+
+    if let Some(codebook_key) = &manifest.compression.codebook_key {
+        keys.insert(codebook_key.clone());
+    }
+    if let Some(coarse_quantizer_key) = &manifest.coarse_quantizer_key {
+        keys.insert(coarse_quantizer_key.clone());
+    }
+    if let Some(lexical) = &manifest.lexical {
+        keys.insert(lexical.artifact_key.clone());
+    }
+
+    keys
 }
 
 /// Summary statistics for one benchmark run.
@@ -1066,16 +1095,60 @@ mod tests {
         let store_arc: Arc<dyn ObjectStore> = store;
         let metrics = compute_cost_metrics(&store_arc, &manifest);
 
-        // Manually sum artifact sizes the same way compute_cost_metrics does.
+        // Manually sum only this manifest's artifacts.
         let manual_sum: u64 = store_arc
-            .list(shardlake_storage::paths::indexes_prefix())
-            .unwrap_or_default()
+            .list(&format!("indexes/{}/", manifest.index_version.0))
+            .unwrap()
             .iter()
-            .filter_map(|k| store_arc.get(k).ok())
+            .filter_map(|key| store_arc.get(key).ok())
             .map(|b| b.len() as u64)
             .sum();
 
         assert_eq!(metrics.disk_footprint_bytes, manual_sum);
+    }
+
+    #[test]
+    fn cost_metrics_disk_footprint_ignores_other_indexes_in_storage() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+
+        let first_manifest = build_test_index(
+            store.as_ref(),
+            make_records(10, 4),
+            1,
+            tmp.path().to_path_buf(),
+        );
+        let _second_manifest = IndexBuilder::new(store.as_ref(), &SystemConfig::default())
+            .build(BuildParams {
+                records: make_records(10, 4),
+                dataset_version: DatasetVersion("ds-other".into()),
+                embedding_version: EmbeddingVersion("emb-other".into()),
+                index_version: IndexVersion("idx-other".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 4,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-other"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-other"),
+                pq_params: None,
+            })
+            .unwrap();
+
+        let store_arc: Arc<dyn ObjectStore> = store;
+        let metrics = compute_cost_metrics(&store_arc, &first_manifest);
+        let this_index_only: u64 = store_arc
+            .list(&format!("indexes/{}/", first_manifest.index_version.0))
+            .unwrap()
+            .iter()
+            .map(|key| store_arc.get(key).unwrap().len() as u64)
+            .sum();
+        let all_indexes: u64 = store_arc
+            .list(shardlake_storage::paths::indexes_prefix())
+            .unwrap()
+            .iter()
+            .map(|key| store_arc.get(key).unwrap().len() as u64)
+            .sum();
+
+        assert_eq!(metrics.disk_footprint_bytes, this_index_only);
+        assert!(all_indexes > this_index_only);
     }
 
     #[test]
