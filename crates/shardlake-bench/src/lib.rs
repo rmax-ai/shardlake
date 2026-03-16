@@ -32,7 +32,7 @@ use shardlake_storage::ObjectStore;
 ///
 /// - `None` → empty string (BM25 search returns no results for an empty query).
 /// - `String` values → returned as-is.
-/// - All other JSON values → formatted with [`serde_json::Value::to_string`].
+/// - All other JSON values → formatted with `serde_json::Value::to_string()`.
 ///
 /// This matches the text extraction convention used when building BM25 indexes
 /// from corpus metadata, ensuring that query text and index text are tokenised
@@ -778,6 +778,13 @@ pub fn run_eval_hybrid(
         return Err(shardlake_index::IndexError::Other(
             "eval-hybrid requires at least one query vector".to_string(),
         ));
+    }
+    if query_texts.len() != queries.len() {
+        return Err(shardlake_index::IndexError::Other(format!(
+            "eval-hybrid requires one query text per query vector (got {} query vectors and {} query texts)",
+            queries.len(),
+            query_texts.len()
+        )));
     }
 
     let nprobe = policy.candidate_centroids as usize;
@@ -2129,6 +2136,46 @@ mod tests {
             assert!(metrics.mean_latency_us >= 0.0);
             assert!(metrics.p99_latency_us >= 0.0);
         }
+    }
+
+    #[test]
+    fn run_eval_hybrid_returns_error_for_mismatched_query_text_count() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(10, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let bm25 = build_bm25_from_records(&records);
+        let queries: Vec<VectorRecord> = records[..3].to_vec();
+        let query_texts = vec![metadata_to_text(&queries[0].metadata)];
+
+        let policy = shardlake_core::config::FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+        let hybrid_policy = HybridRankingPolicy {
+            vector_weight: 0.7,
+            bm25_weight: 0.3,
+        };
+
+        let result = run_eval_hybrid(
+            &searcher,
+            &bm25,
+            &queries,
+            &query_texts,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+            &hybrid_policy,
+        );
+
+        assert!(
+            result.is_err(),
+            "mismatched query text count must return an error"
+        );
     }
 
     #[test]
