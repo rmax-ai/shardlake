@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("invalid fan-out policy: {0}")]
     InvalidFanOutPolicy(String),
 
+    #[error("invalid prefetch policy: {0}")]
+    InvalidPrefetchPolicy(String),
+
     #[error("{0}")]
     Other(String),
 }
