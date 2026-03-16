@@ -28,6 +28,7 @@ use shardlake_storage::ObjectStore;
 
 use crate::{
     ivf::IvfQuantizer,
+    plugin::AnnRegistry,
     pq::{PqCodebook, PqParams},
     shard::{PqShard, ShardIndex},
     IndexError, Result, PQ8_CODEC,
@@ -107,16 +108,9 @@ impl<'a> IndexBuilder<'a> {
         }
 
         // Resolve PQ params: explicit BuildParams override, then config flag.
-        let resolved_pq: Option<PqParams> = pq_params.or({
-            if self.config.pq_enabled {
-                Some(PqParams {
-                    num_subspaces: self.config.pq_num_subspaces as usize,
-                    codebook_size: self.config.pq_codebook_size as usize,
-                })
-            } else {
-                None
-            }
-        });
+        // AnnRegistry centralises this selection so build callers do not need
+        // to branch on pq_enabled directly.
+        let resolved_pq = AnnRegistry::resolve_build_params(pq_params, self.config);
 
         if resolved_pq.is_some() && metric != DistanceMetric::Euclidean {
             return Err(IndexError::Other(

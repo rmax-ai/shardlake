@@ -9,6 +9,7 @@ pub mod kmeans;
 pub mod merge;
 pub mod metrics;
 pub mod pipeline;
+pub mod plugin;
 pub mod pq;
 pub mod query_plan;
 pub mod ranking;
@@ -30,6 +31,7 @@ pub use pipeline::{
     MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder,
     RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
+pub use plugin::{AnnPlugin, AnnRegistry, IvfFlatPlugin, IvfPqPlugin};
 pub use pq::{PqCodebook, PqParams};
 pub use query_plan::QueryPlan;
 pub use ranking::{rank_hybrid, HybridRankingPolicy};

@@ -49,12 +49,12 @@ forward-slash-delimited keys, which map directly to filesystem paths.
 │       ├── pq_codebook.bin            ← index_pq_codebook_key (PQ builds only)
 │       ├── coarse_quantizer.cq        ← index_coarse_quantizer_key
 │       ├── lexical.bm25               ← index_lexical_key (lexical index builds only)
-│       ├── worker_plan.json           ← worker_plan_key (distributed builds only)
+│       ├── worker_plan.json           ← worker_plan_key (parallel/distributed builds only)
 │       ├── shards/
 │       │   ├── shard-0000.sidx        ← index_shard_key(…, 0)
 │       │   ├── shard-0001.sidx        ← index_shard_key(…, 1)
 │       │   └── ...
-│       └── workers/                   ← distributed builds only
+│       └── workers/                   ← parallel/distributed builds only
 │           └── 0000/
 │               └── output.json        ← worker_output_key(…, worker_id)
 └── aliases/
@@ -308,10 +308,11 @@ invocation.
 
 ## Worker plan (`indexes/<version>/worker_plan.json`)
 
-Written by `shardlake build-index-worker --mode plan`.  Describes how a
-distributed build is partitioned across workers.  Workers load this file to
-find their shard assignments and the inline shard centroids needed to filter
-dataset vectors without reloading the coarse-quantizer artifact.
+Written by `shardlake build-index-worker --mode plan` and by
+`shardlake build-index --parallel`. Describes how a build is partitioned across
+workers. Workers load this file to find their shard assignments and the inline
+shard centroids needed to filter dataset vectors without reloading the
+coarse-quantizer artifact.
 
 ```json
 {
