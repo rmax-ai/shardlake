@@ -83,6 +83,17 @@ pub fn index_coarse_quantizer_key(index_version: &str) -> String {
     format!("indexes/{index_version}/coarse_quantizer.cq")
 }
 
+/// Storage key for the BM25 lexical-index artifact of a given index version.
+///
+/// The `.bm25` file stores a serialised [`Bm25Index`] built alongside the
+/// vector shard artifacts.  Its existence is indicated by the
+/// `LexicalIndexConfig` field inside the manifest.
+///
+/// [`Bm25Index`]: shardlake_index::bm25::Bm25Index
+pub fn index_lexical_key(index_version: &str) -> String {
+    format!("indexes/{index_version}/lexical.bm25")
+}
+
 /// Storage key for an alias pointer JSON file.
 pub fn alias_key(alias: &str) -> String {
     format!("aliases/{alias}.json")
@@ -135,6 +146,11 @@ mod tests {
             index_pq_codebook_key("idx-v1"),
             "indexes/idx-v1/pq_codebook.bin"
         );
+    }
+
+    #[test]
+    fn index_lexical_key_has_stable_layout() {
+        assert_eq!(index_lexical_key("idx-v1"), "indexes/idx-v1/lexical.bm25");
     }
 
     #[test]

@@ -1,9 +1,12 @@
 //! Index building and approximate nearest-neighbour search.
 
+pub mod bm25;
 pub mod builder;
+pub mod cache;
 pub mod exact;
 pub mod ivf;
 pub mod kmeans;
+pub mod merge;
 pub mod metrics;
 pub mod pipeline;
 pub mod pq;
@@ -11,9 +14,12 @@ pub mod searcher;
 pub mod shard;
 pub mod validator;
 
+pub use bm25::{tokenize, BM25Params, Bm25Index, BM25_MAGIC};
 pub use builder::{BuildParams, IndexBuilder};
+pub use cache::{ShardCache, DEFAULT_SHARD_CACHE_CAPACITY};
 pub use exact::ExactSearcher;
 pub use ivf::IvfQuantizer;
+pub use merge::GlobalMerge;
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
