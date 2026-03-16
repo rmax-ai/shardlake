@@ -70,7 +70,7 @@ computation before returning results.  Three retrieval modes are supported:
 | `vector` | `float[]` | Mode-dependent | Query vector. Must have the same number of dimensions as the index. Required for `vector` and `hybrid` modes; ignored for `lexical`. |
 | `k` | integer | Yes | Number of results to return. Must be ≥ 1. |
 | `query_mode` | string | No | Retrieval mode. One of `"vector"` (default), `"lexical"`, or `"hybrid"`. See [Query modes](#query-modes) below. |
-| `query_text` | string | Mode-dependent | Query text for BM25 full-text search. Required for `lexical` and `hybrid` modes; ignored for `vector`. |
+| `query_text` | string | Mode-dependent | Query text for BM25 full-text search. Required for `lexical` and `hybrid` modes; ignored for `vector`. Requests are rejected when this field is blank or tokenizes to no searchable terms. |
 | `nprobe` | integer | No | Backward-compatible alias for `candidate_centroids`. Ignored when `candidate_centroids` is also provided. Defaults to the server's `--nprobe` value. |
 | `candidate_centroids` | integer | No | Number of nearest IVF centroids to select for shard routing. Must be ≥ 1 when provided. Takes precedence over `nprobe`. Defaults to the server's `--nprobe` value. |
 | `candidate_shards` | integer | No | Maximum number of shards to probe after centroid-to-shard deduplication. `0` means no cap. Defaults to the server's `--candidate-shards` value. |
@@ -113,10 +113,10 @@ computation before returning results.  Three retrieval modes are supported:
 |--------|------|-------|
 | `400 Bad Request` | `{"error": "k must be > 0"}` | `k` field is 0 |
 | `400 Bad Request` | `{"error": "vector is required for vector mode"}` | `query_mode` is `"vector"` (or absent) and `vector` field is missing |
-| `400 Bad Request` | `{"error": "query_text is required for lexical mode"}` | `query_mode` is `"lexical"` and `query_text` field is missing or empty |
+| `400 Bad Request` | `{"error": "query_text is required for lexical mode"}` | `query_mode` is `"lexical"` and `query_text` field is missing, blank, or tokenizes to no searchable terms |
 | `400 Bad Request` | `{"error": "lexical query mode is not available: no BM25 index loaded"}` | `query_mode` is `"lexical"` but the server was started without a BM25 lexical index |
 | `400 Bad Request` | `{"error": "vector is required for hybrid mode"}` | `query_mode` is `"hybrid"` and `vector` field is missing |
-| `400 Bad Request` | `{"error": "query_text is required for hybrid mode"}` | `query_mode` is `"hybrid"` and `query_text` field is missing or empty |
+| `400 Bad Request` | `{"error": "query_text is required for hybrid mode"}` | `query_mode` is `"hybrid"` and `query_text` field is missing, blank, or tokenizes to no searchable terms |
 | `400 Bad Request` | `{"error": "hybrid query mode is not available: no BM25 index loaded"}` | `query_mode` is `"hybrid"` but the server was started without a BM25 lexical index |
 | `400 Bad Request` | `{"error": "invalid fan-out policy: candidate_centroids must be ≥ 1"}` | `candidate_centroids` (or `nprobe`) is 0 |
 | `400 Bad Request` | `{"error": "invalid query config: rerank_limit must be ≥ 1 when set"}` | `rerank_limit` is 0 |

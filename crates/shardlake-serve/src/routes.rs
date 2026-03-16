@@ -15,6 +15,7 @@ use shardlake_core::{
     types::{DistanceMetric, QueryMode, SearchResult},
 };
 use shardlake_index::{
+    bm25::tokenize,
     ranking::{rank_hybrid, HybridRankingPolicy},
     IndexError, QueryPlan, PQ8_CODEC,
 };
@@ -166,8 +167,12 @@ fn resolve_policy(
         ));
     }
 
-    // `true` when `query_text` is absent or empty.
-    let query_text_missing = req.query_text.as_deref().map(str::is_empty).unwrap_or(true);
+    // `true` when `query_text` is absent or tokenizes to no searchable terms.
+    let query_text_missing = req
+        .query_text
+        .as_deref()
+        .map(|text| tokenize(text).is_empty())
+        .unwrap_or(true);
 
     // Validate mode-specific field requirements.
     let query_mode = req.query_mode;
@@ -358,7 +363,7 @@ async fn query_handler(
                 } else {
                     ann_results
                 };
-                let bm25_results = bm25.search(&text, k);
+                let bm25_results = bm25.search(&text, candidate_k);
                 let hybrid_policy = HybridRankingPolicy::default();
                 Ok(rank_hybrid(vector_results, bm25_results, &hybrid_policy, k))
             }
@@ -1278,6 +1283,80 @@ mod tests {
         (build_router(state), tmp)
     }
 
+    fn make_hybrid_rerank_limit_router() -> (Router, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).expect("store"));
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 1,
+            kmeans_iters: 4,
+            nprobe: 1,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+            kmeans_sample_size: None,
+            ..SystemConfig::default()
+        };
+        let records = vec![
+            VectorRecord {
+                id: VectorId(1),
+                data: vec![0.9, 0.1],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(2),
+                data: vec![1.0, 0.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(3),
+                data: vec![0.0, 1.0],
+                metadata: None,
+            },
+            VectorRecord {
+                id: VectorId(4),
+                data: vec![0.7, 0.3],
+                metadata: None,
+            },
+        ];
+        let manifest = IndexBuilder::new(store.as_ref(), &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-hybrid-rerank".into()),
+                embedding_version: EmbeddingVersion("emb-hybrid-rerank".into()),
+                index_version: IndexVersion("idx-hybrid-rerank".into()),
+                metric: DistanceMetric::Euclidean,
+                dims: 2,
+                vectors_key: "datasets/ds-hybrid-rerank/vectors.jsonl".into(),
+                metadata_key: "datasets/ds-hybrid-rerank/metadata.json".into(),
+                pq_params: None,
+            })
+            .expect("build index");
+        let searcher = Arc::new(IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest));
+        let metrics = Arc::new(PrometheusMetrics::new(searcher.cache_metrics()));
+        let bm25 = Bm25Index::build(
+            &[
+                (VectorId(1), "alpha alpha"),
+                (VectorId(2), "beta"),
+                (VectorId(3), "alpha alpha alpha"),
+                (VectorId(4), "alpha"),
+            ],
+            BM25Params::default(),
+        );
+        let state = AppState {
+            searcher,
+            fan_out: FanOutPolicy {
+                candidate_centroids: 1,
+                candidate_shards: 0,
+                max_vectors_per_shard: 0,
+            },
+            debug_routes_enabled: false,
+            metrics,
+            bm25_index: Some(Arc::new(bm25)),
+        };
+        (build_router(state), tmp)
+    }
+
     // ── Query mode: defaults ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1385,6 +1464,35 @@ mod tests {
                 Request::post("/query")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"k":1,"query_mode":"lexical"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("query_text is required for lexical mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn query_mode_lexical_rejects_whitespace_only_query_text() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"k":1,"query_mode":"lexical","query_text":"   "}"#,
+                    ))
                     .expect("request"),
             )
             .await
@@ -1522,6 +1630,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_mode_hybrid_rejects_punctuation_only_query_text() {
+        let (app, _tmp) = make_lexical_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"hybrid","query_text":"!!!"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("query_text is required for hybrid mode"),
+            "unexpected error: {}",
+            payload["error"]
+        );
+    }
+
+    #[tokio::test]
     async fn query_mode_hybrid_rejects_no_bm25_index() {
         // Router has no BM25 index.
         let (app, _tmp) = make_test_router();
@@ -1552,6 +1689,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_mode_hybrid_rerank_limit_widens_bm25_candidates() {
+        let (app, _tmp) = make_hybrid_rerank_limit_router();
+        let response = app
+            .oneshot(
+                Request::post("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"vector":[1.0,0.0],"k":1,"query_mode":"hybrid","query_text":"alpha","rerank":true,"rerank_limit":3}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: QueryResponse = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].id, VectorId(1));
+    }
+
+    #[tokio::test]
     async fn query_mode_invalid_value_rejected() {
         let (app, _tmp) = make_test_router();
         let response = app
@@ -1565,12 +1725,6 @@ mod tests {
             )
             .await
             .expect("response");
-        // Axum rejects invalid enum values with a 422 or 400 during deserialization.
-        assert!(
-            response.status() == StatusCode::BAD_REQUEST
-                || response.status() == StatusCode::UNPROCESSABLE_ENTITY,
-            "expected 400 or 422 for invalid query_mode, got {}",
-            response.status()
-        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
