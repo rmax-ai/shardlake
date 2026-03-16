@@ -65,8 +65,6 @@ fn default_merge_params() -> MergeParams {
         alias: "latest".into(),
         built_at: Utc::now(),
         builder_version: "test".into(),
-        num_kmeans_iters: 20,
-        nprobe_default: 2,
         build_duration_secs: 0.0,
     }
 }
@@ -385,6 +383,22 @@ fn merge_rejects_out_of_range_shard_id() {
 
     let err = merge_worker_outputs(&plan, outputs, default_merge_params()).unwrap_err();
     assert!(err.to_string().contains("out of range"), "{err}");
+}
+
+#[test]
+fn merge_rejects_mismatched_shard_worker_id() {
+    let tmp = tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+    let config = default_config(tmp.path(), 2);
+    let records = two_cluster_records();
+
+    let (plan, mut outputs) =
+        plan_and_execute_all(&store, &config, &records, "idx-merge-shard-worker-mismatch");
+
+    outputs[0].shards[0].worker_id = outputs[0].worker_id + 1;
+
+    let err = merge_worker_outputs(&plan, outputs, default_merge_params()).unwrap_err();
+    assert!(err.to_string().contains("reports worker_id"), "{err}");
 }
 
 // ── shard_summary ─────────────────────────────────────────────────────────────

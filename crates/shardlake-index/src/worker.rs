@@ -211,10 +211,6 @@ pub struct MergeParams {
     pub built_at: DateTime<Utc>,
     /// Crate version string recorded in [`BuildMetadata::builder_version`].
     pub builder_version: String,
-    /// Number of K-means iterations performed during the plan phase.
-    pub num_kmeans_iters: u32,
-    /// Default `nprobe` value to record in the manifest.
-    pub nprobe_default: u32,
     /// Wall-clock duration of the full distributed build in seconds.
     pub build_duration_secs: f64,
 }
@@ -247,6 +243,8 @@ pub struct MergeParams {
 ///   match the plan's index version.
 /// - Two outputs share the same `worker_id` (duplicate worker).
 /// - A worker output's `worker_id` is out of range for the plan.
+/// - A [`WorkerShardOutput`] names a different `worker_id` than its parent
+///   [`WorkerOutput`].
 /// - The set of shard IDs across all outputs does not exactly match the set
 ///   of shard IDs in the plan (missing or unexpected shard).
 /// - A shard ID appears more than once across all outputs (duplicate shard).
@@ -312,6 +310,12 @@ pub fn merge_worker_outputs(
 
     for output in outputs {
         for shard_out in output.shards {
+            if shard_out.worker_id != output.worker_id {
+                return Err(IndexError::Other(format!(
+                    "shard_id {} reports worker_id {} but parent output is worker_id {}",
+                    shard_out.shard_id.0, shard_out.worker_id, output.worker_id
+                )));
+            }
             if !seen_shard_ids.insert(shard_out.shard_id.0) {
                 return Err(IndexError::Other(format!(
                     "duplicate shard_id {} in worker outputs",

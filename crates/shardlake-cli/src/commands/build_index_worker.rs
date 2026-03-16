@@ -340,8 +340,6 @@ async fn run_merge(storage: PathBuf, args: BuildIndexWorkerArgs) -> Result<()> {
         alias: args.alias,
         built_at: Utc::now(),
         builder_version: env!("CARGO_PKG_VERSION").to_string(),
-        num_kmeans_iters: plan.kmeans_iters,
-        nprobe_default: plan.nprobe_default,
         // Wall-clock duration is not tracked across distributed workers; record
         // zero to indicate this field was not measured for this build mode.
         build_duration_secs: 0.0,
