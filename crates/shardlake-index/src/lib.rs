@@ -27,11 +27,11 @@ pub use merge::GlobalMerge;
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
 pub use pipeline::{
     CachedShardLoader, CandidateSearchStage, CentroidRouter, EmbedStage, ExactCandidateSearch,
-    ExactCandidateStage, ExactRerankStage, IdentityEmbedder, LoadShardStage, MergeStage,
-    MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline, QueryPipelineBuilder,
-    RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
+    ExactCandidateStage, ExactRerankStage, HnswCandidateSearch, IdentityEmbedder, LoadShardStage,
+    MergeStage, MmapShardLoader, NoopReranker, PqCandidateStage, QueryPipeline,
+    QueryPipelineBuilder, RerankStage, RouteStage, TopKMerge, MMAP_MIN_SIZE_BYTES,
 };
-pub use plugin::{AnnPlugin, AnnRegistry, IvfFlatPlugin, IvfPqPlugin};
+pub use plugin::{AnnPlugin, AnnRegistry, HnswConfig, HnswPlugin, IvfFlatPlugin, IvfPqPlugin};
 pub use pq::{PqCodebook, PqParams};
 pub use query_plan::QueryPlan;
 pub use ranking::{rank_hybrid, HybridRankingPolicy};

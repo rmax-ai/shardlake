@@ -157,6 +157,7 @@ framework.
 |---------|-----------|-------------|
 | `IvfFlat` | `"ivf_flat"` | Exact (brute-force) distance scoring within each probed shard. Supports all distance metrics. |
 | `IvfPq` | `"ivf_pq"` | Product-quantised scoring with asymmetric distance computation. Euclidean metric only. |
+| `Hnsw` | `"hnsw"` | Hierarchical Navigable Small World graph-based ANN index. Supports all distance metrics. |
 
 Parse from a string with `"ivf_flat".parse::<AnnFamily>()`. Unknown names return a
 `CoreError::Other` with the list of valid choices.
@@ -184,8 +185,8 @@ constructed.  Then call `plugin.candidate_stage()` to wire the backend into a
 `QueryPipeline` without algorithm-specific branching:
 
 ```rust
-// No branching—both families use the same interface.
-let plugin: &dyn AnnPlugin = &IvfFlatPlugin;
+// No branching—all families use the same interface.
+let plugin: &dyn AnnPlugin = &HnswPlugin::default();
 plugin.validate(dims, DistanceMetric::Cosine).unwrap();
 let pipeline = QueryPipeline::builder(store, manifest)
     .candidate_stage(plugin.candidate_stage())
@@ -198,6 +199,21 @@ let pipeline = QueryPipeline::builder(store, manifest)
 |--------|--------|-------|
 | `IvfFlatPlugin` | `"ivf_flat"` | No extra data needed; constructed directly. |
 | `IvfPqPlugin::new(codebook)` | `"ivf_pq"` | Requires a pre-trained `PqCodebook` loaded from storage. |
+| `HnswPlugin::default()` | `"hnsw"` | No extra data needed; optionally customise via `HnswPlugin::new(HnswConfig { m, ef_construction, ef_search })`. |
+
+### `HnswConfig`
+
+HNSW-specific construction and search parameters:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `m` | `16` | Number of bi-directional links per graph node (`M`). Higher values increase recall but use more memory. Range: 1–64. |
+| `ef_construction` | `200` | Beam width during graph construction. Must be ≥ `m`. Higher values improve recall at the cost of build speed. |
+| `ef_search` | `50` | Beam width during query time. Must be ≥ 1. Higher values improve recall at the cost of query latency. |
+
+Configuration is validated by `HnswPlugin::validate()` before any build or query
+proceeds.  Invalid combinations (e.g. `m = 0` or `ef_construction < m`) return a
+descriptive `IndexError` immediately.
 
 ### `AnnRegistry`
 
@@ -210,15 +226,17 @@ for name in AnnRegistry::families() { println!("{name}"); }
 
 // Check if a name is known.
 assert!(AnnRegistry::exists("ivf_flat"));
-assert!(!AnnRegistry::exists("hnsw"));
+assert!(AnnRegistry::exists("hnsw"));
 
-// Get the IvfFlatPlugin directly (no runtime artifact needed).
+// Get a plugin directly (no runtime artifact needed).
 let plugin = AnnRegistry::get_flat("ivf_flat").unwrap();
+let hnsw_plugin = AnnRegistry::get_flat("hnsw").unwrap();
 ```
 
-For `"ivf_pq"`, `AnnRegistry::get_flat` returns a helpful error message
-explaining that the codebook must be supplied, which guides callers to
-construct `IvfPqPlugin::new(codebook)` directly.
+`AnnRegistry::get_flat` returns a ready-to-use plugin for `"ivf_flat"` and
+`"hnsw"`.  For `"ivf_pq"`, it returns a helpful error message explaining that
+the codebook must be supplied, which guides callers to construct
+`IvfPqPlugin::new(codebook)` directly.
 
 ### Extending with a new backend
 
