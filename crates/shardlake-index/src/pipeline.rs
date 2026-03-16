@@ -263,7 +263,6 @@ impl CachedShardLoader {
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        let _span = debug_span!("shard_load", shard_id = shard_id.0).entered();
         self.record_access(shard_id)?;
 
         let mut retained_bytes = None;
@@ -628,7 +627,11 @@ impl QueryPipeline {
                 all_centroids.push(shard_def.centroid.clone());
                 centroid_to_shard.push(shard_def.shard_id);
             } else {
-                let shard = self.loader.load(shard_def.shard_id)?;
+                let shard = {
+                    let _span =
+                        debug_span!("shard_load", shard_id = shard_def.shard_id.0).entered();
+                    self.loader.load(shard_def.shard_id)?
+                };
                 for centroid in &shard.centroids {
                     all_centroids.push(centroid.clone());
                     centroid_to_shard.push(shard_def.shard_id);
@@ -662,7 +665,10 @@ impl QueryPipeline {
             .map(|&shard_id| {
                 let dispatch = dispatch.clone();
                 tracing::dispatcher::with_default(&dispatch, || {
-                    let shard = self.loader.load(shard_id)?;
+                    let shard = {
+                        let _span = debug_span!("shard_load", shard_id = shard_id.0).entered();
+                        self.loader.load(shard_id)?
+                    };
                     let _span = debug_span!(
                         "ann_search",
                         shard_id = shard_id.0,

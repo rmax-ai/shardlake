@@ -170,6 +170,15 @@ impl IndexSearcher {
         }
     }
 
+    /// Return the cumulative raw-shard cache hit and miss counts.
+    ///
+    /// The returned tuple is `(hits, misses)` for the raw-shard LRU cache since
+    /// this searcher was created. PQ-shard accesses are tracked separately and
+    /// are not included.
+    pub fn cache_access_counts(&self) -> (u64, u64) {
+        (self.cache.hits(), self.cache.misses())
+    }
+
     /// Perform approximate top-k search using the provided [`FanOutPolicy`].
     ///
     /// The policy controls:

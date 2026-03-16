@@ -224,6 +224,8 @@ pub fn run_workload_benchmark(
                 let _ = searcher.search(&query.data, k, policy);
             }
 
+            let (hits_before, misses_before) = searcher.cache_access_counts();
+
             // Measured pass – shards should now be in the LRU cache.
             let mut latencies_us: Vec<f64> = Vec::with_capacity(queries.len());
             let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
@@ -241,7 +243,10 @@ pub fn run_workload_benchmark(
                 recalls.push(recall_at_k(&gt_ids, &approx_ids));
             }
             let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
-            let cache_hit_rate = searcher.cache_hit_rate();
+            let (hits_after, misses_after) = searcher.cache_access_counts();
+            let delta_hits = hits_after.saturating_sub(hits_before);
+            let delta_misses = misses_after.saturating_sub(misses_before);
+            let cache_hit_rate = hit_rate(delta_hits, delta_misses);
 
             (latencies_us, recalls, cache_hit_rate, wall_elapsed_secs)
         }
@@ -267,7 +272,8 @@ pub fn run_workload_benchmark(
                 recalls.push(recall_at_k(&gt_ids, &approx_ids));
             }
             let wall_elapsed_secs = wall_start.elapsed().as_secs_f64();
-            let cache_hit_rate = searcher.cache_hit_rate();
+            let (hits, misses) = searcher.cache_access_counts();
+            let cache_hit_rate = hit_rate(hits, misses);
 
             (latencies_us, recalls, cache_hit_rate, wall_elapsed_secs)
         }
@@ -303,6 +309,15 @@ pub fn run_workload_benchmark(
     );
 
     report
+}
+
+fn hit_rate(hits: u64, misses: u64) -> f64 {
+    let total = hits + misses;
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
+    }
 }
 
 /// Run benchmark comparing approximate search against exact baseline.
@@ -1235,10 +1250,10 @@ mod tests {
 
         assert_eq!(report.workload, WorkloadMode::Warm);
         // After a full warm-up pass all shard loads in the measured pass should
-        // be cache hits, so the hit rate must be > 0.0.
+        // be cache hits, so the measured-pass hit rate should be effectively 1.0.
         assert!(
-            report.cache_hit_rate > 0.0,
-            "warm workload must have a positive cache hit rate, got {}",
+            report.cache_hit_rate > 0.99,
+            "warm workload should report measured-pass hits only, got {}",
             report.cache_hit_rate
         );
         assert_eq!(report.benchmark.num_queries, 5);
