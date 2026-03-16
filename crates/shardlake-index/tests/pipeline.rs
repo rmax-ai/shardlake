@@ -437,3 +437,119 @@ fn pipeline_shard_load_failure_propagates() {
         "unexpected error message: {err}"
     );
 }
+
+#[test]
+fn cosine_pipeline_returns_query_vector_as_top_result() {
+    // An index built with cosine distance should rank the query's own record
+    // (or any record sharing the same direction) at position 0.
+    let records = make_records(20, 4);
+    let query = records[5].data.clone();
+    let (store, manifest, _tmp) =
+        build_index(records.clone(), 2, 4, "ds-cosine", DistanceMetric::Cosine);
+
+    let pipeline = QueryPipeline::builder(store, manifest).build();
+    let results = pipeline.run(&query, 5, 2).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(
+        results[0].id,
+        VectorId(5),
+        "the exact query vector should be closest under cosine distance"
+    );
+}
+
+#[test]
+fn inner_product_pipeline_returns_query_vector_as_top_result() {
+    // An index built with inner-product distance should rank the record with
+    // the largest dot product with the query first. Because `make_records`
+    // generates monotonically increasing values, the last record in the corpus
+    // has the largest component magnitudes and therefore the largest dot product
+    // with itself — making it its own top-1 under inner-product scoring.
+    let n = 20;
+    let records = make_records(n, 4);
+    // Use the last record as the query: it has the highest values in every
+    // dimension, so records[n-1] · records[n-1] > records[i] · records[n-1]
+    // for all i < n-1.
+    let last_id = VectorId((n - 1) as u64);
+    let query = records[n - 1].data.clone();
+    let (store, manifest, _tmp) = build_index(
+        records.clone(),
+        2,
+        4,
+        "ds-inner-product",
+        DistanceMetric::InnerProduct,
+    );
+
+    let pipeline = QueryPipeline::builder(store, manifest).build();
+    let results = pipeline.run(&query, 5, 2).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(
+        results[0].id, last_id,
+        "the last record has the largest self-dot-product under inner-product metric"
+    );
+}
+
+#[test]
+fn cosine_and_euclidean_pipelines_produce_different_top_results_for_scale_differing_corpus() {
+    // Construct a corpus where cosine and euclidean give different top-1 results:
+    //   id=0: [1.0, 0.1, 0.0, 0.0]  — nearest in L2, but slightly off-angle
+    //   id=1: [100.0, 0.0, 0.0, 0.0] — exact cosine match, but far in L2
+    //   id=2: [1.0, 1.0, 0.0, 0.0]  — clearly worse under both metrics
+    //
+    // This makes the metric choice observable end-to-end: euclidean should prefer
+    // the nearby off-angle point, while cosine should prefer the distant point with
+    // exactly matching direction.
+    let corpus: Vec<VectorRecord> = vec![
+        VectorRecord {
+            id: VectorId(0),
+            data: vec![1.0, 0.1, 0.0, 0.0],
+            metadata: None,
+        },
+        VectorRecord {
+            id: VectorId(1),
+            data: vec![100.0, 0.0, 0.0, 0.0],
+            metadata: None,
+        },
+        VectorRecord {
+            id: VectorId(2),
+            data: vec![1.0, 1.0, 0.0, 0.0],
+            metadata: None,
+        },
+    ];
+
+    let query = vec![1.0f32, 0.0, 0.0, 0.0];
+
+    let (store_euc, manifest_euc, _tmp_euc) = build_index(
+        corpus.clone(),
+        1,
+        4,
+        "ds-scale-euc",
+        DistanceMetric::Euclidean,
+    );
+    let (store_cos, manifest_cos, _tmp_cos) =
+        build_index(corpus, 1, 4, "ds-scale-cos", DistanceMetric::Cosine);
+
+    let euclidean_pipeline = QueryPipeline::builder(store_euc, manifest_euc).build();
+    let cosine_pipeline = QueryPipeline::builder(store_cos, manifest_cos).build();
+
+    let euc_top1 = euclidean_pipeline.run(&query, 1, 1).unwrap();
+    let cos_top1 = cosine_pipeline.run(&query, 1, 1).unwrap();
+
+    assert_eq!(
+        euc_top1[0].id,
+        VectorId(0),
+        "euclidean should prefer the nearby off-angle record"
+    );
+    assert_eq!(
+        cos_top1[0].id,
+        VectorId(1),
+        "cosine should prefer the exact directional match even when it is far away"
+    );
+    assert!(
+        cos_top1[0].score < 1e-6,
+        "cosine score for a parallel vector must be ~0"
+    );
+    assert_ne!(
+        euc_top1[0].id, cos_top1[0].id,
+        "the two metrics should produce different top-1 results for this corpus"
+    );
+}
