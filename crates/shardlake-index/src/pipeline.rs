@@ -11,7 +11,8 @@
 //!
 //! [`QueryPipeline`] keeps the modular stage surface introduced on `main` while
 //! adding ANN-specific candidate and rerank stages such as [`PqCandidateStage`]
-//! and [`ExactRerankStage`].
+//! and [`ExactRerankStage`]. Stages 3 and 4 can execute concurrently across
+//! probed shards using Rayon.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+use rayon::prelude::*;
 use tracing::debug;
 
 use shardlake_core::{
@@ -29,8 +31,10 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
 
 use crate::{
+    cache::{CacheAccess, ShardCache, DEFAULT_SHARD_CACHE_CAPACITY},
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
+    merge::GlobalMerge,
     metrics::CacheMetrics,
     pq::PqCodebook,
     shard::ShardIndex,
@@ -124,11 +128,11 @@ impl RouteStage for CentroidRouter {
     }
 }
 
-/// Shard loader that caches loaded shards in an in-memory map.
+/// Shard loader that caches loaded shards in a bounded LRU cache.
 ///
 /// Constructed from an [`ObjectStore`] and a [`Manifest`]; uses the manifest
 /// to resolve the artifact key for each shard ID before fetching bytes from
-/// the store.
+/// the store.  Evicts the least-recently-used shard when the cache is full.
 ///
 /// Cache observability is available via [`CachedShardLoader::metrics`]: a
 /// shared [`CacheMetrics`] instance that tracks hits, misses, load latency,
@@ -136,18 +140,39 @@ impl RouteStage for CentroidRouter {
 pub struct CachedShardLoader {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
     metrics: Arc<CacheMetrics>,
+    cache: ShardCache<ShardIndex>,
 }
 
 impl CachedShardLoader {
-    /// Create a new loader backed by `store` and `manifest`.
+    /// Create a new loader using the [`DEFAULT_SHARD_CACHE_CAPACITY`].
     pub fn new(store: Arc<dyn ObjectStore>, manifest: Manifest) -> Self {
+        Self::with_cache_capacity(store, manifest, DEFAULT_SHARD_CACHE_CAPACITY)
+    }
+
+    /// Create a new loader with the given LRU cache `capacity`.
+    ///
+    /// Use this constructor when you want to size the cache based on runtime
+    /// configuration, for example from
+    /// [`SystemConfig::shard_cache_capacity`](shardlake_core::config::SystemConfig::shard_cache_capacity).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    pub fn with_cache_capacity(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        capacity: usize,
+    ) -> Self {
+        assert!(
+            capacity > 0,
+            "CachedShardLoader shard cache capacity must be at least 1"
+        );
         Self {
             store,
             manifest,
-            cache: Mutex::new(HashMap::new()),
             metrics: Arc::new(CacheMetrics::new()),
+            cache: ShardCache::new(capacity),
         }
     }
 
@@ -162,42 +187,35 @@ impl CachedShardLoader {
 
 impl LoadShardStage for CachedShardLoader {
     fn load(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
-        {
-            let cache = self.cache.lock().map_err(|_| {
-                IndexError::Other(
-                    "shard loader cache lock poisoned: a panic occurred while holding the lock"
-                        .into(),
-                )
-            })?;
-            if let Some(idx) = cache.get(&shard_id) {
-                self.metrics.record_hit();
-                return Ok(Arc::clone(idx));
+        let mut retained_bytes = None;
+        let (shard, access) = self.cache.get_or_load_with_status(shard_id, || {
+            let shard_def = self
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard_id)
+                .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
+            self.metrics.record_miss();
+            let started = Instant::now();
+            let bytes = self.store.get(&shard_def.artifact_key);
+            self.metrics
+                .record_load_attempt(started.elapsed().as_nanos() as u64);
+            let bytes = bytes?;
+            retained_bytes = Some(bytes.len() as u64);
+            Ok(Arc::new(ShardIndex::from_bytes(&bytes)?))
+        })?;
+
+        match access {
+            CacheAccess::Hit => self.metrics.record_hit(),
+            CacheAccess::Miss => {
+                if let Some(bytes) = retained_bytes {
+                    self.metrics.record_retained_bytes(bytes);
+                }
             }
+            CacheAccess::Raced => {}
         }
 
-        let shard_def = self
-            .manifest
-            .shards
-            .iter()
-            .find(|shard| shard.shard_id == shard_id)
-            .ok_or_else(|| IndexError::Other(format!("shard {shard_id} not in manifest")))?;
-
-        self.metrics.record_miss();
-
-        let t0 = Instant::now();
-        let bytes = self.store.get(&shard_def.artifact_key);
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        self.metrics.record_load_attempt(elapsed_ns);
-        let bytes = bytes?;
-        let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
-
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| IndexError::Other("shard loader cache lock poisoned".into()))?;
-        cache.insert(shard_id, Arc::clone(&idx));
-        self.metrics.record_retained_bytes(bytes.len() as u64);
-        Ok(idx)
+        Ok(shard)
     }
 }
 
@@ -420,11 +438,14 @@ impl CandidateSearchStage for PqCandidateStage {
 }
 
 /// Merge stage that keeps the best `k` scored candidates with deduplication.
+///
+/// Delegates to [`GlobalMerge`] so ordering is deterministic: results are
+/// sorted by score ascending with vector ID as a tie-breaker.
 pub struct TopKMerge;
 
 impl MergeStage for TopKMerge {
     fn merge(&self, results: Vec<SearchResult>, k: usize) -> Vec<SearchResult> {
-        merge_top_k(results, k)
+        GlobalMerge.merge(results, k)
     }
 }
 
@@ -546,17 +567,28 @@ impl QueryPipeline {
             k
         };
 
+        type PerShardSearchOutput = (Vec<SearchResult>, Option<Arc<ShardIndex>>);
+
+        let keep_probed_shards = self.reranker.is_some();
+        let per_shard: Result<Vec<PerShardSearchOutput>> = probe_shards
+            .par_iter()
+            .map(|&shard_id| {
+                let shard = self.loader.load(shard_id)?;
+                let results = self.candidate_search.search(
+                    &embedded,
+                    &shard,
+                    metric,
+                    candidates_per_shard,
+                )?;
+                Ok((results, keep_probed_shards.then_some(shard)))
+            })
+            .collect();
+
         let mut all_results = Vec::new();
         let mut probed_shards = Vec::new();
-        for shard_id in probe_shards {
-            let shard = self.loader.load(shard_id)?;
-            all_results.extend(self.candidate_search.search(
-                &embedded,
-                &shard,
-                metric,
-                candidates_per_shard,
-            )?);
-            if self.reranker.is_some() {
+        for (results, shard) in per_shard? {
+            all_results.extend(results);
+            if let Some(shard) = shard {
                 probed_shards.push(shard);
             }
         }
@@ -597,6 +629,7 @@ pub struct QueryPipelineBuilder {
     merge: Arc<dyn MergeStage>,
     reranker: Option<Arc<dyn RerankStage>>,
     rerank_oversample: usize,
+    shard_cache_capacity: usize,
 }
 
 impl QueryPipelineBuilder {
@@ -608,9 +641,10 @@ impl QueryPipelineBuilder {
             router: Arc::new(CentroidRouter),
             loader: None,
             candidate_search: Arc::new(ExactCandidateSearch),
-            merge: Arc::new(TopKMerge),
+            merge: Arc::new(GlobalMerge),
             reranker: None,
             rerank_oversample: 1,
+            shard_cache_capacity: DEFAULT_SHARD_CACHE_CAPACITY,
         }
     }
 
@@ -677,12 +711,36 @@ impl QueryPipelineBuilder {
         self
     }
 
+    /// Set the shard LRU cache capacity for the default [`CachedShardLoader`].
+    ///
+    /// Ignored when a custom loader is supplied via
+    /// [`with_loader`](Self::with_loader).  Defaults to
+    /// [`DEFAULT_SHARD_CACHE_CAPACITY`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is `0`.
+    #[must_use]
+    pub fn with_shard_cache_capacity(mut self, capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "QueryPipelineBuilder shard cache capacity must be at least 1"
+        );
+        self.shard_cache_capacity = capacity;
+        self
+    }
+
     /// Assemble the [`QueryPipeline`].
+    ///
+    /// If no custom loader was provided via [`with_loader`](Self::with_loader),
+    /// a [`CachedShardLoader`] backed by the store passed to
+    /// [`QueryPipeline::builder`] is used with the configured cache capacity.
     pub fn build(self) -> QueryPipeline {
         let loader = self.loader.unwrap_or_else(|| {
-            Arc::new(CachedShardLoader::new(
+            Arc::new(CachedShardLoader::with_cache_capacity(
                 Arc::clone(&self.store),
                 self.manifest.clone(),
+                self.shard_cache_capacity,
             ))
         });
         QueryPipeline {

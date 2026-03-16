@@ -351,6 +351,7 @@ impl<'a> IndexBuilder<'a> {
             compression,
             recall_estimate: None,
             coarse_quantizer_key: Some(cq_key),
+            lexical: None,
         };
 
         manifest.save(self.store).map_err(IndexError::Manifest)?;
