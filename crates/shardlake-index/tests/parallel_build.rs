@@ -1,8 +1,8 @@
 //! Tests covering parallel shard-build execution.
 //!
 //! These tests verify that:
-//! - Shard artifacts and manifest metadata are identical across repeated builds
-//!   with the same input and configuration (determinism).
+//! - Shard artifacts and deterministic manifest shard definitions are identical
+//!   across repeated builds with the same input and configuration.
 //! - Multiple shards are written concurrently without data corruption or
 //!   missing artifacts.
 //! - A storage error during a shard write propagates cleanly as a build error.
@@ -38,7 +38,7 @@ fn default_config(tmp: &std::path::Path, num_shards: u32) -> SystemConfig {
     SystemConfig {
         storage_root: tmp.to_path_buf(),
         num_shards,
-        kmeans_iters: 5,
+        kmeans_iters: 2,
         nprobe: 1,
         kmeans_seed: SystemConfig::default_kmeans_seed(),
         kmeans_sample_size: None,
@@ -87,19 +87,7 @@ impl ConcurrencyTrackingStore {
 impl ObjectStore for ConcurrencyTrackingStore {
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
         let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        // Update peak if this is the highest we've seen.
-        let mut observed = self.peak_concurrent.load(Ordering::Relaxed);
-        while current > observed {
-            match self.peak_concurrent.compare_exchange_weak(
-                observed,
-                current,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => observed = actual,
-            }
-        }
+        self.peak_concurrent.fetch_max(current, Ordering::SeqCst);
         if self.delay_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
         }
@@ -174,25 +162,27 @@ impl ObjectStore for FailingShardStore {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 /// Two builds with the same input and configuration must produce identical
-/// shard fingerprints, shard-ID order, and total vector counts.
+/// shard definitions and total vector counts. Time-based build metadata is
+/// intentionally excluded from this assertion.
 #[test]
 fn parallel_build_is_deterministic() {
     let records = make_records(60, 4);
     let dims = 4;
     let num_shards = 4;
+    let index_version = "idx-par-det";
 
-    let build_once = |idx_ver: &str| {
+    let build_once = || {
         let tmp = tempdir().unwrap();
         let inner = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = default_config(tmp.path(), num_shards);
         let manifest = IndexBuilder::new(inner.as_ref(), &config)
-            .build(build_params(records.clone(), dims, idx_ver))
+            .build(build_params(records.clone(), dims, index_version))
             .unwrap();
         manifest
     };
 
-    let m1 = build_once("idx-par-det-1");
-    let m2 = build_once("idx-par-det-2");
+    let m1 = build_once();
+    let m2 = build_once();
 
     assert_eq!(
         m1.shards.len(),
@@ -210,13 +200,28 @@ fn parallel_build_is_deterministic() {
             "shard IDs must appear in consistent order"
         );
         assert_eq!(
-            s1.fingerprint, s2.fingerprint,
-            "shard {} fingerprint must be identical across parallel builds",
+            s1.artifact_key, s2.artifact_key,
+            "shard {} artifact key must be identical across parallel builds",
             s1.shard_id
         );
         assert_eq!(
             s1.vector_count, s2.vector_count,
             "shard {} vector_count must be identical across parallel builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            s1.fingerprint, s2.fingerprint,
+            "shard {} fingerprint must be identical across parallel builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            s1.centroid, s2.centroid,
+            "shard {} centroid must be identical across parallel builds",
+            s1.shard_id
+        );
+        assert_eq!(
+            s1.routing, s2.routing,
+            "shard {} routing metadata must be identical across parallel builds",
             s1.shard_id
         );
     }

@@ -3,10 +3,10 @@
 //!
 //! Shard artifact construction (encoding, serialisation, fingerprinting, and
 //! storage writes) is executed concurrently across shards using Rayon's
-//! work-stealing thread pool.  The final [`Manifest`] is assembled from the
+//! work-stealing thread pool. The final [`Manifest`] is assembled from the
 //! collected results in deterministic shard-ID order, so repeated builds with
-//! identical inputs and configuration produce bit-identical artifacts and
-//! manifest metadata.
+//! identical inputs and configuration produce bit-identical shard artifacts and
+//! stable shard definitions even though time-based build metadata still varies.
 
 use chrono::Utc;
 use rand::{seq::SliceRandom, SeedableRng};
