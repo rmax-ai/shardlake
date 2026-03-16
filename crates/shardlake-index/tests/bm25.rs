@@ -219,3 +219,32 @@ fn zero_b_disables_length_normalisation() {
     // Should still return matching docs.
     assert!(!results.is_empty());
 }
+
+#[test]
+fn duplicate_vector_ids_are_coalesced_deterministically() {
+    let docs = vec![
+        (VectorId(1), "quick brown"),
+        (VectorId(1), "fox"),
+        (VectorId(2), "lazy dog"),
+    ];
+    let idx = Bm25Index::build(&docs, BM25Params::default());
+
+    assert_eq!(idx.num_docs(), 2);
+    let results = idx.search("quick fox", 2);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, VectorId(1));
+}
+
+#[test]
+fn from_bytes_rejects_corrupt_posting_doc_ids() {
+    let mut bytes = Bm25Index::build(&sample_docs(), BM25Params::default())
+        .to_bytes()
+        .expect("serialise");
+    let len = bytes.len();
+    bytes[len - 12..len - 4].copy_from_slice(&999u64.to_le_bytes());
+
+    let err = Bm25Index::from_bytes(&bytes)
+        .err()
+        .expect("corrupt payload should fail");
+    assert!(err.to_string().contains("unknown doc id 999"));
+}

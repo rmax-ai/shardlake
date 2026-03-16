@@ -3,8 +3,8 @@ use shardlake_core::types::{
     DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
 };
 use shardlake_manifest::{
-    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, ManifestError, RecallEstimate,
-    RoutingMetadata, ShardDef, ShardSummary,
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, LexicalIndexConfig, Manifest,
+    ManifestError, RecallEstimate, RoutingMetadata, ShardDef, ShardSummary,
 };
 use shardlake_storage::{paths, LocalObjectStore, ObjectStore};
 
@@ -287,6 +287,39 @@ fn test_validate_rejects_ivf_flat_without_coarse_quantizer_key() {
     assert!(err
         .to_string()
         .contains("algorithm 'ivf-flat' requires coarse_quantizer_key"));
+}
+
+#[test]
+fn test_validate_rejects_lexical_config_on_legacy_manifest_versions() {
+    let mut m = sample_manifest();
+    m.manifest_version = 3;
+    m.lexical = Some(LexicalIndexConfig {
+        artifact_key: paths::index_lexical_key("idx-v1"),
+        k1: 1.5,
+        b: 0.75,
+        doc_count: m.total_vector_count,
+    });
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("lexical index config requires manifest_version >= 4"));
+}
+
+#[test]
+fn test_validate_rejects_lexical_doc_count_mismatch() {
+    let mut m = sample_manifest();
+    m.lexical = Some(LexicalIndexConfig {
+        artifact_key: paths::index_lexical_key("idx-v1"),
+        k1: 1.5,
+        b: 0.75,
+        doc_count: m.total_vector_count + 1,
+    });
+
+    let err = m.validate().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("lexical.doc_count mismatch: expected 10, found 11"));
 }
 
 // ── manifest v4 routing metadata + lifecycle fields ───────────────────────────

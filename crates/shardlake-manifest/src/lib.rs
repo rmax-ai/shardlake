@@ -503,6 +503,11 @@ impl Manifest {
         }
 
         if let Some(lexical) = &self.lexical {
+            if self.manifest_version < 4 {
+                return Err(ManifestError::Validation(
+                    "lexical index config requires manifest_version >= 4".into(),
+                ));
+            }
             if lexical.artifact_key.trim().is_empty() {
                 return Err(ManifestError::Validation(
                     "lexical.artifact_key must not be empty when present".into(),
@@ -517,6 +522,12 @@ impl Manifest {
                 return Err(ManifestError::Validation(
                     "lexical.b must be finite and within [0, 1]".into(),
                 ));
+            }
+            if lexical.doc_count != self.total_vector_count {
+                return Err(ManifestError::Validation(format!(
+                    "lexical.doc_count mismatch: expected {}, found {}",
+                    self.total_vector_count, lexical.doc_count
+                )));
             }
         }
 

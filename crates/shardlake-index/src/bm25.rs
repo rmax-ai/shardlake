@@ -134,6 +134,10 @@ impl Bm25Index {
     /// An empty `documents` slice produces a valid but empty index that always
     /// returns zero results from [`search`][Bm25Index::search].
     ///
+    /// When `documents` contains the same [`VectorId`] multiple times, the
+    /// fragments are coalesced into one logical document by summing token
+    /// frequencies and document length across all occurrences of that id.
+    ///
     /// # Examples
     ///
     /// ```
@@ -149,29 +153,29 @@ impl Bm25Index {
     /// assert_eq!(idx.num_terms(), 3); // "hello", "world", "rust"
     /// ```
     pub fn build(documents: &[(VectorId, &str)], params: BM25Params) -> Self {
-        let num_docs = documents.len() as u64;
         let mut postings: HashMap<String, Vec<(VectorId, u32)>> = HashMap::new();
         let mut doc_lengths: HashMap<VectorId, u32> = HashMap::new();
+        let mut doc_term_freqs: HashMap<VectorId, HashMap<String, u32>> = HashMap::new();
 
         for (id, text) in documents {
             let tokens = tokenize(text);
             let doc_len = tokens.len() as u32;
-            doc_lengths.insert(*id, doc_len);
+            *doc_lengths.entry(*id).or_insert(0) += doc_len;
 
             // Accumulate per-document term frequencies.
-            let mut tf: HashMap<&str, u32> = HashMap::new();
+            let tf = doc_term_freqs.entry(*id).or_default();
             for token in &tokens {
-                *tf.entry(token.as_str()).or_insert(0) += 1;
-            }
-
-            for (term, freq) in tf {
-                postings
-                    .entry(term.to_owned())
-                    .or_default()
-                    .push((*id, freq));
+                *tf.entry(token.clone()).or_insert(0) += 1;
             }
         }
 
+        for (id, tf) in doc_term_freqs {
+            for (term, freq) in tf {
+                postings.entry(term).or_default().push((id, freq));
+            }
+        }
+
+        let num_docs = doc_lengths.len() as u64;
         let avg_doc_len = if num_docs == 0 {
             0.0
         } else {
@@ -363,16 +367,28 @@ impl Bm25Index {
             cur.read_exact(&mut term_bytes)?;
             let term = String::from_utf8(term_bytes)
                 .map_err(|e| IndexError::Other(format!("invalid UTF-8 in term: {e}")))?;
+            if term.is_empty() {
+                return Err(IndexError::Other(
+                    "invalid BM25 index: term must not be empty".into(),
+                ));
+            }
 
             let post_count = read_u64(&mut cur)?;
             let mut posting_list = Vec::with_capacity(post_count as usize);
             for _ in 0..post_count {
                 let id = VectorId(read_u64(&mut cur)?);
                 let tf = read_u32(&mut cur)?;
+                if tf == 0 {
+                    return Err(IndexError::Other(
+                        "invalid BM25 index: posting term frequency must be > 0".into(),
+                    ));
+                }
                 posting_list.push((id, tf));
             }
             postings.insert(term, posting_list);
         }
+
+        validate_loaded_index(k1, b, num_docs, avg_doc_len, &doc_lengths, &postings)?;
 
         Ok(Self {
             params: BM25Params { k1, b },
@@ -466,6 +482,67 @@ fn read_f32(cur: &mut Cursor<&[u8]>) -> Result<f32> {
     Ok(f32::from_le_bytes(buf))
 }
 
+fn validate_loaded_index(
+    k1: f32,
+    b: f32,
+    num_docs: u64,
+    avg_doc_len: f32,
+    doc_lengths: &HashMap<VectorId, u32>,
+    postings: &HashMap<String, Vec<(VectorId, u32)>>,
+) -> Result<()> {
+    if !k1.is_finite() || k1 <= 0.0 {
+        return Err(IndexError::Other(
+            "invalid BM25 index: k1 must be finite and > 0".into(),
+        ));
+    }
+    if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+        return Err(IndexError::Other(
+            "invalid BM25 index: b must be finite and within [0, 1]".into(),
+        ));
+    }
+    if !avg_doc_len.is_finite() || avg_doc_len < 0.0 {
+        return Err(IndexError::Other(
+            "invalid BM25 index: avg_doc_len must be finite and >= 0".into(),
+        ));
+    }
+
+    let derived_num_docs = doc_lengths.len() as u64;
+    if num_docs != derived_num_docs {
+        return Err(IndexError::Other(format!(
+            "invalid BM25 index: num_docs mismatch (header {num_docs}, derived {derived_num_docs})"
+        )));
+    }
+
+    let derived_avg_doc_len = if derived_num_docs == 0 {
+        0.0
+    } else {
+        doc_lengths.values().map(|&len| len as f32).sum::<f32>() / derived_num_docs as f32
+    };
+    if (avg_doc_len - derived_avg_doc_len).abs() > f32::EPSILON {
+        return Err(IndexError::Other(format!(
+            "invalid BM25 index: avg_doc_len mismatch (header {avg_doc_len}, derived {derived_avg_doc_len})"
+        )));
+    }
+
+    for (term, posting_list) in postings {
+        if term.is_empty() {
+            return Err(IndexError::Other(
+                "invalid BM25 index: term must not be empty".into(),
+            ));
+        }
+        for (doc_id, _) in posting_list {
+            if !doc_lengths.contains_key(doc_id) {
+                return Err(IndexError::Other(format!(
+                    "invalid BM25 index: posting references unknown doc id {}",
+                    doc_id.0
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -521,6 +598,21 @@ mod tests {
         assert_eq!(idx.num_docs(), 3);
         // Terms: the, quick, brown, fox, jumps, over, lazy, dog, slept, all, day, rabbit, runs, fast
         assert!(idx.num_terms() >= 10);
+    }
+
+    #[test]
+    fn build_coalesces_duplicate_vector_ids_into_one_document() {
+        let docs = vec![
+            (VectorId(1), "quick brown"),
+            (VectorId(1), "fox"),
+            (VectorId(2), "slow turtle"),
+        ];
+        let idx = Bm25Index::build(&docs, BM25Params::default());
+
+        assert_eq!(idx.num_docs(), 2);
+        let results = idx.search("quick fox", 2);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, VectorId(1));
     }
 
     // ── Bm25Index::search ─────────────────────────────────────────────────────
@@ -647,6 +739,21 @@ mod tests {
             .unwrap();
         bytes[8] = 99; // format version byte
         assert!(Bm25Index::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_posting_doc_ids() {
+        let mut bytes = Bm25Index::build(&make_docs(), BM25Params::default())
+            .to_bytes()
+            .unwrap();
+
+        let len = bytes.len();
+        bytes[len - 12..len - 4].copy_from_slice(&999u64.to_le_bytes());
+
+        let err = Bm25Index::from_bytes(&bytes)
+            .err()
+            .expect("corrupt payload should fail");
+        assert!(err.to_string().contains("unknown doc id 999"));
     }
 
     #[test]
