@@ -154,6 +154,31 @@ impl IndexSearcher {
         &self.manifest
     }
 
+    /// Return the cache hit rate for raw-shard loads since this searcher was created.
+    ///
+    /// Returns a value in `[0.0, 1.0]`, or `0.0` when no shard accesses have
+    /// been recorded yet.  The rate is computed from the raw-shard LRU cache;
+    /// PQ-shard accesses are tracked separately and are not included.
+    pub fn cache_hit_rate(&self) -> f64 {
+        let hits = self.cache.hits();
+        let misses = self.cache.misses();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    /// Return the cumulative raw-shard cache hit and miss counts.
+    ///
+    /// The returned tuple is `(hits, misses)` for the raw-shard LRU cache since
+    /// this searcher was created. PQ-shard accesses are tracked separately and
+    /// are not included.
+    pub fn cache_access_counts(&self) -> (u64, u64) {
+        (self.cache.hits(), self.cache.misses())
+    }
+
     /// Perform approximate top-k search using the provided [`FanOutPolicy`].
     ///
     /// The policy controls:

@@ -285,12 +285,23 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 | `--max-vectors-per-shard <N>` | u32 | `0` | Maximum number of vectors to score inside each probed shard (`0` = no limit) |
 | `--max-queries <N>` | usize | `0` | Maximum query vectors to use (0 = min(corpus size, 100)) |
 | `--output <FORMAT>` | enum | `text` | Output format: `text` or `json` |
+| `--workload <MODE>` | enum | `mixed` | Workload simulation mode: `cold`, `warm`, or `mixed` |
+
+### Workload Modes
+
+| Mode | Description |
+|------|-------------|
+| `cold` | A fresh shard cache is created before every query. Simulates a process that starts cold with no pre-loaded shards. Latencies reflect pure storage-access costs. |
+| `warm` | All shards accessed by the query set are pre-loaded (un-timed warm-up pass) before the measured run. Simulates a long-running process with a fully warmed cache. |
+| `mixed` | No explicit pre-warming or cache eviction. The cache transitions from cold to warm organically as the run progresses. Reflects realistic serving behaviour (default). |
 
 ### Metrics
 
 | Metric | Description |
 |--------|-------------|
+| Workload | Simulation mode used (`cold`, `warm`, or `mixed`) |
 | Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
+| Cache hit rate | Fraction of raw-shard loads served from in-memory cache during the measured pass; lower values indicate colder behaviour, while `cold` mode still resets the cache before each query |
 | Mean latency | Average per-query ANN search time in microseconds |
 | P99 latency | 99th-percentile per-query ANN search time in microseconds |
 | Throughput | Wall-clock query throughput in queries per second (qps) |
@@ -302,10 +313,12 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 
 ```
 === Benchmark Report ===
+  Workload:          mixed
   Queries:           100
   k:                 10
   nprobe:            2
   Recall@10:         0.9400
+  Cache hit rate:    0.8750
   Mean latency:      42.3 µs
   P99  latency:      210.0 µs
   Throughput:        23800.0 qps
@@ -316,6 +329,8 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 
 ```json
 {
+  "workload": "mixed",
+  "cache_hit_rate": 0.875,
   "num_queries": 100,
   "k": 10,
   "nprobe": 2,
@@ -330,8 +345,14 @@ shardlake [--storage <PATH>] benchmark [OPTIONS]
 ### Example
 
 ```bash
-# Full precision benchmark with a larger query sample
+# Default mixed workload benchmark
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500
+
+# Simulate cold-start latency (fresh cache per query)
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --workload cold
+
+# Simulate fully warm-cache latency (pre-warmed before measurement)
+shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --workload warm
 
 # Machine-readable JSON for CI regression tracking
 shardlake benchmark --k 10 --nprobe 4 --max-queries 500 --output json
