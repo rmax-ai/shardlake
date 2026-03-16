@@ -123,6 +123,11 @@ impl ShardCache {
         self.entries.is_empty()
     }
 
+    /// Iterate over the cached shard values.
+    pub fn values(&self) -> impl Iterator<Item = &Arc<ShardIndex>> {
+        self.entries.values()
+    }
+
     /// Return the maximum capacity of this cache (`0` = unlimited).
     pub fn capacity(&self) -> usize {
         self.capacity

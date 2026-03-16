@@ -3,7 +3,9 @@
 Shardlake is configured primarily through CLI flags. A `config/default.toml` file
 documents the default values for the fields that map to `SystemConfig`, but it is not
 loaded automatically—CLI flags always take precedence and are the authoritative way to
-set configuration today.
+set configuration today. Fields without dedicated CLI flags are still relevant for
+programmatic consumers that construct search components from `SystemConfig`
+directly (for example via `IndexSearcher::from_config`).
 
 ## `SystemConfig` fields
 

@@ -8,7 +8,7 @@ use std::{
 use tracing::{debug, info};
 
 use shardlake_core::{
-    config::FanOutPolicy,
+    config::{FanOutPolicy, PrefetchPolicy, SystemConfig},
     error::CoreError,
     types::{DistanceMetric, SearchResult, ShardId, VectorId},
 };
@@ -16,6 +16,7 @@ use shardlake_manifest::Manifest;
 use shardlake_storage::ObjectStore;
 
 use crate::{
+    cache::ShardCache,
     exact::{distance, exact_search, merge_top_k},
     kmeans::top_n_centroids,
     pq::PqCodebook,
@@ -27,11 +28,12 @@ use crate::{
 pub struct IndexSearcher {
     store: Arc<dyn ObjectStore>,
     manifest: Manifest,
-    cache: Mutex<HashMap<ShardId, Arc<ShardIndex>>>,
+    cache: Mutex<ShardCache>,
     pq_shard_cache: Mutex<HashMap<ShardId, Arc<PqShard>>>,
     /// PQ codebook; loaded once on first PQ search, then cached.
     codebook: Mutex<Option<Arc<PqCodebook>>>,
     metadata_cache: Mutex<Option<Arc<HashMap<String, serde_json::Value>>>>,
+    prefetch: Option<PrefetchPolicy>,
 }
 
 impl IndexSearcher {
@@ -45,11 +47,57 @@ impl IndexSearcher {
         Self {
             store,
             manifest,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(ShardCache::new(0)),
             pq_shard_cache: Mutex::new(HashMap::new()),
             codebook: Mutex::new(None),
             metadata_cache: Mutex::new(None),
+            prefetch: None,
         }
+    }
+
+    /// Create a new searcher configured from a [`SystemConfig`].
+    ///
+    /// The `cache_capacity` and `prefetch` fields are applied to the raw shard
+    /// cache used for exact per-shard search and reranking.
+    pub fn from_config(
+        store: Arc<dyn ObjectStore>,
+        manifest: Manifest,
+        config: &SystemConfig,
+    ) -> Result<Self> {
+        config.prefetch.validate()?;
+
+        let mut searcher =
+            Self::new(store, manifest).with_cache_capacity(config.cache_capacity as usize);
+        if config.prefetch.enabled {
+            searcher.prefetch = Some(config.prefetch.clone());
+        }
+        Ok(searcher)
+    }
+
+    /// Set the maximum number of raw shards to retain in memory.
+    ///
+    /// `capacity = 0` preserves the historical unbounded cache behaviour.
+    #[must_use]
+    pub fn with_cache_capacity(self, capacity: usize) -> Self {
+        Self {
+            store: self.store,
+            manifest: self.manifest,
+            cache: Mutex::new(ShardCache::new(capacity)),
+            pq_shard_cache: self.pq_shard_cache,
+            codebook: self.codebook,
+            metadata_cache: self.metadata_cache,
+            prefetch: self.prefetch,
+        }
+    }
+
+    /// Enable best-effort warming of hot raw shards after cache misses.
+    ///
+    /// Callers should validate the policy before passing it here, or prefer
+    /// [`IndexSearcher::from_config`] which performs that validation.
+    #[must_use]
+    pub fn with_prefetch(mut self, policy: PrefetchPolicy) -> Self {
+        self.prefetch = Some(policy);
+        self
     }
 
     /// Return the underlying manifest.
@@ -441,12 +489,13 @@ impl IndexSearcher {
     /// Load a raw shard from cache or store.
     fn load_shard(&self, shard_id: ShardId) -> Result<Arc<ShardIndex>> {
         {
-            let cache = self
+            let mut cache = self
                 .cache
                 .lock()
                 .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
-            if let Some(idx) = cache.get(&shard_id) {
-                return Ok(Arc::clone(idx));
+            cache.record_access(shard_id);
+            if let Some(idx) = cache.get(shard_id) {
+                return Ok(idx);
             }
         }
 
@@ -460,28 +509,130 @@ impl IndexSearcher {
         let bytes = self.store.get(&shard_def.artifact_key)?;
         let idx = Arc::new(ShardIndex::from_bytes(&bytes)?);
 
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
-        cache.insert(shard_id, Arc::clone(&idx));
+        let warm_threshold = self.prefetch.as_ref().and_then(|policy| {
+            if policy.enabled {
+                Some(u64::from(policy.min_query_count))
+            } else {
+                None
+            }
+        });
+
+        let to_warm: Vec<(ShardId, String)> = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| IndexError::Other("search cache lock poisoned".into()))?;
+            cache.insert(shard_id, Arc::clone(&idx));
+
+            match warm_threshold {
+                Some(threshold) => self
+                    .manifest
+                    .shards
+                    .iter()
+                    .filter(|shard| {
+                        !cache.contains(shard.shard_id)
+                            && cache.access_count(shard.shard_id) >= threshold
+                    })
+                    .map(|shard| (shard.shard_id, shard.artifact_key.clone()))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+
+        for (warm_id, artifact_key) in to_warm {
+            match self.store.get(&artifact_key) {
+                Ok(warm_bytes) => match ShardIndex::from_bytes(&warm_bytes) {
+                    Ok(warm_idx) => {
+                        if let Ok(mut cache) = self.cache.lock() {
+                            if !cache.contains(warm_id) {
+                                debug!(shard_id = ?warm_id, "prefetch: warming hot shard");
+                                cache.insert(warm_id, Arc::new(warm_idx));
+                            }
+                        } else {
+                            debug!(
+                                shard_id = ?warm_id,
+                                "prefetch: search cache lock poisoned while warming shard"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        debug!(
+                            shard_id = ?warm_id,
+                            error = %error,
+                            "prefetch: failed to parse shard"
+                        );
+                    }
+                },
+                Err(error) => {
+                    debug!(
+                        shard_id = ?warm_id,
+                        error = %error,
+                        "prefetch: failed to load shard from store"
+                    );
+                }
+            }
+        }
         Ok(idx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::builder::{BuildParams, IndexBuilder};
     use shardlake_core::{
-        config::{FanOutPolicy, SystemConfig},
+        config::{FanOutPolicy, PrefetchPolicy, SystemConfig},
         types::{DatasetVersion, EmbeddingVersion, IndexVersion, VectorId, VectorRecord},
     };
-    use shardlake_storage::LocalObjectStore;
+    use shardlake_storage::{LocalObjectStore, ObjectStore, StorageError};
+
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        shard_loads: Arc<AtomicUsize>,
+    }
+
+    impl CountingStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let shard_loads = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(Self {
+                inner,
+                shard_loads: Arc::clone(&shard_loads),
+            });
+            (store, shard_loads)
+        }
+    }
+
+    impl ObjectStore for CountingStore {
+        fn put(&self, key: &str, data: Vec<u8>) -> std::result::Result<(), StorageError> {
+            self.inner.put(key, data)
+        }
+
+        fn get(&self, key: &str) -> std::result::Result<Vec<u8>, StorageError> {
+            if key.ends_with(".sidx") {
+                self.shard_loads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key)
+        }
+
+        fn exists(&self, key: &str) -> std::result::Result<bool, StorageError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> std::result::Result<Vec<String>, StorageError> {
+            self.inner.list(prefix)
+        }
+
+        fn delete(&self, key: &str) -> std::result::Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+    }
 
     fn build_test_searcher(tmp: &tempfile::TempDir) -> IndexSearcher {
         let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
@@ -611,5 +762,121 @@ mod tests {
         let results = searcher.search(&[1.0, 0.0], 4, &policy).unwrap();
         // With 2 shards and 1 vector/shard, we can get at most 2 results.
         assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_prefetch_policy() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap()) as Arc<dyn ObjectStore>;
+        let manifest = build_test_searcher(&tmp).manifest().clone();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            prefetch: PrefetchPolicy {
+                enabled: true,
+                min_query_count: 0,
+            },
+            ..SystemConfig::default()
+        };
+
+        let err = match IndexSearcher::from_config(store, manifest, &config) {
+            Ok(_) => panic!("expected invalid prefetch policy to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "core error: invalid prefetch policy: min_query_count must be ≥ 1 when prefetch is enabled"
+        );
+    }
+
+    #[test]
+    fn prefetch_warms_hot_evicted_shards_on_runtime_search_path() {
+        let tmp = tempdir().unwrap();
+        let base_store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let manifest = {
+            let config = SystemConfig {
+                storage_root: tmp.path().to_path_buf(),
+                num_shards: 3,
+                kmeans_iters: 10,
+                nprobe: 2,
+                kmeans_seed: SystemConfig::default_kmeans_seed(),
+                ..SystemConfig::default()
+            };
+            let records = vec![
+                VectorRecord {
+                    id: VectorId(1),
+                    data: vec![0.0, 0.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(2),
+                    data: vec![0.1, 0.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(3),
+                    data: vec![10.0, 10.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(4),
+                    data: vec![10.1, 10.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(5),
+                    data: vec![-10.0, -10.0],
+                    metadata: None,
+                },
+                VectorRecord {
+                    id: VectorId(6),
+                    data: vec![-10.1, -10.0],
+                    metadata: None,
+                },
+            ];
+
+            IndexBuilder::new(base_store.as_ref(), &config)
+                .build(BuildParams {
+                    records,
+                    dataset_version: DatasetVersion("ds-prefetch-runtime".into()),
+                    embedding_version: EmbeddingVersion("emb-prefetch-runtime".into()),
+                    index_version: IndexVersion("idx-prefetch-runtime".into()),
+                    metric: DistanceMetric::Euclidean,
+                    dims: 2,
+                    vectors_key: "datasets/ds-prefetch-runtime/vectors.jsonl".into(),
+                    metadata_key: "datasets/ds-prefetch-runtime/metadata.json".into(),
+                    pq_params: None,
+                })
+                .unwrap()
+        };
+        let (counting_store, shard_loads) = CountingStore::new(base_store as Arc<dyn ObjectStore>);
+        let searcher = IndexSearcher::new(counting_store as Arc<dyn ObjectStore>, manifest.clone())
+            .with_cache_capacity(1)
+            .with_prefetch(PrefetchPolicy {
+                enabled: true,
+                min_query_count: 2,
+            });
+
+        let hot_shard = manifest.shards[0].shard_id;
+        let cold_shard = manifest.shards[1].shard_id;
+
+        searcher.load_shard(hot_shard).unwrap();
+        searcher.load_shard(hot_shard).unwrap();
+
+        shard_loads.store(0, Ordering::SeqCst);
+
+        searcher.load_shard(cold_shard).unwrap();
+        assert_eq!(
+            shard_loads.load(Ordering::SeqCst),
+            2,
+            "expected one direct load and one warm-up load"
+        );
+
+        let before = shard_loads.load(Ordering::SeqCst);
+        searcher.load_shard(hot_shard).unwrap();
+        assert_eq!(
+            shard_loads.load(Ordering::SeqCst),
+            before,
+            "hot shard should be cache-resident after warming"
+        );
     }
 }
