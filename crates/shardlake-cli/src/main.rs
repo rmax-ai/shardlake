@@ -37,6 +37,8 @@ enum Commands {
     Benchmark(commands::benchmark::BenchmarkArgs),
     /// Evaluate ANN quality: recall@k, precision@k, and latency.
     EvalAnn(commands::eval_ann::EvalAnnArgs),
+    /// Compare multiple ANN families: IVF-PQ, HNSW, DiskANN, and others.
+    CompareAnn(commands::compare_ann::CompareAnnArgs),
     /// Evaluate hybrid retrieval quality: compare vector-only, BM25-only, and hybrid modes.
     EvalHybrid(commands::eval_hybrid::EvalHybridArgs),
     /// Validate dataset and/or index manifests against stored artifacts.
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => commands::serve::run(cli.storage, args).await,
         Commands::Benchmark(args) => commands::benchmark::run(cli.storage, args).await,
         Commands::EvalAnn(args) => commands::eval_ann::run(cli.storage, args).await,
+        Commands::CompareAnn(args) => commands::compare_ann::run(cli.storage, args).await,
         Commands::EvalHybrid(args) => commands::eval_hybrid::run(cli.storage, args).await,
         Commands::ValidateManifest(args) => {
             commands::validate_manifest::run(cli.storage, args).await

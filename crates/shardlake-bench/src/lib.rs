@@ -266,6 +266,47 @@ pub struct EvalAnnReport {
     pub p99_latency_us: f64,
 }
 
+/// One row in an ANN family comparison report.
+///
+/// Captures the alias and ANN family name together with the evaluation metrics
+/// for that family, allowing callers to compare results across families in a
+/// single [`CompareAnnReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnFamilyReport {
+    /// Alias used to load the index (e.g. `"latest"`, `"hnsw-exp"`).
+    pub alias: String,
+    /// Canonical ANN algorithm family name derived from manifest metadata
+    /// (e.g. `"ivf_flat"`, `"ivf_pq"`, `"hnsw"`, `"diskann"`).
+    pub ann_family: String,
+    /// Evaluation metrics for this family.
+    #[serde(flatten)]
+    pub eval: EvalAnnReport,
+}
+
+/// Comparison report across multiple ANN families.
+///
+/// Produced by running [`run_eval_ann`] once per alias and collecting the
+/// results into a single document.  Each entry corresponds to one index alias
+/// and includes the ANN family name derived from the manifest metadata, making it
+/// straightforward to compare quality and latency across families.
+///
+/// # Example (JSON)
+///
+/// ```json
+/// {
+///   "entries": [
+///     { "alias": "ivf-idx",  "ann_family": "ivf_flat", "num_queries": 100, ... },
+///     { "alias": "hnsw-idx", "ann_family": "hnsw",     "num_queries": 100, ... }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareAnnReport {
+    /// One entry per evaluated alias / ANN family, in the order they were
+    /// supplied to the CLI.
+    pub entries: Vec<AnnFamilyReport>,
+}
+
 /// Workload simulation mode for benchmark runs.
 ///
 /// Controls whether the shard cache is pre-warmed, cleared, or left to warm
@@ -603,6 +644,9 @@ pub fn run_benchmark(
 /// instead focuses on per-query quality and latency, returning an
 /// [`EvalAnnReport`] that is suitable for regression tracking.
 ///
+/// This convenience wrapper computes the exact top-k ground truth from `corpus`
+/// for each query, then delegates to [`run_eval_ann_with_ground_truth`].
+///
 /// # Arguments
 ///
 /// * `searcher` – A loaded [`IndexSearcher`] ready to serve queries.
@@ -619,10 +663,54 @@ pub fn run_eval_ann(
     policy: &FanOutPolicy,
     metric: DistanceMetric,
 ) -> IndexResult<EvalAnnReport> {
+    let ground_truth_ids = precompute_ground_truth_ids(queries, corpus, metric, k);
+    run_eval_ann_with_ground_truth(searcher, queries, &ground_truth_ids, k, policy)
+}
+
+/// Precompute the exact top-k neighbour ids for each query.
+///
+/// This is useful when several evaluation passes reuse the same queries and
+/// corpus, such as comparing multiple ANN aliases against a shared ground truth.
+pub fn precompute_ground_truth_ids(
+    queries: &[VectorRecord],
+    corpus: &[VectorRecord],
+    metric: DistanceMetric,
+    k: usize,
+) -> Vec<Vec<VectorId>> {
+    queries
+        .iter()
+        .map(|query| {
+            exact_search(&query.data, corpus, metric, k)
+                .into_iter()
+                .map(|result| result.id)
+                .collect()
+        })
+        .collect()
+}
+
+/// Evaluate ANN quality using precomputed exact top-k ids for each query.
+///
+/// Callers that compare several indexes over the same query set can precompute
+/// ground truth once with [`precompute_ground_truth_ids`] and reuse it across
+/// repeated ANN runs.
+pub fn run_eval_ann_with_ground_truth(
+    searcher: &IndexSearcher,
+    queries: &[VectorRecord],
+    ground_truth_ids: &[Vec<VectorId>],
+    k: usize,
+    policy: &FanOutPolicy,
+) -> IndexResult<EvalAnnReport> {
     if queries.is_empty() {
         return Err(shardlake_index::IndexError::Other(
             "eval-ann requires at least one query vector".to_string(),
         ));
+    }
+    if ground_truth_ids.len() != queries.len() {
+        return Err(shardlake_index::IndexError::Other(format!(
+            "eval-ann requires one ground-truth entry per query (got {} queries and {} ground-truth entries)",
+            queries.len(),
+            ground_truth_ids.len()
+        )));
     }
 
     let nprobe = policy.candidate_centroids as usize;
@@ -631,17 +719,14 @@ pub fn run_eval_ann(
     let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
     let mut precisions: Vec<f64> = Vec::with_capacity(queries.len());
 
-    for query in queries {
-        let gt = exact_search(&query.data, corpus, metric, k);
-        let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
-
+    for (query, gt_ids) in queries.iter().zip(ground_truth_ids.iter()) {
         let t0 = Instant::now();
         let approx = searcher.search(&query.data, k, policy)?;
         let elapsed_us = t0.elapsed().as_micros() as f64;
 
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
-        recalls.push(recall_at_k(&gt_ids, &approx_ids));
-        precisions.push(precision_at_k(&gt_ids, &approx_ids));
+        recalls.push(recall_at_k(gt_ids, &approx_ids));
+        precisions.push(precision_at_k(gt_ids, &approx_ids));
         latencies_us.push(elapsed_us);
     }
 
@@ -2040,6 +2125,134 @@ mod tests {
                 "WorkloadReport.workload must equal the requested mode"
             );
         }
+    }
+
+    // ── CompareAnnReport / AnnFamilyReport ────────────────────────────────────
+
+    #[test]
+    fn ann_family_report_flattens_eval_fields_in_json() {
+        let eval = EvalAnnReport {
+            num_queries: 10,
+            k: 5,
+            nprobe: 2,
+            recall_at_k: 0.9,
+            precision_at_k: 0.85,
+            mean_latency_us: 50.0,
+            p99_latency_us: 200.0,
+        };
+        let entry = AnnFamilyReport {
+            alias: "hnsw-idx".into(),
+            ann_family: "hnsw".into(),
+            eval,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        // Flattened: eval fields appear at the top level.
+        assert_eq!(json["alias"], "hnsw-idx");
+        assert_eq!(json["ann_family"], "hnsw");
+        assert_eq!(json["num_queries"], 10);
+        assert_eq!(json["recall_at_k"], 0.9);
+        assert_eq!(json["precision_at_k"], 0.85);
+    }
+
+    #[test]
+    fn compare_ann_report_serialises_all_entries() {
+        let make_entry = |alias: &str, family: &str, recall: f64| AnnFamilyReport {
+            alias: alias.into(),
+            ann_family: family.into(),
+            eval: EvalAnnReport {
+                num_queries: 5,
+                k: 3,
+                nprobe: 1,
+                recall_at_k: recall,
+                precision_at_k: recall,
+                mean_latency_us: 10.0,
+                p99_latency_us: 30.0,
+            },
+        };
+
+        let report = CompareAnnReport {
+            entries: vec![
+                make_entry("ivf-idx", "ivf_flat", 0.8),
+                make_entry("hnsw-idx", "hnsw", 0.95),
+                make_entry("da-idx", "diskann", 0.88),
+            ],
+        };
+
+        let json = serde_json::to_value(&report).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["ann_family"], "ivf_flat");
+        assert_eq!(entries[1]["ann_family"], "hnsw");
+        assert_eq!(entries[2]["ann_family"], "diskann");
+        assert_eq!(entries[1]["recall_at_k"], 0.95);
+    }
+
+    #[test]
+    fn compare_ann_report_empty_entries_round_trips() {
+        let report = CompareAnnReport { entries: vec![] };
+        let json = serde_json::to_string(&report).unwrap();
+        let decoded: CompareAnnReport = serde_json::from_str(&json).unwrap();
+        assert!(decoded.entries.is_empty());
+    }
+
+    #[test]
+    fn run_eval_ann_with_ground_truth_matches_direct_eval() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let direct = run_eval_ann(
+            &searcher,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap();
+        let ground_truth =
+            precompute_ground_truth_ids(&queries, &records, DistanceMetric::Euclidean, 3);
+        let reused =
+            run_eval_ann_with_ground_truth(&searcher, &queries, &ground_truth, 3, &policy).unwrap();
+
+        assert_eq!(direct.num_queries, reused.num_queries);
+        assert_eq!(direct.k, reused.k);
+        assert_eq!(direct.nprobe, reused.nprobe);
+        assert_eq!(direct.recall_at_k, reused.recall_at_k);
+        assert_eq!(direct.precision_at_k, reused.precision_at_k);
+    }
+
+    #[test]
+    fn run_eval_ann_with_ground_truth_rejects_mismatched_lengths() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(8, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let queries: Vec<VectorRecord> = records[..2].to_vec();
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let err =
+            run_eval_ann_with_ground_truth(&searcher, &queries, &[vec![VectorId(1)]], 2, &policy)
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires one ground-truth entry per query"));
     }
 
     // ── run_eval_hybrid tests ─────────────────────────────────────────────────
