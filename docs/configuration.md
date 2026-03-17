@@ -26,6 +26,8 @@ individual command flags.
 | `shard_cache_capacity` | usize | `128` | Maximum number of shard indexes kept in the in-memory LRU cache at query time. When more than `shard_cache_capacity` distinct shards have been loaded, the least-recently-used shard is evicted to bound memory usage. Set this to at least as large as `nprobe` (or `candidate_shards` when non-zero) so that all shards probed in a single query can stay hot in cache simultaneously. This value must be greater than or equal to `1`. Equivalent to `--shard-cache-capacity` on `serve`. |
 | `prefetch.enabled` | bool | `false` | Enable optional shard warming for programmatic consumers that construct an `IndexSearcher` or `CachedShardLoader` with prefetch support. Lazy loading remains unchanged when disabled. |
 | `prefetch.min_query_count` | u32 | `3` | Minimum number of probe events a shard must accumulate before it becomes eligible for warming. Must be ≥ 1 when `prefetch.enabled` is `true`. |
+| `recall_sample_size` | u32 or absent | absent (`None`) | Number of sample queries used for build-time recall@k estimation. When absent (default), `manifest.recall_estimate` is left `None`. When set to a positive `n`, a reproducible random sample of up to `n` vectors is drawn from the build corpus (using `kmeans_seed`) after the index is written, queried against the freshly-built index, and compared against brute-force ground truth over the full corpus. The resulting mean recall@`recall_k` is persisted in `manifest.recall_estimate`. Enabling this option loads all shard artifacts back into memory after the build, so peak memory during estimation is proportional to the corpus size. |
+| `recall_k` | u32 | `10` | The *k* used for build-time recall@k estimation. Ignored when `recall_sample_size` is absent. When the corpus contains fewer than `recall_k` vectors, `k` is automatically clamped to the corpus size. |
 
 ### `config/default.toml` (reference)
 
@@ -44,6 +46,11 @@ shard_cache_capacity = 128
 # kmeans_sample_size is absent by default (all vectors used for training).
 # Set to a positive integer to limit centroid training to a sample:
 # kmeans_sample_size = 50000
+
+# Build-time recall estimation is disabled by default.
+# Set recall_sample_size to a positive integer to enable it.
+# recall_sample_size = 200
+recall_k = 10
 
 [prefetch]
 enabled = false

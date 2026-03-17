@@ -17,17 +17,18 @@ use shardlake_core::{
     config::SystemConfig,
     error::CoreError,
     types::{
-        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, ShardId,
-        VectorRecord,
+        AnnFamily, DatasetVersion, DistanceMetric, EmbeddingVersion, IndexVersion, SearchResult,
+        ShardId, VectorId, VectorRecord,
     },
 };
 use shardlake_manifest::{
-    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, RoutingMetadata, ShardDef,
-    ShardSummary,
+    AlgorithmMetadata, BuildMetadata, CompressionConfig, Manifest, RecallEstimate, RoutingMetadata,
+    ShardDef, ShardSummary,
 };
 use shardlake_storage::ObjectStore;
 
 use crate::{
+    exact::{exact_search, merge_top_k, recall_at_k},
     ivf::IvfQuantizer,
     plugin::{AnnRegistry, HnswConfig},
     pq::{PqCodebook, PqParams},
@@ -197,6 +198,22 @@ impl<'a> IndexBuilder<'a> {
         }
 
         let quantizer = IvfQuantizer::train(training_vecs, k, iters, &mut rng);
+
+        // Optionally sample query vectors for build-time recall estimation.
+        // This must happen before `records` is consumed into `shard_records`.
+        let recall_queries: Vec<VectorRecord> = if let Some(sz) = self.config.recall_sample_size {
+            if sz == 0 {
+                return Err(IndexError::Other(
+                    "recall_sample_size must be greater than 0".into(),
+                ));
+            }
+            let sample_size = (sz as usize).min(records.len());
+            let mut indices: Vec<usize> = (0..records.len()).collect();
+            let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
+            shuffled.iter().map(|&i| records[i].clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         info!("Assigning vectors to IVF posting-list shards");
         let mut shard_records: Vec<Vec<VectorRecord>> = vec![Vec::new(); quantizer.num_clusters()];
@@ -394,6 +411,38 @@ impl<'a> IndexBuilder<'a> {
             CompressionConfig::default()
         };
 
+        // Compute build-time recall estimate when the caller requested it.
+        let recall_estimate = if recall_queries.is_empty() {
+            None
+        } else {
+            let recall_k = (self.config.recall_k as usize).max(1);
+            let nprobe = (self.config.nprobe as usize).max(1);
+            match estimate_recall(
+                &recall_queries,
+                &quantizer,
+                &shard_defs,
+                self.store,
+                metric,
+                recall_k,
+                nprobe,
+                codebook.as_ref(),
+            ) {
+                Ok(est) => {
+                    info!(
+                        recall_at_k = est.recall_at_k,
+                        k = est.k,
+                        sample_size = est.sample_size,
+                        "Build-time recall estimate computed"
+                    );
+                    Some(est)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Build-time recall estimation failed; continuing without estimate");
+                    None
+                }
+            }
+        };
+
         let manifest = Manifest {
             manifest_version: 4,
             dataset_version,
@@ -420,7 +469,7 @@ impl<'a> IndexBuilder<'a> {
             },
             shard_summary,
             compression,
-            recall_estimate: None,
+            recall_estimate,
             coarse_quantizer_key: Some(cq_key),
             lexical: None,
         };
@@ -429,6 +478,93 @@ impl<'a> IndexBuilder<'a> {
         info!(index_version = %manifest.index_version, "Manifest written");
         Ok(manifest)
     }
+}
+
+/// Estimate recall@k for a freshly-built index by comparing approximate
+/// nearest-neighbour results against a brute-force ground truth.
+///
+/// All shard artifacts are loaded back from `store` once to reconstruct the
+/// full corpus for ground-truth computation.  The same in-memory shards are
+/// then reused during the per-query approximate search so each shard artifact
+/// is read from storage exactly once.
+///
+/// Returns a [`RecallEstimate`] populated with the mean recall@k over all
+/// `queries`, or an error if any artifact cannot be loaded or deserialized.
+#[allow(clippy::too_many_arguments)]
+fn estimate_recall(
+    queries: &[VectorRecord],
+    quantizer: &IvfQuantizer,
+    shard_defs: &[ShardDef],
+    store: &dyn ObjectStore,
+    metric: DistanceMetric,
+    k: usize,
+    nprobe: usize,
+    codebook: Option<&PqCodebook>,
+) -> Result<RecallEstimate> {
+    // Load all shard artifacts once, reconstructing each shard as a flat list
+    // of VectorRecords.  For PQ shards the codes are decoded back to
+    // approximate float vectors using the codebook.
+    let mut all_shard_records: Vec<Vec<VectorRecord>> = Vec::with_capacity(shard_defs.len());
+    let mut corpus: Vec<VectorRecord> = Vec::new();
+
+    for def in shard_defs {
+        let bytes = store.get(&def.artifact_key)?;
+        let shard_vecs: Vec<VectorRecord> = if let Some(cb) = codebook {
+            let pq = PqShard::from_bytes(&bytes)?;
+            pq.entries
+                .iter()
+                .map(|(id, codes)| {
+                    cb.reconstruct(codes).map(|data| VectorRecord {
+                        id: *id,
+                        data,
+                        metadata: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            ShardIndex::from_bytes(&bytes)?.records
+        };
+        corpus.extend(shard_vecs.iter().cloned());
+        all_shard_records.push(shard_vecs);
+    }
+
+    let effective_k = k.min(corpus.len());
+    if effective_k == 0 {
+        return Err(IndexError::Other(
+            "corpus is empty; cannot estimate recall".into(),
+        ));
+    }
+
+    let nprobe = nprobe.min(all_shard_records.len());
+
+    let mut total_recall = 0.0f64;
+    for query in queries {
+        // Exact brute-force ground truth over the full corpus.
+        let gt = exact_search(&query.data, &corpus, metric, effective_k);
+        let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
+
+        // Approximate search: probe the nprobe nearest shards.
+        let probe_indices = quantizer.top_probes(&query.data, nprobe);
+        let mut candidates: Vec<SearchResult> = Vec::new();
+        for probe_idx in probe_indices {
+            if let Some(shard_vecs) = all_shard_records.get(probe_idx) {
+                let results = exact_search(&query.data, shard_vecs, metric, effective_k);
+                candidates.extend(results);
+            }
+        }
+        let approx = merge_top_k(candidates, effective_k);
+        let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
+
+        total_recall += recall_at_k(&gt_ids, &approx_ids);
+    }
+
+    let mean_recall = total_recall / queries.len() as f64;
+
+    Ok(RecallEstimate {
+        k: effective_k as u32,
+        recall_at_k: mean_recall as f32,
+        sample_size: queries.len() as u64,
+    })
 }
 
 #[cfg(test)]
@@ -731,5 +867,225 @@ mod tests {
                 s1.shard_id
             );
         }
+    }
+
+    /// When `recall_sample_size` is set, the builder must populate
+    /// `manifest.recall_estimate` with valid values.
+    #[test]
+    fn build_with_recall_sample_size_populates_recall_estimate() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let n = 30usize;
+        let dims = 4usize;
+        let records: Vec<VectorRecord> = (0..n)
+            .map(|i| VectorRecord {
+                id: VectorId(i as u64),
+                data: (0..dims).map(|d| (i * dims + d) as f32).collect(),
+                metadata: None,
+            })
+            .collect();
+
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            recall_sample_size: Some(5),
+            recall_k: 3,
+            ..SystemConfig::default()
+        };
+
+        let manifest = IndexBuilder::new(&store, &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-recall".into()),
+                embedding_version: EmbeddingVersion("emb-recall".into()),
+                index_version: IndexVersion("idx-recall".into()),
+                metric: DistanceMetric::Euclidean,
+                dims,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-recall"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-recall"),
+                pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
+            })
+            .unwrap();
+
+        let est = manifest
+            .recall_estimate
+            .as_ref()
+            .expect("recall_estimate must be populated when recall_sample_size is set");
+        assert_eq!(est.k, 3, "recall_estimate.k must match recall_k config");
+        assert!(
+            est.sample_size > 0,
+            "recall_estimate.sample_size must be > 0"
+        );
+        assert!(
+            (0.0..=1.0).contains(&est.recall_at_k),
+            "recall_estimate.recall_at_k must be in [0, 1], got {}",
+            est.recall_at_k
+        );
+        // The manifest must still pass validation.
+        manifest
+            .validate()
+            .expect("manifest with recall_estimate must pass validation");
+    }
+
+    /// When `recall_sample_size` is `None`, `manifest.recall_estimate` must be `None`.
+    #[test]
+    fn build_without_recall_sample_size_omits_recall_estimate() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 1,
+            recall_sample_size: None,
+            ..SystemConfig::default()
+        };
+
+        let manifest = IndexBuilder::new(&store, &config)
+            .build(build_params(
+                (0..10)
+                    .map(|i| VectorRecord {
+                        id: VectorId(i as u64),
+                        data: vec![i as f32, (i + 1) as f32],
+                        metadata: None,
+                    })
+                    .collect(),
+                2,
+            ))
+            .unwrap();
+
+        assert!(
+            manifest.recall_estimate.is_none(),
+            "recall_estimate must be None when recall_sample_size is not set"
+        );
+    }
+
+    /// Two builds with the same `recall_sample_size` and seed must produce
+    /// identical recall estimates.
+    #[test]
+    fn recall_estimate_is_deterministic() {
+        let n = 30usize;
+        let dims = 4usize;
+        let records: Vec<VectorRecord> = (0..n)
+            .map(|i| VectorRecord {
+                id: VectorId(i as u64),
+                data: (0..dims).map(|d| (i * dims + d) as f32).collect(),
+                metadata: None,
+            })
+            .collect();
+
+        let build_once = |idx_ver: &str| {
+            let tmp = tempdir().unwrap();
+            let store = LocalObjectStore::new(tmp.path()).unwrap();
+            let config = SystemConfig {
+                storage_root: tmp.path().to_path_buf(),
+                num_shards: 2,
+                kmeans_iters: 5,
+                nprobe: 2,
+                kmeans_seed: SystemConfig::default_kmeans_seed(),
+                recall_sample_size: Some(5),
+                recall_k: 3,
+                ..SystemConfig::default()
+            };
+            IndexBuilder::new(&store, &config)
+                .build(BuildParams {
+                    records: records.clone(),
+                    dataset_version: DatasetVersion("ds-recall-det".into()),
+                    embedding_version: EmbeddingVersion("emb-recall-det".into()),
+                    index_version: IndexVersion(idx_ver.into()),
+                    metric: DistanceMetric::Euclidean,
+                    dims,
+                    vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-recall-det"),
+                    metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-recall-det"),
+                    pq_params: None,
+                    ann_family: None,
+                    hnsw_config: None,
+                })
+                .unwrap()
+        };
+
+        let m1 = build_once("idx-recall-det-1");
+        let m2 = build_once("idx-recall-det-2");
+
+        let e1 = m1.recall_estimate.unwrap();
+        let e2 = m2.recall_estimate.unwrap();
+
+        assert_eq!(
+            e1.k, e2.k,
+            "k must be identical across deterministic builds"
+        );
+        assert_eq!(
+            e1.sample_size, e2.sample_size,
+            "sample_size must be identical across deterministic builds"
+        );
+        assert!(
+            (e1.recall_at_k - e2.recall_at_k).abs() < 1e-6,
+            "recall_at_k must be identical across deterministic builds: {} vs {}",
+            e1.recall_at_k,
+            e2.recall_at_k
+        );
+    }
+
+    /// Build with PQ compression enabled and recall_sample_size set; the
+    /// recall estimate must still be populated and valid.
+    #[test]
+    fn recall_estimate_works_with_pq_compression() {
+        let tmp = tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path()).unwrap();
+        let n = 20usize;
+        let dims = 4usize;
+        let records: Vec<VectorRecord> = (0..n)
+            .map(|i| VectorRecord {
+                id: VectorId(i as u64),
+                data: (0..dims).map(|d| (i * dims + d) as f32).collect(),
+                metadata: None,
+            })
+            .collect();
+
+        let config = SystemConfig {
+            storage_root: tmp.path().to_path_buf(),
+            num_shards: 2,
+            kmeans_iters: 5,
+            nprobe: 2,
+            kmeans_seed: SystemConfig::default_kmeans_seed(),
+            pq_enabled: true,
+            pq_num_subspaces: 2,
+            pq_codebook_size: 4,
+            recall_sample_size: Some(5),
+            recall_k: 3,
+            ..SystemConfig::default()
+        };
+
+        let manifest = IndexBuilder::new(&store, &config)
+            .build(BuildParams {
+                records,
+                dataset_version: DatasetVersion("ds-recall-pq".into()),
+                embedding_version: EmbeddingVersion("emb-recall-pq".into()),
+                index_version: IndexVersion("idx-recall-pq".into()),
+                metric: DistanceMetric::Euclidean,
+                dims,
+                vectors_key: shardlake_storage::paths::dataset_vectors_key("ds-recall-pq"),
+                metadata_key: shardlake_storage::paths::dataset_metadata_key("ds-recall-pq"),
+                pq_params: None,
+                ann_family: None,
+                hnsw_config: None,
+            })
+            .unwrap();
+
+        let est = manifest
+            .recall_estimate
+            .as_ref()
+            .expect("recall_estimate must be populated for PQ build with recall_sample_size set");
+        assert_eq!(est.k, 3);
+        assert!(est.sample_size > 0);
+        assert!((0.0..=1.0).contains(&est.recall_at_k));
+        manifest
+            .validate()
+            .expect("PQ manifest with recall_estimate must pass validation");
     }
 }
