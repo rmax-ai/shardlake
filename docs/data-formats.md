@@ -293,8 +293,8 @@ before use.
 - Only parameters that are *structurally significant* (i.e. that change the
   index layout or query behaviour) should be listed in `required_params`.
   Examples: `num_shards`, `num_clusters`, `hnsw_m`.
-- Informational parameters (`kmeans_iters`, `build_duration_secs`, etc.) need
-  not be listed; their presence in the manifest will not cause a failure.
+- Parameters that a given caller treats as informational need not be listed;
+  their presence in the manifest will not cause a failure.
 - Unknown parameters introduced by newer builders are ignored, preserving
   forward-compatibility across minor version upgrades.
 
