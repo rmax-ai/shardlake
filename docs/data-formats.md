@@ -196,7 +196,7 @@ For a PQ-compressed index the `compression` block looks like:
 |--------------------|-------------|
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
 | `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
-| `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v4 documents. |
+| `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. A v3+ reader fills in `serde` defaults for these fields when loading v1/v2 documents that omit them (backward-compatible read). Manifests re-saved by the current library are rewritten as v4 documents. |
 | `4` | Current schema. Adds an optional `routing` object to `ShardDef` with `centroid_id`, `index_type`, and `file_location` for partition-aware query routing. Fresh v4 builds populate it for every non-empty shard. Manifests loaded from older versions may still omit `routing` after being re-saved, in which case the field defaults to `None`. |
 
 ### Fields
@@ -282,6 +282,50 @@ The upgrade is applied automatically and transparently:
 > `Manifest` with a legacy version field will serialise using whatever the
 > in-memory struct contains.  Always call `Manifest::save` (or load the
 > manifest and re-save it) to obtain a correctly versioned on-disk document.
+
+### Compatibility directions
+
+Manifest compatibility operates in two independent directions, each relying on
+a different mechanism.
+
+#### Backward-compatible reads (new reader, old manifest)
+
+When a **current** `Manifest` reader (e.g. a v4-aware binary) loads an older
+manifest document (v1, v2, or v3), the fields that were added in later schema
+versions are absent from the JSON.  `serde` fills those missing fields with the
+`#[serde(default)]`-supplied values declared on each struct field:
+
+| Field absent in old manifest | Default value applied by the current reader |
+|------------------------------|---------------------------------------------|
+| `algorithm` | `AlgorithmConfig { algorithm: "kmeans-flat", variant: None, params: {} }` |
+| `compression` | `CompressionConfig { enabled: false, codec: "none", … }` |
+| `build_metadata.build_duration_secs` | `0.0` |
+| `shard_summary` | `None` |
+| `recall_estimate` | `None` |
+| `ShardDef.routing` | `None` |
+
+This lets a current reader safely load any manifest version without bespoke
+migration code.
+
+#### Forward-compatible reads (old reader, new manifest)
+
+When an **older** reader (e.g. a v1-era binary) loads a newer manifest
+document (v2, v3, or v4), the JSON contains fields the reader's structs do not
+declare.  By default, `serde_json` **silently discards** JSON keys that have no
+corresponding struct field.  This is an entirely separate mechanism from
+`#[serde(default)]`: the older reader does not need `#[serde(default)]` to
+ignore a field it has never heard of — unknown keys are dropped automatically
+during deserialization.
+
+For example, a v1 reader loading a v4 manifest will successfully deserialize
+the fields it knows (`manifest_version`, `shards`, `build_metadata`, …) and
+silently drop the unfamiliar ones (`algorithm`, `compression`, `routing`, …).
+
+> **Important:** forward-compatible reads are only safe when the new fields are
+> genuinely additive and the older reader's logic still produces correct results
+> while ignoring them.  Adding a field that changes the semantics of existing
+> fields without bumping the schema version is a breaking change regardless of
+> whether old readers can deserialize the document without error.
 
 ### Compatibility checks
 
