@@ -171,8 +171,9 @@ and index version and describes every shard artifact.
 }
 ```
 
-> `recall_estimate` is omitted from the example above because it is absent in prototype
-> builds (the field is skipped when `None`).  When present it looks like:
+> `recall_estimate` is omitted from the example above because the default
+> configuration leaves it absent (`recall_sample_size` is unset, so the field is
+> skipped when `None`). When present it looks like:
 >
 > ```json
 > "recall_estimate": { "k": 10, "recall_at_k": 0.97, "sample_size": 500 }
@@ -254,6 +255,43 @@ For a PQ-compressed index the `compression` block looks like:
 | `routing.centroid_id` | string | Stable identifier for this shard's centroid (e.g. `"shard-0000"`). Used as a routing key to identify the shard in routing tables and logs. |
 | `routing.index_type` | string | ANN index algorithm within this shard (e.g. `"flat"` for linear scan). Consumed by the serving path to select the correct search method when loading this shard. |
 | `routing.file_location` | string | Canonical storage key to load this shard when routing a query. Equals `artifact_key` for local storage backends; may differ in multi-storage deployments that resolve a URL or filesystem path separately. |
+
+### Build-time recall estimation
+
+`recall_estimate` is populated by `IndexBuilder` when the `recall_sample_size`
+configuration field is set to a positive integer. The query sample is drawn
+before vectors are consumed into shards, and the estimation pass runs after all
+shard artifacts have been written to storage:
+
+1. A reproducible random sample of up to `recall_sample_size` vectors is drawn
+   from the build corpus using the same seeded RNG as K-means training
+   (`kmeans_seed`).  These vectors become the **query set**.
+2. All shard artifacts are loaded back from storage and their vectors are
+   reassembled into a flat in-memory **ground-truth corpus**.  For
+   PQ-compressed shards, each code is decoded back to an approximate float
+   vector using the PQ codebook.
+3. For each sample query:
+   - The brute-force top-`recall_k` result list is computed over the full
+     ground-truth corpus (exact nearest-neighbour search).
+   - The approximate top-`recall_k` result list is computed by routing the
+     query through the IVF coarse quantizer (using the configured `nprobe`
+     value) and performing flat search within each probed shard's in-memory
+     record list.
+4. Recall@`recall_k` is computed per query as the fraction of ground-truth IDs
+   that appear in the approximate result list, then averaged over the sample.
+5. The mean recall@k value is written to `manifest.recall_estimate`.
+
+The estimate is reproducible: two builds with identical inputs, the same
+`kmeans_seed`, and the same `recall_sample_size` / `recall_k` will always
+produce the same `recall_estimate` values.
+
+When `recall_sample_size` is absent (the default) no estimation is performed and
+`recall_estimate` is `null` / absent in the manifest.
+
+> **Memory note:** Loading all shard artifacts for ground-truth reconstruction
+> temporarily increases peak memory usage during the build proportionally to the
+> corpus size.  Disable recall estimation for very large builds where this cost
+> is unacceptable.
 
 ### Legacy manifest migration
 

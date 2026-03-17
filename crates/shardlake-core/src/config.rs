@@ -295,6 +295,30 @@ pub struct SystemConfig {
     /// unless callers explicitly opt in.
     #[serde(default)]
     pub prefetch: PrefetchPolicy,
+    /// Number of sample queries used for build-time recall@k estimation.
+    ///
+    /// When `None` (default), recall estimation is skipped and
+    /// `manifest.recall_estimate` is left `None`.  When `Some(n)`, a
+    /// reproducible random sample of up to `n` vectors is drawn from the build
+    /// corpus (using `kmeans_seed`), queried against the freshly-built index,
+    /// and compared against a brute-force ground truth over the full corpus.
+    /// The resulting mean recall@`recall_k` is persisted in the manifest.
+    ///
+    /// Enabling this option loads all shard artifacts back into memory after the
+    /// build completes, so the peak memory usage during the estimation step is
+    /// proportional to the corpus size.  Disable for very large builds where
+    /// this cost is unacceptable.
+    #[serde(default)]
+    pub recall_sample_size: Option<u32>,
+    /// The *k* used for build-time recall@k estimation.
+    ///
+    /// Defaults to `10` (recall@10).  Ignored when [`recall_sample_size`] is
+    /// `None`.  When the corpus contains fewer than `recall_k` vectors, `k` is
+    /// automatically clamped to the corpus size.
+    ///
+    /// [`recall_sample_size`]: SystemConfig::recall_sample_size
+    #[serde(default = "SystemConfig::default_recall_k")]
+    pub recall_k: u32,
 }
 
 impl SystemConfig {
@@ -332,6 +356,11 @@ impl SystemConfig {
     pub fn default_shard_cache_capacity() -> usize {
         128
     }
+
+    /// Returns the default k for build-time recall estimation (10).
+    pub fn default_recall_k() -> u32 {
+        10
+    }
 }
 
 impl Default for SystemConfig {
@@ -350,6 +379,8 @@ impl Default for SystemConfig {
             pq_codebook_size: Self::default_pq_codebook_size(),
             shard_cache_capacity: Self::default_shard_cache_capacity(),
             prefetch: PrefetchPolicy::default(),
+            recall_sample_size: None,
+            recall_k: Self::default_recall_k(),
         }
     }
 }
