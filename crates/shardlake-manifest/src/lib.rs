@@ -573,28 +573,7 @@ impl Manifest {
             }
         }
 
-        for shard in &self.shards {
-            if let Some(routing) = &shard.routing {
-                if routing.centroid_id.trim().is_empty() {
-                    return Err(ManifestError::Validation(format!(
-                        "shard {} routing.centroid_id must not be empty",
-                        shard.shard_id
-                    )));
-                }
-                if routing.index_type.trim().is_empty() {
-                    return Err(ManifestError::Validation(format!(
-                        "shard {} routing.index_type must not be empty",
-                        shard.shard_id
-                    )));
-                }
-                if routing.file_location.trim().is_empty() {
-                    return Err(ManifestError::Validation(format!(
-                        "shard {} routing.file_location must not be empty",
-                        shard.shard_id
-                    )));
-                }
-            }
-        }
+        self.validate_routing_metadata()?;
 
         if let Some(lexical) = &self.lexical {
             if self.manifest_version < 4 {
@@ -625,6 +604,35 @@ impl Manifest {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate that every shard's optional routing metadata is internally
+    /// consistent (non-empty `centroid_id`, `index_type`, and
+    /// `file_location`).
+    fn validate_routing_metadata(&self) -> Result<()> {
+        for shard in &self.shards {
+            if let Some(routing) = &shard.routing {
+                if routing.centroid_id.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.centroid_id must not be empty",
+                        shard.shard_id
+                    )));
+                }
+                if routing.index_type.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.index_type must not be empty",
+                        shard.shard_id
+                    )));
+                }
+                if routing.file_location.trim().is_empty() {
+                    return Err(ManifestError::Validation(format!(
+                        "shard {} routing.file_location must not be empty",
+                        shard.shard_id
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
