@@ -16,7 +16,10 @@ use clap::Parser;
 use tracing::info;
 
 use shardlake_bench::{AnnFamilyReport, CompareAnnReport};
-use shardlake_core::{config::FanOutPolicy, types::VectorRecord};
+use shardlake_core::{
+    config::FanOutPolicy,
+    types::{DistanceMetric, VectorRecord},
+};
 use shardlake_index::IndexSearcher;
 use shardlake_manifest::Manifest;
 use shardlake_storage::{LocalObjectStore, ObjectStore};
@@ -109,6 +112,14 @@ pub async fn run(storage: PathBuf, args: CompareAnnArgs) -> Result<()> {
     for alias in &args.aliases {
         let manifest = Manifest::load_alias(&*store, alias)
             .with_context(|| format!("loading manifest for alias '{alias}'"))?;
+        ensure_comparable_alias(
+            &args.aliases[0],
+            &first_manifest.vectors_key,
+            first_manifest.distance_metric,
+            alias,
+            &manifest.vectors_key,
+            manifest.distance_metric,
+        )?;
         let ann_family = manifest.algorithm.algorithm.clone();
 
         info!(
@@ -179,5 +190,77 @@ fn print_text(report: &CompareAnnReport) {
             mean_lat,
             p99_lat,
         );
+    }
+}
+
+fn ensure_comparable_alias(
+    reference_alias: &str,
+    reference_vectors_key: &str,
+    reference_metric: DistanceMetric,
+    alias: &str,
+    vectors_key: &str,
+    metric: DistanceMetric,
+) -> Result<()> {
+    anyhow::ensure!(
+        vectors_key == reference_vectors_key,
+        "alias '{alias}' points to vectors artifact '{vectors_key}', but alias '{reference_alias}' points to '{reference_vectors_key}'; `compare-ann` requires all aliases to reference the same dataset"
+    );
+    anyhow::ensure!(
+        metric == reference_metric,
+        "alias '{alias}' uses distance metric '{metric}', but alias '{reference_alias}' uses '{reference_metric}'; `compare-ann` requires all aliases to use the same distance metric"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_comparable_alias;
+    use shardlake_core::types::DistanceMetric;
+
+    #[test]
+    fn comparable_aliases_pass_validation() {
+        ensure_comparable_alias(
+            "ivf",
+            "datasets/ds-v1/vectors.jsonl",
+            DistanceMetric::Cosine,
+            "hnsw",
+            "datasets/ds-v1/vectors.jsonl",
+            DistanceMetric::Cosine,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mismatched_dataset_is_rejected() {
+        let err = ensure_comparable_alias(
+            "ivf",
+            "datasets/ds-v1/vectors.jsonl",
+            DistanceMetric::Cosine,
+            "diskann",
+            "datasets/ds-v2/vectors.jsonl",
+            DistanceMetric::Cosine,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires all aliases to reference the same dataset"));
+    }
+
+    #[test]
+    fn mismatched_metric_is_rejected() {
+        let err = ensure_comparable_alias(
+            "ivf",
+            "datasets/ds-v1/vectors.jsonl",
+            DistanceMetric::Cosine,
+            "diskann",
+            "datasets/ds-v1/vectors.jsonl",
+            DistanceMetric::Euclidean,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires all aliases to use the same distance metric"));
     }
 }

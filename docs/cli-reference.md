@@ -692,9 +692,9 @@ reproducible evaluation run.  Each supplied alias is evaluated against the same 
 brute-force baseline and the results are printed side-by-side, making it straightforward
 to assess quality/latency trade-offs across families.
 
-All compared indexes must reference the same dataset (the corpus is loaded once from the
-first alias).  Each index should have been built with a different `--ann-family` flag so
-that the comparison is meaningful.
+All compared indexes must reference the same dataset and use the same distance metric
+(the corpus and exact-search baseline are loaded from the first alias). Each index should
+have been built with a different `--ann-family` flag so that the comparison is meaningful.
 
 ### Usage
 
