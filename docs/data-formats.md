@@ -171,8 +171,9 @@ and index version and describes every shard artifact.
 }
 ```
 
-> `recall_estimate` is omitted from the example above because it is absent in prototype
-> builds (the field is skipped when `None`).  When present it looks like:
+> `recall_estimate` is omitted from the example above because the default
+> configuration leaves it absent (`recall_sample_size` is unset, so the field is
+> skipped when `None`). When present it looks like:
 >
 > ```json
 > "recall_estimate": { "k": 10, "recall_at_k": 0.97, "sample_size": 500 }
@@ -258,8 +259,9 @@ For a PQ-compressed index the `compression` block looks like:
 ### Build-time recall estimation
 
 `recall_estimate` is populated by `IndexBuilder` when the `recall_sample_size`
-configuration field is set to a positive integer.  The estimation procedure runs
-immediately after all shard artifacts have been written to storage:
+configuration field is set to a positive integer. The query sample is drawn
+before vectors are consumed into shards, and the estimation pass runs after all
+shard artifacts have been written to storage:
 
 1. A reproducible random sample of up to `recall_sample_size` vectors is drawn
    from the build corpus using the same seeded RNG as K-means training

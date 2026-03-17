@@ -199,18 +199,22 @@ impl<'a> IndexBuilder<'a> {
 
         let quantizer = IvfQuantizer::train(training_vecs, k, iters, &mut rng);
 
-        // Optionally sample query vectors for build-time recall estimation.
+        // Optionally sample query indices for build-time recall estimation.
         // This must happen before `records` is consumed into `shard_records`.
-        let recall_queries: Vec<VectorRecord> = if let Some(sz) = self.config.recall_sample_size {
+        let recall_query_indices: Vec<usize> = if let Some(sz) = self.config.recall_sample_size {
             if sz == 0 {
                 return Err(IndexError::Other(
                     "recall_sample_size must be greater than 0".into(),
                 ));
             }
-            let sample_size = (sz as usize).min(records.len());
-            let mut indices: Vec<usize> = (0..records.len()).collect();
-            let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
-            shuffled.iter().map(|&i| records[i].clone()).collect()
+            let sample_size = (sz as usize).min(vecs.len());
+            if sample_size >= vecs.len() {
+                (0..vecs.len()).collect()
+            } else {
+                let mut indices: Vec<usize> = (0..vecs.len()).collect();
+                let (shuffled, _) = indices.partial_shuffle(&mut rng, sample_size);
+                shuffled.to_vec()
+            }
         } else {
             Vec::new()
         };
@@ -412,13 +416,14 @@ impl<'a> IndexBuilder<'a> {
         };
 
         // Compute build-time recall estimate when the caller requested it.
-        let recall_estimate = if recall_queries.is_empty() {
+        let recall_estimate = if recall_query_indices.is_empty() {
             None
         } else {
             let recall_k = (self.config.recall_k as usize).max(1);
             let nprobe = (self.config.nprobe as usize).max(1);
             match estimate_recall(
-                &recall_queries,
+                &recall_query_indices,
+                &vecs,
                 &quantizer,
                 &shard_defs,
                 self.store,
@@ -483,16 +488,19 @@ impl<'a> IndexBuilder<'a> {
 /// Estimate recall@k for a freshly-built index by comparing approximate
 /// nearest-neighbour results against a brute-force ground truth.
 ///
-/// All shard artifacts are loaded back from `store` once to reconstruct the
-/// full corpus for ground-truth computation.  The same in-memory shards are
-/// then reused during the per-query approximate search so each shard artifact
-/// is read from storage exactly once.
+/// All shard artifacts are loaded back from `store` once to reconstruct a
+/// single in-memory corpus for ground-truth computation. Slice ranges into that
+/// corpus are then reused during the per-query approximate search so each shard
+/// artifact is read from storage exactly once without storing duplicate shard
+/// copies.
 ///
 /// Returns a [`RecallEstimate`] populated with the mean recall@k over all
-/// `queries`, or an error if any artifact cannot be loaded or deserialized.
+/// sampled queries, or an error if any artifact cannot be loaded or
+/// deserialized.
 #[allow(clippy::too_many_arguments)]
 fn estimate_recall(
-    queries: &[VectorRecord],
+    query_indices: &[usize],
+    query_vectors: &[Vec<f32>],
     quantizer: &IvfQuantizer,
     shard_defs: &[ShardDef],
     store: &dyn ObjectStore,
@@ -501,17 +509,22 @@ fn estimate_recall(
     nprobe: usize,
     codebook: Option<&PqCodebook>,
 ) -> Result<RecallEstimate> {
-    if queries.is_empty() {
+    if query_indices.is_empty() {
         return Err(IndexError::Other(
             "recall estimation requires at least one sample query".into(),
         ));
     }
 
-    // Load all shard artifacts once, reconstructing each shard as a flat list
-    // of VectorRecords.  For PQ shards the codes are decoded back to
-    // approximate float vectors using the codebook.
-    let mut all_shard_records: Vec<Vec<VectorRecord>> = Vec::with_capacity(shard_defs.len());
-    let mut corpus: Vec<VectorRecord> = Vec::new();
+    // Load all shard artifacts once, reconstructing a single flat corpus.
+    // Per-shard ranges into that corpus are retained so approximate search can
+    // reuse the same vectors without a second copy. For PQ shards the codes are
+    // decoded back to approximate float vectors using the codebook.
+    let total_vectors = shard_defs
+        .iter()
+        .map(|def| def.vector_count as usize)
+        .sum::<usize>();
+    let mut shard_ranges = Vec::with_capacity(shard_defs.len());
+    let mut corpus = Vec::with_capacity(total_vectors);
 
     for def in shard_defs {
         let bytes = store.get(&def.artifact_key)?;
@@ -530,8 +543,9 @@ fn estimate_recall(
         } else {
             ShardIndex::from_bytes(&bytes)?.records
         };
-        corpus.extend(shard_vecs.iter().cloned());
-        all_shard_records.push(shard_vecs);
+        let start = corpus.len();
+        corpus.extend(shard_vecs);
+        shard_ranges.push(start..corpus.len());
     }
 
     let effective_k = k.min(corpus.len());
@@ -541,20 +555,26 @@ fn estimate_recall(
         ));
     }
 
-    let nprobe = nprobe.min(all_shard_records.len());
+    let nprobe = nprobe.min(shard_ranges.len());
 
     let mut total_recall = 0.0f64;
-    for query in queries {
+    for &query_idx in query_indices {
+        let query = query_vectors.get(query_idx).ok_or_else(|| {
+            IndexError::Other(format!(
+                "recall sample query index {query_idx} is out of bounds for {} vectors",
+                query_vectors.len()
+            ))
+        })?;
         // Exact brute-force ground truth over the full corpus.
-        let gt = exact_search(&query.data, &corpus, metric, effective_k);
+        let gt = exact_search(query, &corpus, metric, effective_k);
         let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
 
         // Approximate search: probe the nprobe nearest shards.
-        let probe_indices = quantizer.top_probes(&query.data, nprobe);
+        let probe_indices = quantizer.top_probes(query, nprobe);
         let mut candidates: Vec<SearchResult> = Vec::new();
         for probe_idx in probe_indices {
-            if let Some(shard_vecs) = all_shard_records.get(probe_idx) {
-                let results = exact_search(&query.data, shard_vecs, metric, effective_k);
+            if let Some(range) = shard_ranges.get(probe_idx) {
+                let results = exact_search(query, &corpus[range.clone()], metric, effective_k);
                 candidates.extend(results);
             }
         }
@@ -564,12 +584,12 @@ fn estimate_recall(
         total_recall += recall_at_k(&gt_ids, &approx_ids);
     }
 
-    let mean_recall = total_recall / queries.len() as f64;
+    let mean_recall = total_recall / query_indices.len() as f64;
 
     Ok(RecallEstimate {
         k: effective_k as u32,
         recall_at_k: mean_recall as f32,
-        sample_size: queries.len() as u64,
+        sample_size: query_indices.len() as u64,
     })
 }
 
