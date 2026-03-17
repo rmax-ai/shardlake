@@ -199,6 +199,85 @@ fn test_load_accepts_compat_fingerprint_field() {
     assert!(manifest.shards[0].centroid.is_empty());
 }
 
+/// Saving a v1 manifest must upgrade it to the current schema version on
+/// disk.  Wire-format strict: the stored document must not claim version 1
+/// while containing v3-only fields such as `algorithm` and `compression`.
+#[test]
+fn test_v1_save_upgrades_to_current_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+
+    // Deserialize a genuine v1 document (no centroid, no algorithm, no
+    // compression, no build_duration_secs).
+    let v1_value = serde_json::json!({
+        "manifest_version": 1,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 5,
+        "shards": [{
+            "shard_id": 0,
+            "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+            "vector_count": 5,
+            "sha256": "abc"
+        }],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2
+        }
+    });
+    let m: Manifest = serde_json::from_value(v1_value).unwrap();
+    assert_eq!(
+        m.manifest_version, 1,
+        "deserialized version must be preserved in memory"
+    );
+    m.save(&store).unwrap();
+
+    // The stored document must declare the current schema version, not v1.
+    let manifest_key = Manifest::storage_key(&m.index_version);
+    let saved = store.get(&manifest_key).unwrap();
+    let saved_json = String::from_utf8(saved).unwrap();
+    assert!(
+        saved_json.contains("\"manifest_version\": 4"),
+        "saved manifest must be upgraded to v4, not left at v1; got: {saved_json}"
+    );
+    // v3-only fields must be present because the document is now v4.
+    assert!(
+        saved_json.contains("\"algorithm\""),
+        "saved v4 document must contain 'algorithm'"
+    );
+    assert!(
+        saved_json.contains("\"compression\""),
+        "saved v4 document must contain 'compression'"
+    );
+    assert!(
+        saved_json.contains("\"build_duration_secs\""),
+        "saved v4 document must contain 'build_duration_secs'"
+    );
+    // v1 shards have no centroid; the field must remain absent after upgrade.
+    assert!(
+        !saved_json.contains("\"centroid\""),
+        "v1 shards have no centroid and the field must remain absent after upgrade"
+    );
+
+    // Round-trip: the loaded manifest must reflect the upgraded schema.
+    let loaded = Manifest::load(&store, &m.index_version).unwrap();
+    assert_eq!(loaded.manifest_version, 4);
+    assert_eq!(loaded.algorithm.algorithm, "kmeans-flat");
+    assert!(!loaded.compression.enabled);
+    assert_eq!(loaded.compression.codec, "none");
+    assert_eq!(loaded.build_metadata.build_duration_secs, 0.0);
+    // v1 shards have no routing metadata; the field must remain None on upgrade.
+    assert!(loaded.shards[0].routing.is_none());
+}
+
 #[test]
 fn test_v2_centroid_round_trips() {
     let tmp = tempfile::tempdir().unwrap();

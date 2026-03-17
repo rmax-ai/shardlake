@@ -256,6 +256,34 @@ For a PQ-compressed index the `compression` block looks like:
 | `routing.index_type` | string | ANN index algorithm within this shard (e.g. `"flat"` for linear scan). Consumed by the serving path to select the correct search method when loading this shard. |
 | `routing.file_location` | string | Canonical storage key to load this shard when routing a query. Equals `artifact_key` for local storage backends; may differ in multi-storage deployments that resolve a URL or filesystem path separately. |
 
+### Legacy manifest migration
+
+When `Manifest::save` writes a manifest to storage it always **upgrades the
+on-disk document to the current schema version** (`manifest_version: 4`),
+regardless of the version that was read from storage.  This keeps the stored
+wire format internally consistent: a document that claims `manifest_version: 4`
+will always contain all v3+ fields (`algorithm`, `compression`,
+`build_duration_secs`, …) and will never carry a lower version number than the
+fields it exposes.
+
+The upgrade is applied automatically and transparently:
+
+1. `Manifest::load` reads the on-disk document and fills in `serde` defaults
+   for any fields absent in older schemas (e.g. `algorithm` defaults to
+   `"kmeans-flat"`, `compression` defaults to disabled/`"none"`,
+   `build_duration_secs` defaults to `0.0`).
+2. The in-memory `Manifest` retains the version that was declared on disk
+   (`manifest_version: 1`, `2`, or `3`) so that callers can inspect the
+   original provenance.
+3. When `Manifest::save` is called on that manifest, `normalised_for_save`
+   upgrades the version to `4` before serialising, ensuring the emitted JSON
+   contains all current fields and declares `manifest_version: 4`.
+
+> **Note:** Direct `serde_json::to_string` / `serde_json::to_value` calls on a
+> `Manifest` with a legacy version field will serialise using whatever the
+> in-memory struct contains.  Always call `Manifest::save` (or load the
+> manifest and re-save it) to obtain a correctly versioned on-disk document.
+
 ### Compatibility checks
 
 `shardlake_manifest::Manifest` exposes three typed helpers for call-site compatibility
