@@ -501,6 +501,12 @@ fn estimate_recall(
     nprobe: usize,
     codebook: Option<&PqCodebook>,
 ) -> Result<RecallEstimate> {
+    if queries.is_empty() {
+        return Err(IndexError::Other(
+            "recall estimation requires at least one sample query".into(),
+        ));
+    }
+
     // Load all shard artifacts once, reconstructing each shard as a flat list
     // of VectorRecords.  For PQ shards the codes are decoded back to
     // approximate float vectors using the codebook.
