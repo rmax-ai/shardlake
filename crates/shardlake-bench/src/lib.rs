@@ -644,6 +644,9 @@ pub fn run_benchmark(
 /// instead focuses on per-query quality and latency, returning an
 /// [`EvalAnnReport`] that is suitable for regression tracking.
 ///
+/// This convenience wrapper computes the exact top-k ground truth from `corpus`
+/// for each query, then delegates to [`run_eval_ann_with_ground_truth`].
+///
 /// # Arguments
 ///
 /// * `searcher` – A loaded [`IndexSearcher`] ready to serve queries.
@@ -660,10 +663,54 @@ pub fn run_eval_ann(
     policy: &FanOutPolicy,
     metric: DistanceMetric,
 ) -> IndexResult<EvalAnnReport> {
+    let ground_truth_ids = precompute_ground_truth_ids(queries, corpus, metric, k);
+    run_eval_ann_with_ground_truth(searcher, queries, &ground_truth_ids, k, policy)
+}
+
+/// Precompute the exact top-k neighbour ids for each query.
+///
+/// This is useful when several evaluation passes reuse the same queries and
+/// corpus, such as comparing multiple ANN aliases against a shared ground truth.
+pub fn precompute_ground_truth_ids(
+    queries: &[VectorRecord],
+    corpus: &[VectorRecord],
+    metric: DistanceMetric,
+    k: usize,
+) -> Vec<Vec<VectorId>> {
+    queries
+        .iter()
+        .map(|query| {
+            exact_search(&query.data, corpus, metric, k)
+                .into_iter()
+                .map(|result| result.id)
+                .collect()
+        })
+        .collect()
+}
+
+/// Evaluate ANN quality using precomputed exact top-k ids for each query.
+///
+/// Callers that compare several indexes over the same query set can precompute
+/// ground truth once with [`precompute_ground_truth_ids`] and reuse it across
+/// repeated ANN runs.
+pub fn run_eval_ann_with_ground_truth(
+    searcher: &IndexSearcher,
+    queries: &[VectorRecord],
+    ground_truth_ids: &[Vec<VectorId>],
+    k: usize,
+    policy: &FanOutPolicy,
+) -> IndexResult<EvalAnnReport> {
     if queries.is_empty() {
         return Err(shardlake_index::IndexError::Other(
             "eval-ann requires at least one query vector".to_string(),
         ));
+    }
+    if ground_truth_ids.len() != queries.len() {
+        return Err(shardlake_index::IndexError::Other(format!(
+            "eval-ann requires one ground-truth entry per query (got {} queries and {} ground-truth entries)",
+            queries.len(),
+            ground_truth_ids.len()
+        )));
     }
 
     let nprobe = policy.candidate_centroids as usize;
@@ -672,17 +719,14 @@ pub fn run_eval_ann(
     let mut recalls: Vec<f64> = Vec::with_capacity(queries.len());
     let mut precisions: Vec<f64> = Vec::with_capacity(queries.len());
 
-    for query in queries {
-        let gt = exact_search(&query.data, corpus, metric, k);
-        let gt_ids: Vec<VectorId> = gt.iter().map(|r| r.id).collect();
-
+    for (query, gt_ids) in queries.iter().zip(ground_truth_ids.iter()) {
         let t0 = Instant::now();
         let approx = searcher.search(&query.data, k, policy)?;
         let elapsed_us = t0.elapsed().as_micros() as f64;
 
         let approx_ids: Vec<VectorId> = approx.iter().map(|r| r.id).collect();
-        recalls.push(recall_at_k(&gt_ids, &approx_ids));
-        precisions.push(precision_at_k(&gt_ids, &approx_ids));
+        recalls.push(recall_at_k(gt_ids, &approx_ids));
+        precisions.push(precision_at_k(gt_ids, &approx_ids));
         latencies_us.push(elapsed_us);
     }
 
@@ -2149,6 +2193,66 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let decoded: CompareAnnReport = serde_json::from_str(&json).unwrap();
         assert!(decoded.entries.is_empty());
+    }
+
+    #[test]
+    fn run_eval_ann_with_ground_truth_matches_direct_eval() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(20, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let queries: Vec<VectorRecord> = records[..5].to_vec();
+        let policy = FanOutPolicy {
+            candidate_centroids: 2,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let direct = run_eval_ann(
+            &searcher,
+            &queries,
+            &records,
+            3,
+            &policy,
+            DistanceMetric::Euclidean,
+        )
+        .unwrap();
+        let ground_truth =
+            precompute_ground_truth_ids(&queries, &records, DistanceMetric::Euclidean, 3);
+        let reused =
+            run_eval_ann_with_ground_truth(&searcher, &queries, &ground_truth, 3, &policy).unwrap();
+
+        assert_eq!(direct.num_queries, reused.num_queries);
+        assert_eq!(direct.k, reused.k);
+        assert_eq!(direct.nprobe, reused.nprobe);
+        assert_eq!(direct.recall_at_k, reused.recall_at_k);
+        assert_eq!(direct.precision_at_k, reused.precision_at_k);
+    }
+
+    #[test]
+    fn run_eval_ann_with_ground_truth_rejects_mismatched_lengths() {
+        let tmp = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
+        let records = make_records(8, 4);
+        let manifest =
+            build_test_index(store.as_ref(), records.clone(), 2, tmp.path().to_path_buf());
+        let searcher = IndexSearcher::new(store as Arc<dyn ObjectStore>, manifest);
+        let queries: Vec<VectorRecord> = records[..2].to_vec();
+        let policy = FanOutPolicy {
+            candidate_centroids: 1,
+            candidate_shards: 0,
+            max_vectors_per_shard: 0,
+        };
+
+        let err =
+            run_eval_ann_with_ground_truth(&searcher, &queries, &[vec![VectorId(1)]], 2, &policy)
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires one ground-truth entry per query"));
     }
 
     // ── run_eval_hybrid tests ─────────────────────────────────────────────────

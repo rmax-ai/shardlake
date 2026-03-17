@@ -15,7 +15,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 
-use shardlake_bench::{AnnFamilyReport, CompareAnnReport};
+use shardlake_bench::{
+    precompute_ground_truth_ids, run_eval_ann_with_ground_truth, AnnFamilyReport, CompareAnnReport,
+};
 use shardlake_core::{
     config::FanOutPolicy,
     types::{DistanceMetric, VectorRecord},
@@ -98,6 +100,7 @@ pub async fn run(storage: PathBuf, args: CompareAnnArgs) -> Result<()> {
         args.max_queries.min(corpus.len())
     };
     let queries: Vec<VectorRecord> = corpus[..limit].to_vec();
+    let ground_truth_ids = precompute_ground_truth_ids(&queries, &corpus, metric, args.k);
 
     info!(
         n_queries = queries.len(),
@@ -136,7 +139,7 @@ pub async fn run(storage: PathBuf, args: CompareAnnArgs) -> Result<()> {
         let searcher =
             IndexSearcher::new(Arc::clone(&store) as Arc<dyn ObjectStore>, manifest.clone());
         let eval =
-            shardlake_bench::run_eval_ann(&searcher, &queries, &corpus, args.k, &policy, metric)
+            run_eval_ann_with_ground_truth(&searcher, &queries, &ground_truth_ids, args.k, &policy)
                 .with_context(|| {
                     format!("running eval-ann for alias '{alias}' (family: {ann_family})")
                 })?;

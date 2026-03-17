@@ -958,9 +958,9 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(tmp.path()).unwrap());
         let config = SystemConfig {
             storage_root: tmp.path().to_path_buf(),
-            num_shards: 2,
+            num_shards: 1,
             kmeans_iters: 5,
-            nprobe: 2,
+            nprobe: 1,
             kmeans_seed: SystemConfig::default_kmeans_seed(),
             kmeans_sample_size: None,
             ..SystemConfig::default()
@@ -1173,6 +1173,21 @@ mod tests {
     where
         S: tracing::Subscriber,
     {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn enabled(
+            &self,
+            _metadata: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
@@ -1193,9 +1208,7 @@ mod tests {
             .lock()
             .unwrap();
         let collector = SpanCollector::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::LevelFilter::TRACE)
-            .with(collector.clone());
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
         let result = subscriber::with_default(subscriber, f);
         (result, collector.snapshot())
     }
