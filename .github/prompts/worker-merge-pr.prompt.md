@@ -40,7 +40,7 @@ Requirements:
    - labeled `ready-to-merge`
    - authored by a login that passes the normalized workflow actor guard rail: `copilot-swe-agent`, `copilot-swe-agent[bot]`, `app/copilot-swe-agent`, or `rmax`
    - still on the expected head SHA, or stop and report the mismatch clearly
-4. Fetch the latest PR metadata, including author identity, status checks, review state, and labels.
+4. Fetch the latest PR metadata, including author identity, status checks, review state, and labels. This project does not use GitHub Actions CI checks; if `gh pr checks` returns a non-zero exit code or reports "no checks reported", treat that as a passing/no-blocking-checks state and continue — do not stop on this result alone.
 5. Resolve the primary repository root from `$SHARDLAKE_PRIMARY_ROOT`; if it is unset or invalid, stop and report that the PR worktree could not be prepared safely.
 6. Before any branch checkout, verify the repository's primary checkout is safe with `git -C "$SHARDLAKE_PRIMARY_ROOT" status --short`.
 7. Create or refresh a dedicated git worktree for this PR by running `$SHARDLAKE_PRIMARY_ROOT/tools/prepare_pr_worktree.sh <pr-number> <base-branch>`.

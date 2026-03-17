@@ -171,8 +171,9 @@ and index version and describes every shard artifact.
 }
 ```
 
-> `recall_estimate` is omitted from the example above because it is absent in prototype
-> builds (the field is skipped when `None`).  When present it looks like:
+> `recall_estimate` is omitted from the example above because the default
+> configuration leaves it absent (`recall_sample_size` is unset, so the field is
+> skipped when `None`). When present it looks like:
 >
 > ```json
 > "recall_estimate": { "k": 10, "recall_at_k": 0.97, "sample_size": 500 }
@@ -196,7 +197,7 @@ For a PQ-compressed index the `compression` block looks like:
 |--------------------|-------------|
 | `1` | Original schema. `ShardDef` has no `centroid` field. `IndexSearcher` falls back to loading every shard body to gather centroids before routing. |
 | `2` | Added `centroid` array in `ShardDef`. `IndexSearcher` can select probe shards without deserialising any shard body. |
-| `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. The reader uses `serde` defaults when loading v1/v2 documents, and manifests re-saved by the current library are rewritten as v4 documents. |
+| `3` | Adds lifecycle metadata: `algorithm`, `shard_summary`, `compression`, `recall_estimate` (optional), and `build_metadata.build_duration_secs`. A v3+ reader fills in `serde` defaults for these fields when loading v1/v2 documents that omit them (backward-compatible read). Manifests re-saved by the current library are rewritten as v4 documents. |
 | `4` | Current schema. Adds an optional `routing` object to `ShardDef` with `centroid_id`, `index_type`, and `file_location` for partition-aware query routing. Fresh v4 builds populate it for every non-empty shard. Manifests loaded from older versions may still omit `routing` after being re-saved, in which case the field defaults to `None`. |
 
 ### Fields
@@ -221,20 +222,19 @@ For a PQ-compressed index the `compression` block looks like:
 | `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
 | `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name. `"ivf-flat"` for current builds; `"kmeans-flat"` for indexes built before IVF was introduced. Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
-| `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
-| `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
-| `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
-| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. `false` for uncompressed builds, `true` for PQ builds. Defaults to `false`. |
-| `compression.codec` | string | *(v3+)* Codec identifier. `"none"` for uncompressed builds; `"pq8"` for 8-bit product quantisation. Defaults to `"none"`. |
-| `compression.pq_num_subspaces` | integer | *(v3+, `"pq8"` only)* Number of PQ sub-spaces `M`. Omitted when codec is `"none"`. |
-| `compression.pq_codebook_size` | integer | *(v3+, `"pq8"` only)* PQ codebook size `K` (number of centroids per sub-space). Must be ≤ 256. Omitted when codec is `"none"`. |
-| `compression.codebook_key` | string | *(v3+, `"pq8"` only)* Storage key of the PQ codebook artifact (`pq_codebook.bin`). Omitted when codec is `"none"`. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. For `"kmeans-flat"` builds always includes `num_shards`, `kmeans_iters`, and `kmeans_seed`, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
+| `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Must equal the actual number of entries in the `shards` array. Absent in v1/v2 manifests. |
+| `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. Must equal the minimum `vector_count` across all shards. Must be ≤ `max_shard_vector_count`. |
+| `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. Must equal the maximum `vector_count` across all shards. |
+| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. `false` for uncompressed builds, `true` for PQ builds. Defaults to `false`. Must be `true` when `codec="pq8"` and `false` when `codec="none"`. |
+| `compression.codec` | string | *(v3+)* Codec identifier. Must be `"none"` (uncompressed) or `"pq8"` (8-bit product quantisation). No other values are accepted. Defaults to `"none"`. |
+| `compression.pq_num_subspaces` | integer | *(v3+, `"pq8"` only)* Number of PQ sub-spaces `M`. Must be > 0 when `codec="pq8"`. Must be `0` (and is omitted on write) when `codec="none"`. |
+| `compression.pq_codebook_size` | integer | *(v3+, `"pq8"` only)* PQ codebook size `K` (number of centroids per sub-space). Must be in the range 1–256 when `codec="pq8"` (`"pq8"` encodes each sub-space index as a single byte, so at most 256 entries are representable). Must be `0` (and is omitted on write) when `codec="none"`. |
+| `compression.codebook_key` | string | *(v3+, `"pq8"` only)* Storage key of the PQ codebook artifact (`pq_codebook.bin`). Must be present and non-empty when `codec="pq8"`. Must be absent when `codec="none"`. |
 | `recall_estimate` | object \| null | *(v3+, optional)* Approximate recall estimate from a build-time sample query. `null` / absent when not computed. |
-| `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). |
-| `recall_estimate.recall_at_k` | float | Estimated recall@k in [0, 1]. |
-| `recall_estimate.sample_size` | integer | Number of sample queries used. |
+| `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). Must be > 0. |
+| `recall_estimate.recall_at_k` | float | Estimated recall@k. Must be a finite value in [0, 1]. |
+| `recall_estimate.sample_size` | integer | Number of sample queries used. Must be > 0. |
 | `coarse_quantizer_key` | string \| null | Storage key of the IVF coarse-quantizer artifact (`coarse_quantizer.cq`). Present for `"ivf-flat"` indexes; absent for legacy `"kmeans-flat"` indexes. |
 | `lexical` | object \| null | *(v4+, optional)* Configuration for the BM25 lexical index artifact. `null` / absent when no lexical index was built (vector-only indexes). |
 | `lexical.artifact_key` | string | Storage key of the serialised BM25 index artifact (`lexical.bm25`). |
@@ -256,9 +256,123 @@ For a PQ-compressed index the `compression` block looks like:
 | `routing.index_type` | string | ANN index algorithm within this shard (e.g. `"flat"` for linear scan). Consumed by the serving path to select the correct search method when loading this shard. |
 | `routing.file_location` | string | Canonical storage key to load this shard when routing a query. Equals `artifact_key` for local storage backends; may differ in multi-storage deployments that resolve a URL or filesystem path separately. |
 
+### Build-time recall estimation
+
+`recall_estimate` is populated by `IndexBuilder` when the `recall_sample_size`
+configuration field is set to a positive integer. The query sample is drawn
+before vectors are consumed into shards, and the estimation pass runs after all
+shard artifacts have been written to storage:
+
+1. A reproducible random sample of up to `recall_sample_size` vectors is drawn
+   from the build corpus using the same seeded RNG as K-means training
+   (`kmeans_seed`).  These vectors become the **query set**.
+2. All shard artifacts are loaded back from storage and their vectors are
+   reassembled into a flat in-memory **ground-truth corpus**.  For
+   PQ-compressed shards, each code is decoded back to an approximate float
+   vector using the PQ codebook.
+3. For each sample query:
+   - The brute-force top-`recall_k` result list is computed over the full
+     ground-truth corpus (exact nearest-neighbour search).
+   - The approximate top-`recall_k` result list is computed by routing the
+     query through the IVF coarse quantizer (using the configured `nprobe`
+     value) and performing flat search within each probed shard's in-memory
+     record list.
+4. Recall@`recall_k` is computed per query as the fraction of ground-truth IDs
+   that appear in the approximate result list, then averaged over the sample.
+5. The mean recall@k value is written to `manifest.recall_estimate`.
+
+The estimate is reproducible: two builds with identical inputs, the same
+`kmeans_seed`, and the same `recall_sample_size` / `recall_k` will always
+produce the same `recall_estimate` values.
+
+When `recall_sample_size` is absent (the default) no estimation is performed and
+`recall_estimate` is `null` / absent in the manifest.
+
+> **Memory note:** Loading all shard artifacts for ground-truth reconstruction
+> temporarily increases peak memory usage during the build proportionally to the
+> corpus size.  Disable recall estimation for very large builds where this cost
+> is unacceptable.
+
+### Legacy manifest migration
+
+When `Manifest::save` writes a manifest to storage it always **upgrades the
+on-disk document to the current schema version** (`manifest_version: 4`),
+regardless of the version that was read from storage.  This keeps the stored
+wire format internally consistent: a document that claims `manifest_version: 4`
+will always contain all v3+ fields (`algorithm`, `compression`,
+`build_duration_secs`, …) and will never carry a lower version number than the
+fields it exposes.
+
+The upgrade is applied automatically and transparently:
+
+1. `Manifest::load` reads the on-disk document and fills in `serde` defaults
+   for any fields absent in older schemas (e.g. `algorithm` defaults to
+   `"kmeans-flat"`, `compression` defaults to disabled/`"none"`,
+   `build_duration_secs` defaults to `0.0`).
+2. The in-memory `Manifest` retains the version that was declared on disk
+   (`manifest_version: 1`, `2`, or `3`) so that callers can inspect the
+   original provenance.
+3. When `Manifest::save` is called on that manifest, `normalised_for_save`
+   upgrades the version to `4` before serialising, ensuring the emitted JSON
+   contains all current fields and declares `manifest_version: 4`.
+
+> **Note:** Direct `serde_json::to_string` / `serde_json::to_value` calls on a
+> `Manifest` with a legacy version field will serialise using whatever the
+> in-memory struct contains.  Always call `Manifest::save` (or load the
+> manifest and re-save it) to obtain a correctly versioned on-disk document.
+
+### Compatibility directions
+
+Manifest compatibility operates in two independent directions, each relying on
+a different mechanism.
+
+#### Backward-compatible reads (new reader, old manifest)
+
+When a **current** `Manifest` reader (e.g. a v4-aware binary) loads an older
+manifest document (v1, v2, or v3), the fields that were added in later schema
+versions are absent from the JSON.  `serde` fills those missing fields with the
+`#[serde(default)]`-supplied values declared on each struct field.  The table
+below is the complete set of post-v1 manifest fields that rely on this
+mechanism when they are absent from an older document:
+
+| Field absent in old manifest | Default value applied by the current reader |
+|------------------------------|---------------------------------------------|
+| `algorithm` | `AlgorithmMetadata { algorithm: "kmeans-flat", variant: None, params: {} }` |
+| `compression` | `CompressionConfig { enabled: false, codec: "none", pq_num_subspaces: 0, pq_codebook_size: 0, codebook_key: None }` |
+| `build_metadata.build_duration_secs` | `0.0` |
+| `shard_summary` | `None` |
+| `recall_estimate` | `None` |
+| `coarse_quantizer_key` | `None` |
+| `lexical` | `None` |
+| `ShardDef.centroid` | `[]` |
+| `ShardDef.routing` | `None` |
+
+This lets a current reader safely load any manifest version without bespoke
+migration code.
+
+#### Forward-compatible reads (old reader, new manifest)
+
+When an **older** reader (e.g. a v1-era binary) loads a newer manifest
+document (v2, v3, or v4), the JSON contains fields the reader's structs do not
+declare.  By default, `serde_json` **silently discards** JSON keys that have no
+corresponding struct field.  This is an entirely separate mechanism from
+`#[serde(default)]`: the older reader does not need `#[serde(default)]` to
+ignore a field it has never heard of — unknown keys are dropped automatically
+during deserialization.
+
+For example, a v1 reader loading a v4 manifest will successfully deserialize
+the fields it knows (`manifest_version`, `shards`, `build_metadata`, …) and
+silently drop the unfamiliar ones (`algorithm`, `compression`, `routing`, …).
+
+> **Important:** forward-compatible reads are only safe when the new fields are
+> genuinely additive and the older reader's logic still produces correct results
+> while ignoring them.  Adding a field that changes the semantics of existing
+> fields without bumping the schema version is a breaking change regardless of
+> whether old readers can deserialize the document without error.
+
 ### Compatibility checks
 
-`shardlake_manifest::Manifest` exposes three typed helpers for call-site compatibility
+`shardlake_manifest::Manifest` exposes typed helpers for call-site compatibility
 validation:
 
 | Method | Error condition |
@@ -266,9 +380,37 @@ validation:
 | `check_dimension_compat(dims)` | `dims` does not match `manifest.dims` |
 | `check_dataset_version_compat(version)` | `version` does not match `manifest.dataset_version` |
 | `check_algorithm_compat(algorithm)` | `algorithm` does not match `manifest.algorithm.algorithm` |
+| `check_algorithm_full_compat(algorithm, variant, required_params)` | See semantics below |
 
-All three return `ManifestError::Compatibility(…)` on failure so callers can distinguish
-compatibility errors from parse or validation errors.
+All helpers return `ManifestError::Compatibility(…)` on failure so callers can
+distinguish compatibility errors from parse or validation errors.
+
+#### `check_algorithm_full_compat` semantics
+
+This richer helper enforces the complete algorithm identity contract and is the
+recommended API for query and serving code that needs to validate a manifest
+before use.
+
+| Parameter | Type | Semantics |
+|-----------|------|-----------|
+| `algorithm` | `&str` | Must match `manifest.algorithm.algorithm` exactly. |
+| `variant` | `Option<&str>` | When `Some(v)`, `manifest.algorithm.variant` must equal `Some(v)` exactly. Pass `None` to skip the variant check (any manifest variant, including `None`, is accepted). |
+| `required_params` | `&[(&str, &serde_json::Value)]` | Each `(key, value)` pair must appear in `manifest.algorithm.params` with an identical value. Parameters present in the manifest but absent from `required_params` are silently ignored, enabling forward-compatibility when new informational parameters are added in future builder versions. A parameter listed in `required_params` but absent from the manifest is a mismatch. |
+
+**Variant rules in detail:**
+- Variant differences are always incompatible when a specific variant is
+  required (`variant: Some(v)`).
+- Callers that do not care about the variant (e.g. index readers that support
+  any variant of a given algorithm family) should pass `None`.
+
+**Parameter rules in detail:**
+- Only parameters that are *structurally significant* (i.e. that change the
+  index layout or query behaviour) should be listed in `required_params`.
+  Examples: `num_shards`, `num_clusters`, `hnsw_m`.
+- Parameters that a given caller treats as informational need not be listed;
+  their presence in the manifest will not cause a failure.
+- Unknown parameters introduced by newer builders are ignored, preserving
+  forward-compatibility across minor version upgrades.
 
 ### Reproducibility contract
 

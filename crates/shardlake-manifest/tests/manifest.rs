@@ -199,6 +199,85 @@ fn test_load_accepts_compat_fingerprint_field() {
     assert!(manifest.shards[0].centroid.is_empty());
 }
 
+/// Saving a v1 manifest must upgrade it to the current schema version on
+/// disk.  Wire-format strict: the stored document must not claim version 1
+/// while containing v3-only fields such as `algorithm` and `compression`.
+#[test]
+fn test_v1_save_upgrades_to_current_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LocalObjectStore::new(tmp.path()).unwrap();
+
+    // Deserialize a genuine v1 document (no centroid, no algorithm, no
+    // compression, no build_duration_secs).
+    let v1_value = serde_json::json!({
+        "manifest_version": 1,
+        "dataset_version": "ds-v1",
+        "embedding_version": "emb-v1",
+        "index_version": "idx-v1",
+        "alias": "latest",
+        "dims": 4,
+        "distance_metric": "cosine",
+        "vectors_key": "datasets/ds-v1/vectors.jsonl",
+        "metadata_key": "datasets/ds-v1/metadata.json",
+        "total_vector_count": 5,
+        "shards": [{
+            "shard_id": 0,
+            "artifact_key": "indexes/idx-v1/shards/shard-0000.sidx",
+            "vector_count": 5,
+            "sha256": "abc"
+        }],
+        "build_metadata": {
+            "built_at": "2026-03-10T17:44:00Z",
+            "builder_version": "0.1.0",
+            "num_kmeans_iters": 20,
+            "nprobe_default": 2
+        }
+    });
+    let m: Manifest = serde_json::from_value(v1_value).unwrap();
+    assert_eq!(
+        m.manifest_version, 1,
+        "deserialized version must be preserved in memory"
+    );
+    m.save(&store).unwrap();
+
+    // The stored document must declare the current schema version, not v1.
+    let manifest_key = Manifest::storage_key(&m.index_version);
+    let saved = store.get(&manifest_key).unwrap();
+    let saved_json = String::from_utf8(saved).unwrap();
+    assert!(
+        saved_json.contains("\"manifest_version\": 4"),
+        "saved manifest must be upgraded to v4, not left at v1; got: {saved_json}"
+    );
+    // v3-only fields must be present because the document is now v4.
+    assert!(
+        saved_json.contains("\"algorithm\""),
+        "saved v4 document must contain 'algorithm'"
+    );
+    assert!(
+        saved_json.contains("\"compression\""),
+        "saved v4 document must contain 'compression'"
+    );
+    assert!(
+        saved_json.contains("\"build_duration_secs\""),
+        "saved v4 document must contain 'build_duration_secs'"
+    );
+    // v1 shards have no centroid; the field must remain absent after upgrade.
+    assert!(
+        !saved_json.contains("\"centroid\""),
+        "v1 shards have no centroid and the field must remain absent after upgrade"
+    );
+
+    // Round-trip: the loaded manifest must reflect the upgraded schema.
+    let loaded = Manifest::load(&store, &m.index_version).unwrap();
+    assert_eq!(loaded.manifest_version, 4);
+    assert_eq!(loaded.algorithm.algorithm, "kmeans-flat");
+    assert!(!loaded.compression.enabled);
+    assert_eq!(loaded.compression.codec, "none");
+    assert_eq!(loaded.build_metadata.build_duration_secs, 0.0);
+    // v1 shards have no routing metadata; the field must remain None on upgrade.
+    assert!(loaded.shards[0].routing.is_none());
+}
+
 #[test]
 fn test_v2_centroid_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
@@ -434,6 +513,225 @@ fn test_v1_manifest_defaults_new_fields() {
     assert!(manifest.shards[0].routing.is_none());
 }
 
+// ── compression config validation ─────────────────────────────────────────────
+
+fn pq8_compression() -> CompressionConfig {
+    CompressionConfig {
+        enabled: true,
+        codec: "pq8".into(),
+        pq_num_subspaces: 8,
+        pq_codebook_size: 256,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    }
+}
+
+#[test]
+fn test_validate_accepts_valid_pq8_compression() {
+    let mut m = sample_manifest();
+    m.compression = pq8_compression();
+    m.validate()
+        .expect("valid pq8 compression must be accepted");
+}
+
+#[test]
+fn test_validate_rejects_unknown_codec() {
+    let mut m = sample_manifest();
+    m.compression.codec = "lz4".into();
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("not a recognised codec"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_enabled_true_with_none_codec() {
+    let mut m = sample_manifest();
+    m.compression.enabled = true;
+    // codec is still "none" (default)
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.enabled is true but codec is \"none\""),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_enabled_false_with_pq8_codec() {
+    let mut m = sample_manifest();
+    // enabled stays false (default), but codec is set to pq8
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "pq8".into(),
+        pq_num_subspaces: 8,
+        pq_codebook_size: 256,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codec is \"pq8\" but enabled is false"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_missing_num_subspaces() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_num_subspaces: 0,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_num_subspaces must be > 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_zero_codebook_size() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_codebook_size: 0,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be in 1..=256"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_codebook_size_exceeds_256() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        pq_codebook_size: 512,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be in 1..=256"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_missing_codebook_key() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        codebook_key: None,
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must be present"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_pq8_empty_codebook_key() {
+    // spaces-only
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        codebook_key: Some("  ".into()),
+        ..pq8_compression()
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must not be empty"),
+        "unexpected error: {err}"
+    );
+
+    // mixed whitespace (tabs, newlines)
+    let mut m2 = sample_manifest();
+    m2.compression = CompressionConfig {
+        codebook_key: Some("\t\n ".into()),
+        ..pq8_compression()
+    };
+
+    let err2 = m2.validate().unwrap_err();
+    assert!(
+        err2.to_string()
+            .contains("compression.codebook_key must not be empty"),
+        "unexpected error: {err2}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_pq_num_subspaces() {
+    let mut m = sample_manifest();
+    // codec is "none" but pq_num_subspaces is non-zero (stale PQ config)
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 4,
+        pq_codebook_size: 0,
+        codebook_key: None,
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_num_subspaces must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_pq_codebook_size() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 0,
+        pq_codebook_size: 256,
+        codebook_key: None,
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.pq_codebook_size must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_none_codec_with_stale_codebook_key() {
+    let mut m = sample_manifest();
+    m.compression = CompressionConfig {
+        enabled: false,
+        codec: "none".into(),
+        pq_num_subspaces: 0,
+        pq_codebook_size: 0,
+        codebook_key: Some("indexes/idx-v1/pq_codebook.bin".into()),
+    };
+
+    let err = m.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("compression.codebook_key must be absent when codec is \"none\""),
+        "unexpected error: {err}"
+    );
+}
+
 // ── compatibility checks ──────────────────────────────────────────────────────
 
 #[test]
@@ -520,6 +818,143 @@ fn test_check_algorithm_compat_uses_v1_default() {
     let manifest: Manifest = serde_json::from_value(compat).unwrap();
     assert!(manifest.check_algorithm_compat("kmeans-flat").is_ok());
     assert!(manifest.check_algorithm_compat("hnsw").is_err());
+}
+
+// ── check_algorithm_full_compat ───────────────────────────────────────────────
+
+/// Algorithm name, no variant, no required params → compatible.
+#[test]
+fn test_full_compat_algorithm_only_ok() {
+    let m = sample_manifest();
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", None, &[])
+        .is_ok());
+}
+
+/// Algorithm name mismatch → Compatibility error.
+#[test]
+fn test_full_compat_algorithm_mismatch() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat("hnsw", None, &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm mismatch"));
+    assert!(err.to_string().contains("manifest has kmeans-flat"));
+    assert!(err.to_string().contains("requested hnsw"));
+}
+
+/// Manifest has a variant and caller requests the same variant → compatible.
+#[test]
+fn test_full_compat_variant_match_ok() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", Some("cosine-normalised"), &[])
+        .is_ok());
+}
+
+/// Manifest has variant A, caller requires variant B → Compatibility error.
+#[test]
+fn test_full_compat_variant_mismatch() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    let err = m
+        .check_algorithm_full_compat("kmeans-flat", Some("dot-normalised"), &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm variant mismatch"));
+    assert!(err.to_string().contains("manifest has"));
+    assert!(err.to_string().contains("cosine-normalised"));
+    assert!(err.to_string().contains("requested"));
+    assert!(err.to_string().contains("dot-normalised"));
+}
+
+/// Manifest has no variant, caller requires a specific variant → Compatibility error.
+#[test]
+fn test_full_compat_variant_manifest_none_requested_some() {
+    let m = sample_manifest(); // variant is None
+    let err = m
+        .check_algorithm_full_compat("kmeans-flat", Some("cosine-normalised"), &[])
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm variant mismatch"));
+}
+
+/// Manifest has a variant, caller passes variant=None → variant is not checked (compatible).
+#[test]
+fn test_full_compat_variant_caller_none_skips_check() {
+    let mut m = sample_manifest();
+    m.algorithm.variant = Some("cosine-normalised".into());
+    assert!(m
+        .check_algorithm_full_compat("kmeans-flat", None, &[])
+        .is_ok());
+}
+
+/// All required_params are present and match → compatible.
+#[test]
+fn test_full_compat_required_params_all_match() {
+    let m = sample_manifest();
+    assert!(m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[
+                ("num_shards", &serde_json::json!(2)),
+                ("kmeans_iters", &serde_json::json!(20)),
+            ]
+        )
+        .is_ok());
+}
+
+/// A required param has a different value in the manifest → Compatibility error.
+#[test]
+fn test_full_compat_required_param_value_mismatch() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_shards", &serde_json::json!(8))],
+        )
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("algorithm param"));
+    assert!(err.to_string().contains("num_shards"));
+    assert!(err.to_string().contains("mismatch"));
+}
+
+/// A required param is not present in the manifest at all → Compatibility error.
+#[test]
+fn test_full_compat_required_param_missing_from_manifest() {
+    let m = sample_manifest();
+    let err = m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_clusters", &serde_json::json!(256))],
+        )
+        .unwrap_err();
+    assert!(matches!(err, ManifestError::Compatibility(_)));
+    assert!(err.to_string().contains("num_clusters"));
+    assert!(err.to_string().contains("missing from manifest"));
+}
+
+/// Manifest has extra params not listed in required_params → silently accepted (forward-compat).
+#[test]
+fn test_full_compat_extra_manifest_params_ignored() {
+    let mut m = sample_manifest();
+    m.algorithm
+        .params
+        .insert("future_param".into(), serde_json::json!("some_value"));
+    // Caller only requires num_shards; the extra future_param is not checked.
+    assert!(m
+        .check_algorithm_full_compat(
+            "kmeans-flat",
+            None,
+            &[("num_shards", &serde_json::json!(2))]
+        )
+        .is_ok());
 }
 
 // ── routing metadata validation ───────────────────────────────────────────────
