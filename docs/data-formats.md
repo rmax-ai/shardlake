@@ -286,7 +286,7 @@ The upgrade is applied automatically and transparently:
 
 ### Compatibility checks
 
-`shardlake_manifest::Manifest` exposes three typed helpers for call-site compatibility
+`shardlake_manifest::Manifest` exposes typed helpers for call-site compatibility
 validation:
 
 | Method | Error condition |
@@ -294,9 +294,37 @@ validation:
 | `check_dimension_compat(dims)` | `dims` does not match `manifest.dims` |
 | `check_dataset_version_compat(version)` | `version` does not match `manifest.dataset_version` |
 | `check_algorithm_compat(algorithm)` | `algorithm` does not match `manifest.algorithm.algorithm` |
+| `check_algorithm_full_compat(algorithm, variant, required_params)` | See semantics below |
 
-All three return `ManifestError::Compatibility(…)` on failure so callers can distinguish
-compatibility errors from parse or validation errors.
+All helpers return `ManifestError::Compatibility(…)` on failure so callers can
+distinguish compatibility errors from parse or validation errors.
+
+#### `check_algorithm_full_compat` semantics
+
+This richer helper enforces the complete algorithm identity contract and is the
+recommended API for query and serving code that needs to validate a manifest
+before use.
+
+| Parameter | Type | Semantics |
+|-----------|------|-----------|
+| `algorithm` | `&str` | Must match `manifest.algorithm.algorithm` exactly. |
+| `variant` | `Option<&str>` | When `Some(v)`, `manifest.algorithm.variant` must equal `Some(v)` exactly. Pass `None` to skip the variant check (any manifest variant, including `None`, is accepted). |
+| `required_params` | `&[(&str, &serde_json::Value)]` | Each `(key, value)` pair must appear in `manifest.algorithm.params` with an identical value. Parameters present in the manifest but absent from `required_params` are silently ignored, enabling forward-compatibility when new informational parameters are added in future builder versions. A parameter listed in `required_params` but absent from the manifest is a mismatch. |
+
+**Variant rules in detail:**
+- Variant differences are always incompatible when a specific variant is
+  required (`variant: Some(v)`).
+- Callers that do not care about the variant (e.g. index readers that support
+  any variant of a given algorithm family) should pass `None`.
+
+**Parameter rules in detail:**
+- Only parameters that are *structurally significant* (i.e. that change the
+  index layout or query behaviour) should be listed in `required_params`.
+  Examples: `num_shards`, `num_clusters`, `hnsw_m`.
+- Parameters that a given caller treats as informational need not be listed;
+  their presence in the manifest will not cause a failure.
+- Unknown parameters introduced by newer builders are ignored, preserving
+  forward-compatibility across minor version upgrades.
 
 ### Reproducibility contract
 
