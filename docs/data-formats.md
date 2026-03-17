@@ -293,15 +293,20 @@ a different mechanism.
 When a **current** `Manifest` reader (e.g. a v4-aware binary) loads an older
 manifest document (v1, v2, or v3), the fields that were added in later schema
 versions are absent from the JSON.  `serde` fills those missing fields with the
-`#[serde(default)]`-supplied values declared on each struct field:
+`#[serde(default)]`-supplied values declared on each struct field.  The table
+below is the complete set of post-v1 manifest fields that rely on this
+mechanism when they are absent from an older document:
 
 | Field absent in old manifest | Default value applied by the current reader |
 |------------------------------|---------------------------------------------|
-| `algorithm` | `AlgorithmConfig { algorithm: "kmeans-flat", variant: None, params: {} }` |
-| `compression` | `CompressionConfig { enabled: false, codec: "none", … }` |
+| `algorithm` | `AlgorithmMetadata { algorithm: "kmeans-flat", variant: None, params: {} }` |
+| `compression` | `CompressionConfig { enabled: false, codec: "none", pq_num_subspaces: 0, pq_codebook_size: 0, codebook_key: None }` |
 | `build_metadata.build_duration_secs` | `0.0` |
 | `shard_summary` | `None` |
 | `recall_estimate` | `None` |
+| `coarse_quantizer_key` | `None` |
+| `lexical` | `None` |
+| `ShardDef.centroid` | `[]` |
 | `ShardDef.routing` | `None` |
 
 This lets a current reader safely load any manifest version without bespoke
