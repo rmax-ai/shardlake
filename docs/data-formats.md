@@ -221,20 +221,19 @@ For a PQ-compressed index the `compression` block looks like:
 | `build_metadata.build_duration_secs` | float | *(v3+)* Wall-clock build duration in seconds. `0.0` when absent in older manifests. |
 | `algorithm.algorithm` | string | *(v3+)* Canonical algorithm family name. `"ivf-flat"` for current builds; `"kmeans-flat"` for indexes built before IVF was introduced. Defaults to `"kmeans-flat"` for v1/v2 manifests. |
 | `algorithm.variant` | string \| null | *(v3+, optional)* Algorithm variant identifier (e.g. `"cosine-normalised"`). Omitted when null. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. |
-| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. Always includes `num_shards`, `kmeans_iters`, and `kmeans_seed` for `"kmeans-flat"` builds, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
-| `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Absent in v1/v2 manifests. |
-| `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. |
-| `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. |
-| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. `false` for uncompressed builds, `true` for PQ builds. Defaults to `false`. |
-| `compression.codec` | string | *(v3+)* Codec identifier. `"none"` for uncompressed builds; `"pq8"` for 8-bit product quantisation. Defaults to `"none"`. |
-| `compression.pq_num_subspaces` | integer | *(v3+, `"pq8"` only)* Number of PQ sub-spaces `M`. Omitted when codec is `"none"`. |
-| `compression.pq_codebook_size` | integer | *(v3+, `"pq8"` only)* PQ codebook size `K` (number of centroids per sub-space). Must be ≤ 256. Omitted when codec is `"none"`. |
-| `compression.codebook_key` | string | *(v3+, `"pq8"` only)* Storage key of the PQ codebook artifact (`pq_codebook.bin`). Omitted when codec is `"none"`. |
+| `algorithm.params` | object | *(v3+)* Free-form algorithm parameters. Omitted when empty. For `"ivf-flat"` builds includes `num_clusters`, `num_shards`, `kmeans_iters`, and `kmeans_seed`. For `"kmeans-flat"` builds always includes `num_shards`, `kmeans_iters`, and `kmeans_seed`, and includes `kmeans_sample_size` only when centroid training actually ran on a bounded sample smaller than the full dataset. The recorded value is the effective bounded sample size used for training. |
+| `shard_summary.num_shards` | integer | *(v3+)* Total number of non-empty shards. Must equal the actual number of entries in the `shards` array. Absent in v1/v2 manifests. |
+| `shard_summary.min_shard_vector_count` | integer | *(v3+)* Vector count of the smallest shard. Must equal the minimum `vector_count` across all shards. Must be ≤ `max_shard_vector_count`. |
+| `shard_summary.max_shard_vector_count` | integer | *(v3+)* Vector count of the largest shard. Must equal the maximum `vector_count` across all shards. |
+| `compression.enabled` | boolean | *(v3+)* Whether compression / quantization is active. `false` for uncompressed builds, `true` for PQ builds. Defaults to `false`. Must be `true` when `codec="pq8"` and `false` when `codec="none"`. |
+| `compression.codec` | string | *(v3+)* Codec identifier. Must be `"none"` (uncompressed) or `"pq8"` (8-bit product quantisation). No other values are accepted. Defaults to `"none"`. |
+| `compression.pq_num_subspaces` | integer | *(v3+, `"pq8"` only)* Number of PQ sub-spaces `M`. Must be > 0 when `codec="pq8"`. Must be `0` (and is omitted on write) when `codec="none"`. |
+| `compression.pq_codebook_size` | integer | *(v3+, `"pq8"` only)* PQ codebook size `K` (number of centroids per sub-space). Must be in the range 1–256 when `codec="pq8"` (`"pq8"` encodes each sub-space index as a single byte, so at most 256 entries are representable). Must be `0` (and is omitted on write) when `codec="none"`. |
+| `compression.codebook_key` | string | *(v3+, `"pq8"` only)* Storage key of the PQ codebook artifact (`pq_codebook.bin`). Must be present and non-empty when `codec="pq8"`. Must be absent when `codec="none"`. |
 | `recall_estimate` | object \| null | *(v3+, optional)* Approximate recall estimate from a build-time sample query. `null` / absent when not computed. |
-| `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). |
-| `recall_estimate.recall_at_k` | float | Estimated recall@k in [0, 1]. |
-| `recall_estimate.sample_size` | integer | Number of sample queries used. |
+| `recall_estimate.k` | integer | The *k* used for the estimate (e.g. `10` for recall@10). Must be > 0. |
+| `recall_estimate.recall_at_k` | float | Estimated recall@k. Must be a finite value in [0, 1]. |
+| `recall_estimate.sample_size` | integer | Number of sample queries used. Must be > 0. |
 | `coarse_quantizer_key` | string \| null | Storage key of the IVF coarse-quantizer artifact (`coarse_quantizer.cq`). Present for `"ivf-flat"` indexes; absent for legacy `"kmeans-flat"` indexes. |
 | `lexical` | object \| null | *(v4+, optional)* Configuration for the BM25 lexical index artifact. `null` / absent when no lexical index was built (vector-only indexes). |
 | `lexical.artifact_key` | string | Storage key of the serialised BM25 index artifact (`lexical.bm25`). |

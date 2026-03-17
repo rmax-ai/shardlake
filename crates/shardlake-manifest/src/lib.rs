@@ -134,6 +134,19 @@ pub struct ShardSummary {
 /// When `enabled` is `true` and `codec` is `"pq8"`, shard artifacts use the
 /// PQ-encoded format (version 2) and an additional codebook artifact is
 /// stored at the key given by `codebook_key`.
+///
+/// # Schema constraints
+///
+/// The following invariants are enforced by [`Manifest::validate`]:
+///
+/// - `codec` must be `"none"` or `"pq8"`.
+/// - `enabled` and `codec` must be consistent: `enabled=true` requires
+///   `codec="pq8"`; `enabled=false` requires `codec="none"`.
+/// - When `codec="pq8"`: `pq_num_subspaces` must be > 0, `pq_codebook_size`
+///   must be in the range 1–256, and `codebook_key` must be present and
+///   non-empty.
+/// - When `codec="none"`: `pq_num_subspaces` and `pq_codebook_size` must be
+///   0, and `codebook_key` must be absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompressionConfig {
     /// Whether compression / quantization is active.
@@ -145,8 +158,11 @@ pub struct CompressionConfig {
     /// Number of PQ sub-spaces (`M`).  `0` when codec is not `"pq8"`.
     #[serde(default, skip_serializing_if = "CompressionConfig::is_zero_u32")]
     pub pq_num_subspaces: u32,
-    /// PQ codebook size (`K`).  Defaults to `256` for `"pq8"` builds;
-    /// `0` for uncompressed indexes.
+    /// PQ codebook size (`K`): number of centroids per sub-space.
+    ///
+    /// Must be in the range 1–256 when `codec="pq8"` (`"pq8"` encodes each
+    /// sub-space index as a single byte, so at most 256 entries are
+    /// representable).  `0` for uncompressed indexes.
     #[serde(default, skip_serializing_if = "CompressionConfig::is_zero_u32")]
     pub pq_codebook_size: u32,
     /// Storage key of the PQ codebook artifact.  `None` for uncompressed
@@ -156,6 +172,12 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
+    /// Maximum allowed `pq_codebook_size` for the `"pq8"` codec.
+    ///
+    /// `"pq8"` encodes each sub-space centroid index as a single unsigned byte,
+    /// which can represent at most 256 distinct values (0–255).
+    pub const MAX_PQ_CODEBOOK_SIZE: u32 = 256;
+
     fn default_codec() -> String {
         "none".into()
     }
@@ -405,6 +427,73 @@ impl Manifest {
             return Err(ManifestError::Validation(
                 "compression.codec must not be empty".into(),
             ));
+        }
+        let known_codecs = ["none", "pq8"];
+        if !known_codecs.contains(&self.compression.codec.as_str()) {
+            return Err(ManifestError::Validation(format!(
+                "compression.codec '{}' is not a recognised codec; expected one of: {}",
+                self.compression.codec,
+                known_codecs.join(", ")
+            )));
+        }
+        if self.compression.enabled && self.compression.codec == "none" {
+            return Err(ManifestError::Validation(
+                "compression.enabled is true but codec is \"none\"; set codec to \"pq8\" or disable compression".into(),
+            ));
+        }
+        if !self.compression.enabled && self.compression.codec != "none" {
+            return Err(ManifestError::Validation(format!(
+                "compression.codec is \"{}\" but enabled is false; set enabled=true or use codec \"none\"",
+                self.compression.codec
+            )));
+        }
+        if self.compression.codec == "pq8" {
+            if self.compression.pq_num_subspaces == 0 {
+                return Err(ManifestError::Validation(
+                    "compression.pq_num_subspaces must be > 0 when codec is \"pq8\"".into(),
+                ));
+            }
+            if self.compression.pq_codebook_size == 0
+                || self.compression.pq_codebook_size > CompressionConfig::MAX_PQ_CODEBOOK_SIZE
+            {
+                return Err(ManifestError::Validation(format!(
+                    "compression.pq_codebook_size must be in 1..={} when codec is \"pq8\", found {}",
+                    CompressionConfig::MAX_PQ_CODEBOOK_SIZE,
+                    self.compression.pq_codebook_size
+                )));
+            }
+            match &self.compression.codebook_key {
+                None => {
+                    return Err(ManifestError::Validation(
+                        "compression.codebook_key must be present when codec is \"pq8\"".into(),
+                    ));
+                }
+                Some(key) if key.trim().is_empty() => {
+                    return Err(ManifestError::Validation(
+                        "compression.codebook_key must not be empty when codec is \"pq8\"".into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if self.compression.codec == "none" {
+            if self.compression.pq_num_subspaces != 0 {
+                return Err(ManifestError::Validation(format!(
+                    "compression.pq_num_subspaces must be 0 when codec is \"none\", found {}",
+                    self.compression.pq_num_subspaces
+                )));
+            }
+            if self.compression.pq_codebook_size != 0 {
+                return Err(ManifestError::Validation(format!(
+                    "compression.pq_codebook_size must be 0 when codec is \"none\", found {}",
+                    self.compression.pq_codebook_size
+                )));
+            }
+            if self.compression.codebook_key.is_some() {
+                return Err(ManifestError::Validation(
+                    "compression.codebook_key must be absent when codec is \"none\"".into(),
+                ));
+            }
         }
         if let Some(key) = &self.coarse_quantizer_key {
             if key.trim().is_empty() {
