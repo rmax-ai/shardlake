@@ -683,8 +683,6 @@ shardlake eval-ann --k 10 --nprobe 4 --max-queries 500 --output json
 
 ---
 
----
-
 ## `shardlake compare-ann`
 
 Compares multiple ANN families (IVF-PQ, HNSW, DiskANN, or any combination) in one
@@ -716,7 +714,7 @@ shardlake [--storage <PATH>] compare-ann --alias <ALIAS>... [OPTIONS]
 
 | Metric | Description |
 |--------|-------------|
-| Family | Canonical ANN algorithm family name extracted from the manifest |
+| Family | Canonical ANN algorithm family name derived from manifest algorithm/compression metadata |
 | Recall@k | Fraction of true top-k neighbours that appear in the retrieved results |
 | Precision@k | Fraction of retrieved results that are true top-k neighbours |
 | Mean Lat | Average per-query ANN search time in microseconds |

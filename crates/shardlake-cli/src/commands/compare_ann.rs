@@ -120,7 +120,11 @@ pub async fn run(storage: PathBuf, args: CompareAnnArgs) -> Result<()> {
             &manifest.vectors_key,
             manifest.distance_metric,
         )?;
-        let ann_family = manifest.algorithm.algorithm.clone();
+        let ann_family = canonical_ann_family(
+            &manifest.algorithm.algorithm,
+            manifest.compression.enabled,
+            &manifest.compression.codec,
+        );
 
         info!(
             alias = %alias,
@@ -212,9 +216,23 @@ fn ensure_comparable_alias(
     Ok(())
 }
 
+fn canonical_ann_family(
+    algorithm: &str,
+    compression_enabled: bool,
+    compression_codec: &str,
+) -> String {
+    match algorithm {
+        "ivf-flat" | "kmeans-flat" if compression_enabled && compression_codec == "pq8" => {
+            "ivf_pq".to_owned()
+        }
+        "ivf-flat" | "kmeans-flat" => "ivf_flat".to_owned(),
+        other => other.replace('-', "_"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ensure_comparable_alias;
+    use super::{canonical_ann_family, ensure_comparable_alias};
     use shardlake_core::types::DistanceMetric;
 
     #[test]
@@ -262,5 +280,24 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires all aliases to use the same distance metric"));
+    }
+
+    #[test]
+    fn canonical_ann_family_distinguishes_ivf_flat_and_pq() {
+        assert_eq!(canonical_ann_family("ivf-flat", false, "none"), "ivf_flat");
+        assert_eq!(canonical_ann_family("ivf-flat", true, "pq8"), "ivf_pq");
+        assert_eq!(
+            canonical_ann_family("kmeans-flat", false, "none"),
+            "ivf_flat"
+        );
+    }
+
+    #[test]
+    fn canonical_ann_family_normalizes_hyphenated_names() {
+        assert_eq!(canonical_ann_family("diskann", false, "none"), "diskann");
+        assert_eq!(
+            canonical_ann_family("custom-family", false, "none"),
+            "custom_family"
+        );
     }
 }

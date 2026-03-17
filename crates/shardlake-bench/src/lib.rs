@@ -275,7 +275,7 @@ pub struct EvalAnnReport {
 pub struct AnnFamilyReport {
     /// Alias used to load the index (e.g. `"latest"`, `"hnsw-exp"`).
     pub alias: String,
-    /// Canonical ANN algorithm family name recorded in the manifest
+    /// Canonical ANN algorithm family name derived from manifest metadata
     /// (e.g. `"ivf_flat"`, `"ivf_pq"`, `"hnsw"`, `"diskann"`).
     pub ann_family: String,
     /// Evaluation metrics for this family.
@@ -287,7 +287,7 @@ pub struct AnnFamilyReport {
 ///
 /// Produced by running [`run_eval_ann`] once per alias and collecting the
 /// results into a single document.  Each entry corresponds to one index alias
-/// and includes the ANN family name extracted from the manifest, making it
+/// and includes the ANN family name derived from the manifest metadata, making it
 /// straightforward to compare quality and latency across families.
 ///
 /// # Example (JSON)
